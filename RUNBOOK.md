@@ -95,12 +95,22 @@ se nedotýká. Doručování řeší výhradně náš vlastní pipeline (viz
 - [ ] Deploy → Doména: `mail.ripieno.xyz` → service `web`, port 3000, HTTPS OFF
       (+ tunnel hostname `mail.ripieno.xyz → localhost:80` v CF, pokud není wildcard)
 - [ ] Ověř: web UI naběhne, založ si admin účet, projdi Settings
-- [ ] **Delivery node (pro odesílání do světa, dle P5 plánu):** objednat mini
-      VPS (Hetzner CAX11/CX22 ~€4/měs) → nastavit PTR `mail.ripieno.xyz` →
-      požádat o odemčení portu 25 (ticket, trvá dny — objednat s předstihem!)
-      → Tailscale → worker s `WORKER_ROLE=direct` (až bude P1 kód hotový)
-- [ ] Do té doby appky maily ven neposílají; nouzovka: SmtpConfig na vlastní
-      Gmail (smtp.gmail.com:587 + app password, 500/den)
+
+**Odesílání — DEN 1: Seznam SMTP smarthost (zdarma, funguje hned).**
+Uživatel má na produkci launchmailu ověřený setup: **Seznam e-mail zdarma pro
+doménu** (`@mojedomena.cz` schránky) + odesílání přes Seznam SMTP. Seznam má
+čisté IP + PTR + reputaci → doručitelnost bez vlastní infry. V homelab instanci
+jen znovu vytvoř ten SmtpConfig (typ **smarthost**):
+- [ ] Dashboard → SMTP → New → **Relay (smarthost)**:
+      host `smtp.seznam.cz`, port `465` (SSL) nebo `587` (STARTTLS),
+      username = plná adresa `neco@mojedomena.cz`, password = heslo schránky,
+      From = tatáž adresa. Ověř doménu v launchmailu (DKIM) pro lepší inbox.
+- [ ] Test: pošli sám sobě → dorazí do inboxu ✔
+
+**Odesílání — ENDGAME: `direct` (vlastní ESP, 0 třetích stran).** Kód hotový
+(Fáze 1). Až bude egress host s PTR + portem 25 (kamarádův server, nebo levná
+VPS — viz `launchmail/DIRECT_DELIVERY_PLAN.md` Phase 5), vytvoř SmtpConfig typu
+**Direct**, nastav ho jako default a Seznam nech jako fallback.
 
 **Monitoring:**
 ```bash
