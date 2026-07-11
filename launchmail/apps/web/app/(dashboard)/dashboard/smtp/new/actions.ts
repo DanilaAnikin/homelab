@@ -6,12 +6,23 @@ import { revalidatePath } from "next/cache";
 export async function createSmtpConfigAction(formData: FormData) {
   const imapHost = ((formData.get("imapHost") as string) || "").trim();
   const imapPort = parseInt(formData.get("imapPort") as string) || 993;
+  const type =
+    (formData.get("type") as string) === "direct" ? "direct" : "smarthost";
+  // Direct configs deliver to recipient MX themselves — no upstream host/creds;
+  // they carry a HELO hostname (must match the egress IP PTR) instead.
+  const credentials =
+    type === "direct"
+      ? { heloHostname: ((formData.get("heloHostname") as string) || "").trim() }
+      : {
+          host: formData.get("host") as string,
+          username: formData.get("username") as string,
+          password: formData.get("password") as string,
+        };
   const res = await apiSend<{ id: string }>("POST", "/api/smtp-configs", {
     name: formData.get("name") as string,
-    host: formData.get("host") as string,
+    type,
+    ...credentials,
     port: parseInt(formData.get("port") as string) || 587,
-    username: formData.get("username") as string,
-    password: formData.get("password") as string,
     fromAddress: formData.get("fromAddress") as string,
     fromName: (formData.get("fromName") as string) || undefined,
     // Only send IMAP fields when a host is given. secure=false on 143 lets the

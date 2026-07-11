@@ -48,7 +48,7 @@ function clientFor(config: SmtpConfig): ImapFlow {
     port: config.imapPort ?? 993,
     secure: config.imapSecure ?? true,
     auth: {
-      user: config.imapUsername || config.username,
+      user: config.imapUsername || config.username || "",
       pass: config.imapPassword ?? "",
     },
     logger: false,
@@ -428,7 +428,7 @@ export async function testImapConnection(
     port: config.imapPort ?? 993,
     secure: config.imapSecure ?? true,
     auth: {
-      user: config.imapUsername || config.username,
+      user: config.imapUsername || config.username || "",
       pass: config.imapPassword ?? "",
     },
     logger: false,

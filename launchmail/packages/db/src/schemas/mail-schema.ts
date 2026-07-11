@@ -24,10 +24,19 @@ export const smtpConfigs = pgTable(
       onDelete: "set null",
     }),
     name: text("name").notNull(),
-    host: text("host").notNull(),
+    // Delivery mode. "smarthost" relays through an upstream SMTP server
+    // (host/username/password required — the classic path). "direct" resolves
+    // each recipient's MX and delivers on port 25 itself, with no upstream
+    // credentials — our own-ESP path. See packages/mail-queue/src/direct-transport.ts.
+    type: text("type").notNull().default("smarthost"),
+    // Smarthost credentials. NULL for "direct" configs (no upstream to log in to).
+    host: text("host"),
     port: integer("port").notNull().default(587),
-    username: text("username").notNull(),
-    passwordEncrypted: text("password_encrypted").notNull(),
+    username: text("username"),
+    passwordEncrypted: text("password_encrypted"),
+    // EHLO/HELO identity used for "direct" sends. MUST match the PTR (reverse
+    // DNS) of the egress IP, or receivers fail forward-confirmed rDNS and reject.
+    heloHostname: text("helo_hostname"),
     fromAddress: text("from_address").notNull(),
     fromName: text("from_name"),
     isDefault: boolean("is_default").notNull().default(false),

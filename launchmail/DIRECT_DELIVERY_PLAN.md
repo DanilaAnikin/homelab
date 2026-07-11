@@ -64,27 +64,27 @@ where the clean IP is. Core (API, web, Postgres, Redis, tracking) stays home.
 
 ---
 
-## Phase 1 — Transport abstraction + direct-MX MVP (~2–4 days)
+## Phase 1 — Transport abstraction + direct-MX MVP — ✅ DONE (2026-07-11)
 
-- [ ] Schema: `smtpConfigs.type: "smarthost" | "direct"` (default `smarthost`,
-      migration) + `heloHostname` (must match the egress PTR), make
-      `host/port/username/password` nullable for `direct`.
-- [ ] New `packages/mail-queue/src/direct-transport.ts`:
-  - `dns/promises.resolveMx()` per recipient domain, sort by priority,
-    try hosts in order; happy-eyeballs not needed (v4 first, fallback v6)
-  - deliver via nodemailer's `SMTPConnection` (or `SMTPTransport` with
-    `host=<mx>`, `port=25`, `secure=false`, `opportunisticTLS`), EHLO =
-    `heloHostname`, envelope-from (return-path) on the sending domain
-  - **require DKIM** for direct sends (config validation — unsigned direct
-    mail is DOA in 2026)
-  - classify SMTP replies: 2xx → sent; 4xx → retryable (throw retryable);
-    5xx → permanent (no retry, log response, feed Phase 2 suppression)
-  - group recipients by domain; one connection per domain per job
-- [ ] `smtp.ts` `sendMail()` branches on `config.type` — call sites unchanged.
-- [ ] Web UI: SMTP config form gets type toggle; `direct` hides credentials,
-      shows `heloHostname` + "egress IP must have matching PTR" hint.
-- [ ] Acceptance: from a clean-IP host, send to Gmail+Seznam test accounts →
-      inbox, headers show `spf=pass dkim=pass`, `Received:` shows our HELO/IP.
+- [x] Schema: `smtpConfigs.type: "smarthost" | "direct"` (default `smarthost`)
+      + `heloHostname`; `host/username/password_encrypted` made nullable.
+      Migration `0009_direct_delivery.sql`.
+- [x] `packages/mail-queue/src/direct-transport.ts`: `resolveMx` per recipient
+      domain (priority-sorted, implicit-MX fallback); delivers via nodemailer
+      `SMTPTransport` (`host=<mx>`, `port=25`, `secure=false`,
+      `opportunisticTLS`), EHLO=`heloHostname`, return-path aligned to From
+      domain; **requires DKIM** (permanent 5xx if missing); classifies replies
+      (network/4xx retryable, 5xx permanent), tries next MX on retryable;
+      groups recipients by domain.
+- [x] `smtp.ts` `sendMail()` branches on `config.type`; `testSmtpConnection`
+      does an MX + port-25 probe for direct. Worker unchanged.
+- [x] Web UI: `new-smtp-form.tsx` delivery-mode toggle; direct shows
+      `heloHostname` + PTR/DKIM/SPF/port-25 requirements.
+- [x] Unit tests (`direct-transport.test.ts`, 13). Full workspace typecheck +
+      lint + tests green.
+- [ ] **Remaining acceptance (needs the egress node):** from a clean-IP host,
+      send to Gmail+Seznam → inbox, `spf=pass dkim=pass`. Code is ready; only
+      blocked on a host with PTR + open port 25 (Phase 5).
 
 ## Phase 2 — Queue hardening for direct mode (~1–2 days)
 
@@ -127,28 +127,46 @@ mailbox**. We already sync mailboxes via IMAP — reuse it:
 
 ## Phase 5 — Egress delivery node (ops, ~0.5–1 day)
 
-- [ ] Tiny VPS: Hetzner CAX11/CX22 (~€4/mo). Set **PTR** in console →
-      `mail.<domain>`. Request **port 25 unlock** (Hetzner support ticket;
-      blocked by default on new accounts — plan for a short delay).
-- [ ] Join node to Tailscale → runs `worker` container with
-      `WORKER_ROLE=direct`, `REDIS_URL` over tailnet to homelab.
-- [ ] DNS per sending domain: SPF `ip4:<node-ip>`, DKIM key, DMARC
-      (`p=none` → `quarantine` after warm-up), PTR done above.
-      Optional: MTA-STS + TLS-RPT.
-- [ ] Acceptance: mail-tester.com ≥ 9/10 through our own pipe; then ramp
-      volume via Phase 4 warm-up and **retire the Resend smarthost config**.
+The ONLY rented ingredient: an IP with a controllable PTR and open port 25.
+The launchmail brain (queue, DKIM, tracking, UI, data) stays on the homelab.
+Two ways to get that IP, cheapest first:
+
+- **Option A — a friend's / existing server with a public IP.** Viable **only
+  if** that box (a) has a static public IPv4 whose PTR the owner can set to
+  `mail.<domain>`, and (b) has outbound port 25 open. A self-hosted
+  Headscale/Tailscale tunnel gives network reach but does NOT change the exit
+  IP's PTR/reputation — the exit host itself must meet (a)+(b). If it does:
+  run the `worker` there (`WORKER_ROLE=direct`) over the tailnet — €0.
+- **Option B — tiny VPS.** Hetzner CAX11/CX22 (~€4/mo) or any provider that
+  sets PTR + unlocks port 25 (Hetzner: support ticket, short delay). Some
+  budget hosts leave 25 open by default.
+
+Then, whichever host:
+- [ ] Set **PTR** = `mail.<domain>`; confirm outbound **port 25** works.
+- [ ] Join Tailscale → run `worker` with `WORKER_ROLE=direct`, `REDIS_URL`
+      over the tailnet to the homelab.
+- [ ] DNS per sending domain: SPF `ip4:<node-ip>`, DKIM key (from launchmail),
+      DMARC (`p=none` → `quarantine` after warm-up). Optional MTA-STS/TLS-RPT.
+- [ ] Acceptance: mail-tester.com ≥ 9/10 through our own pipe; ramp via
+      Phase 4 warm-up.
 
 ## Non-goals (for now)
 
 Dedicated IP pools / multi-node scheduling, ARC sealing, full inbound MX
 hosting (IMAP path covers receiving), DMARC aggregate-report analytics UI.
 
-## Rollout strategy (homelab)
+## Rollout strategy (homelab) — NO third-party sender, ever
 
-1. **Day D (server arrival): zero code.** Run launchmail with one `smarthost`
-   SmtpConfig (Resend free tier) — everything ships mail from day one.
-2. Build Phases 1–3 on evenings; test direct mode from any clean-IP box.
-3. Phase 5: rent the delivery node, flip the default SmtpConfig to `direct`,
-   keep Resend config as emergency fallback for a month, then delete it.
+The user's requirement: zero Resend/Brevo/SES. So:
 
-Total build estimate: **~1.5–2 weeks of evenings** to a fully self-hosted ESP.
+1. **Day D:** deploy launchmail (Phase 1 code is already merged). Apps can
+   enqueue mail immediately; it just won't leave the building until an egress
+   host exists. For the brief gap, the only "third party" tolerated is the
+   user's own Gmail as a stopgap SmtpConfig (app password, 500/day) — optional.
+2. **Get the egress IP (Phase 5, Option A friend's box or B cheap VPS).** Set
+   PTR + port 25 + DNS. Create a `direct` SmtpConfig, make it default.
+3. From then on launchmail delivers everything itself. Build Phases 2–4
+   (rate limits, bounce ingestion, deliverability console) on evenings to
+   harden it. No external sending service is ever part of the pipeline.
+
+Remaining build estimate after Phase 1: **~1–1.5 weeks of evenings**.

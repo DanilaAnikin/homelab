@@ -109,21 +109,48 @@ const smtpConfigsRouter = new Hono<AppVariables>()
     }),
     zValidator(
       "json",
-      z.object({
-        name: z.string().min(1),
-        host: z.string().min(1),
-        port: z.number().int().min(1).max(65535).default(587),
-        username: z.string().min(1),
-        password: z.string().min(1),
-        fromAddress: z.string().email(),
-        fromName: z.string().optional(),
-        // Optional incoming mail (IMAP). Receive-enabled when imapHost is set.
-        imapHost: z.string().optional(),
-        imapPort: z.number().int().min(1).max(65535).optional(),
-        imapUsername: z.string().optional(),
-        imapPassword: z.string().optional(),
-        imapSecure: z.boolean().optional(),
-      }),
+      z
+        .object({
+          name: z.string().min(1),
+          // "smarthost" (default) relays via host/username/password.
+          // "direct" delivers to recipient MX itself — needs heloHostname, no creds.
+          type: z.enum(["smarthost", "direct"]).default("smarthost"),
+          host: z.string().min(1).optional(),
+          port: z.number().int().min(1).max(65535).default(587),
+          username: z.string().min(1).optional(),
+          password: z.string().min(1).optional(),
+          heloHostname: z.string().min(1).optional(),
+          fromAddress: z.string().email(),
+          fromName: z.string().optional(),
+          // Optional incoming mail (IMAP). Receive-enabled when imapHost is set.
+          imapHost: z.string().optional(),
+          imapPort: z.number().int().min(1).max(65535).optional(),
+          imapUsername: z.string().optional(),
+          imapPassword: z.string().optional(),
+          imapSecure: z.boolean().optional(),
+        })
+        .superRefine((v, ctx) => {
+          if (v.type === "direct") {
+            if (!v.heloHostname) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ["heloHostname"],
+                message:
+                  "heloHostname is required for direct delivery (must match the egress IP's PTR record)",
+              });
+            }
+          } else {
+            for (const field of ["host", "username", "password"] as const) {
+              if (!v[field]) {
+                ctx.addIssue({
+                  code: z.ZodIssueCode.custom,
+                  path: [field],
+                  message: `${field} is required for smarthost delivery`,
+                });
+              }
+            }
+          }
+        }),
     ),
     async (c) => {
       const denied = requirePerm(c, "smtpConfig", "create");
@@ -161,10 +188,12 @@ const smtpConfigsRouter = new Hono<AppVariables>()
       "json",
       z.object({
         name: z.string().min(1).optional(),
+        type: z.enum(["smarthost", "direct"]).optional(),
         host: z.string().min(1).optional(),
         port: z.number().int().min(1).max(65535).optional(),
         username: z.string().min(1).optional(),
         password: z.string().min(1).optional(),
+        heloHostname: z.string().min(1).optional(),
         fromAddress: z.string().email().optional(),
         fromName: z.string().optional(),
         isDefault: z.boolean().optional(),

@@ -8,10 +8,15 @@ export interface SmtpConfig {
   organizationId: string;
   userId: string | null;
   name: string;
-  host: string;
+  // "smarthost" → relay via host/username/password below.
+  // "direct" → deliver to recipient MX ourselves; credentials are null and
+  // heloHostname/DKIM carry the identity instead. (See direct-transport.ts.)
+  type: "smarthost" | "direct";
+  host: string | null;
   port: number;
-  username: string;
-  password: string; // decrypted
+  username: string | null;
+  password: string; // decrypted; "" for direct configs
+  heloHostname: string | null;
   fromAddress: string;
   fromName: string | null;
   isDefault: boolean;
@@ -34,10 +39,14 @@ export interface SmtpConfig {
 
 export interface CreateSmtpConfigInput {
   name: string;
-  host: string;
+  // Omit type (or "smarthost") → host/username/password required.
+  // "direct" → credentials omitted; heloHostname required instead.
+  type?: "smarthost" | "direct";
+  host?: string;
   port: number;
-  username: string;
-  password: string;
+  username?: string;
+  password?: string;
+  heloHostname?: string | null;
   fromAddress: string;
   fromName?: string;
   createdByUserId?: string;
@@ -50,10 +59,12 @@ export interface CreateSmtpConfigInput {
 
 export interface UpdateSmtpConfigInput {
   name?: string;
+  type?: "smarthost" | "direct";
   host?: string;
   port?: number;
   username?: string;
   password?: string;
+  heloHostname?: string | null;
   fromAddress?: string;
   fromName?: string;
   isDefault?: boolean;
@@ -71,7 +82,9 @@ function toSmtpConfig(row: typeof smtpConfigs.$inferSelect): SmtpConfig {
   const { passwordEncrypted, imapPasswordEncrypted, ...rest } = row;
   return {
     ...rest,
-    password: decrypt(passwordEncrypted),
+    // Direct configs have no upstream password → null ciphertext → "".
+    type: (rest.type as "smarthost" | "direct") ?? "smarthost",
+    password: passwordEncrypted ? decrypt(passwordEncrypted) : "",
     imapPassword: imapPasswordEncrypted ? decrypt(imapPasswordEncrypted) : null,
     fromName: rest.fromName ?? null,
   };
@@ -160,10 +173,12 @@ export async function createSmtpConfig(
         organizationId,
         userId: input.createdByUserId ?? null,
         name: input.name,
-        host: input.host,
+        type: input.type ?? "smarthost",
+        host: input.host ?? null,
         port: input.port,
-        username: input.username,
-        passwordEncrypted: encrypt(input.password),
+        username: input.username ?? null,
+        passwordEncrypted: input.password ? encrypt(input.password) : null,
+        heloHostname: input.heloHostname ?? null,
         fromAddress: input.fromAddress,
         fromName: input.fromName ?? null,
         isDefault,
@@ -193,11 +208,14 @@ export async function updateSmtpConfig(
 
   const updates: Record<string, unknown> = { updatedAt: new Date() };
   if (input.name !== undefined) updates.name = input.name;
-  if (input.host !== undefined) updates.host = input.host;
+  if (input.type !== undefined) updates.type = input.type;
+  if (input.host !== undefined) updates.host = input.host || null;
   if (input.port !== undefined) updates.port = input.port;
-  if (input.username !== undefined) updates.username = input.username;
+  if (input.username !== undefined) updates.username = input.username || null;
   if (input.password !== undefined)
-    updates.passwordEncrypted = encrypt(input.password);
+    updates.passwordEncrypted = input.password ? encrypt(input.password) : null;
+  if (input.heloHostname !== undefined)
+    updates.heloHostname = input.heloHostname || null;
   if (input.fromAddress !== undefined) updates.fromAddress = input.fromAddress;
   if (input.fromName !== undefined) updates.fromName = input.fromName;
   // IMAP fields. A field set to null/"" clears it (disabling receiving when the

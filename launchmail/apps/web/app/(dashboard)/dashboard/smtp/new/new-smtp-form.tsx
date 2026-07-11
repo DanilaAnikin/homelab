@@ -22,6 +22,7 @@ export function NewSmtpForm({
   const [loading, setLoading] = useState(false);
   const [testingImap, setTestingImap] = useState(false);
   const [fromAddress, setFromAddress] = useState("");
+  const [mode, setMode] = useState<"smarthost" | "direct">("smarthost");
 
   async function testImap() {
     const fd = new FormData(formRef.current!);
@@ -81,36 +82,98 @@ export function NewSmtpForm({
       <Separator />
 
       <section className="space-y-3">
-        <p className="text-eyebrow">Connection</p>
-        <div className="grid grid-cols-3 gap-3">
-          <FormField className="col-span-2">
-            <FormLabel>SMTP host</FormLabel>
-            <FormControl>
-              <Input name="host" placeholder="smtp.sendgrid.net" required />
-            </FormControl>
-          </FormField>
-          <FormField>
-            <FormLabel>Port</FormLabel>
-            <FormControl>
-              <Input name="port" type="number" defaultValue={587} required />
-            </FormControl>
-          </FormField>
-        </div>
+        <p className="text-eyebrow">Delivery mode</p>
+        <input type="hidden" name="type" value={mode} />
         <div className="grid grid-cols-2 gap-3">
-          <FormField>
-            <FormLabel>Username</FormLabel>
-            <FormControl>
-              <Input name="username" placeholder="apikey" autoComplete="off" required />
-            </FormControl>
-          </FormField>
-          <FormField>
-            <FormLabel>Password</FormLabel>
-            <FormControl>
-              <Input name="password" type="password" placeholder="••••••••" autoComplete="new-password" required />
-            </FormControl>
-          </FormField>
+          <button
+            type="button"
+            onClick={() => setMode("smarthost")}
+            className={`rounded-lg border px-4 py-3 text-left transition ${
+              mode === "smarthost"
+                ? "border-primary bg-primary/5"
+                : "border-border hover:border-muted-foreground/40"
+            }`}
+          >
+            <p className="text-body-strong">Relay (smarthost)</p>
+            <p className="text-caption text-muted-foreground">
+              Send through an upstream SMTP server you log in to.
+            </p>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("direct")}
+            className={`rounded-lg border px-4 py-3 text-left transition ${
+              mode === "direct"
+                ? "border-primary bg-primary/5"
+                : "border-border hover:border-muted-foreground/40"
+            }`}
+          >
+            <p className="text-body-strong">Direct (self-hosted)</p>
+            <p className="text-caption text-muted-foreground">
+              Deliver straight to recipient mail servers. No third party.
+            </p>
+          </button>
         </div>
       </section>
+
+      <Separator />
+
+      {mode === "smarthost" ? (
+        <section className="space-y-3">
+          <p className="text-eyebrow">Connection</p>
+          <div className="grid grid-cols-3 gap-3">
+            <FormField className="col-span-2">
+              <FormLabel>SMTP host</FormLabel>
+              <FormControl>
+                <Input name="host" placeholder="smtp.sendgrid.net" required />
+              </FormControl>
+            </FormField>
+            <FormField>
+              <FormLabel>Port</FormLabel>
+              <FormControl>
+                <Input name="port" type="number" defaultValue={587} required />
+              </FormControl>
+            </FormField>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <FormField>
+              <FormLabel>Username</FormLabel>
+              <FormControl>
+                <Input name="username" placeholder="apikey" autoComplete="off" required />
+              </FormControl>
+            </FormField>
+            <FormField>
+              <FormLabel>Password</FormLabel>
+              <FormControl>
+                <Input name="password" type="password" placeholder="••••••••" autoComplete="new-password" required />
+              </FormControl>
+            </FormField>
+          </div>
+        </section>
+      ) : (
+        <section className="space-y-3">
+          <p className="text-eyebrow">Direct delivery</p>
+          <FormField>
+            <FormLabel>HELO hostname</FormLabel>
+            <FormControl>
+              <Input name="heloHostname" placeholder="mail.yourdomain.com" required />
+            </FormControl>
+            <FormDescription>
+              The egress server&apos;s hostname. Its reverse DNS (PTR) MUST match
+              this exactly, or receivers reject the mail.
+            </FormDescription>
+          </FormField>
+          <div className="rounded-lg bg-muted/40 px-4 py-3 text-caption text-muted-foreground space-y-1">
+            <p className="text-body-strong text-foreground">
+              Requirements for direct delivery
+            </p>
+            <p>• The From domain must be verified (for DKIM signing).</p>
+            <p>• Outbound port 25 must be open on the egress host.</p>
+            <p>• A PTR record matching the HELO hostname above.</p>
+            <p>• SPF and DMARC published for the sending domain.</p>
+          </div>
+        </section>
+      )}
 
       <Separator />
 
