@@ -5,8 +5,11 @@ import { domains } from "@workspace/db/schemas";
 import type { Domain } from "@workspace/db/schemas";
 import { and, desc, eq } from "drizzle-orm";
 import { encrypt, decrypt } from "./crypto";
+import { checkDeliverability, type DeliverabilityReport } from "./deliverability";
+import { listSmtpConfigs } from "./smtp-configs.service";
 
 export type { Domain };
+export type { DeliverabilityReport };
 
 export interface DnsRecord {
   type: "TXT";
@@ -193,4 +196,35 @@ export async function verifyDomain(
     .where(and(eq(domains.id, id), eq(domains.organizationId, organizationId)))
     .returning();
   return row ?? null;
+}
+
+/**
+ * Full deliverability report for a sending domain (Phase 4). Discovers the
+ * org's direct-delivery egress host (from its "direct" smtp_config), resolves
+ * its IP, then checks SPF/DKIM/DMARC/PTR/port-25 and generates the DNS records
+ * to publish. Falls back to record-less checks when no direct config exists.
+ */
+export async function domainDeliverability(
+  domain: Domain,
+  organizationId: string,
+): Promise<DeliverabilityReport> {
+  const configs = await listSmtpConfigs(organizationId);
+  const direct = configs.find((c) => c.type === "direct" && c.heloHostname);
+  const heloHostname = direct?.heloHostname ?? undefined;
+
+  let egressIp: string | undefined;
+  if (heloHostname) {
+    const a = await dns.resolve4(heloHostname).catch(() => [] as string[]);
+    egressIp = a[0];
+  }
+
+  return checkDeliverability({
+    domain: domain.domain,
+    dkimSelector: domain.dkimSelector,
+    dkimPublicKeyTxt: domain.dkimPublicKey
+      ? dkimPublicTxt(domain.dkimPublicKey)
+      : "",
+    egressIp,
+    heloHostname,
+  });
 }

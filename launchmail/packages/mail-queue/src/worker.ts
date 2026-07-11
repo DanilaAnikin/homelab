@@ -7,9 +7,10 @@ import { filterSuppressed, addSuppression } from "./suppressions.service";
 import { dispatchEvent } from "./webhooks.service";
 import { injectTracking, trackingEnabled } from "./tracking.service";
 import { findSigningDomain } from "./domains.service";
-import { classifyDeliveryError } from "./direct-transport";
+import { classifyDeliveryError, extractEmail, domainOf } from "./direct-transport";
 import { mailBackoffDelay, MAIL_JOB_ATTEMPTS } from "./backoff";
 import { consumeDomainToken } from "./rate-limiter";
+import { consumeDailyQuota } from "./warmup";
 import { db } from "@workspace/db";
 import { emailLogs } from "@workspace/db/schemas";
 import { and, eq } from "drizzle-orm";
@@ -128,11 +129,24 @@ export function startWorker() {
         }
       }
 
-      // Per-domain rate limiting for direct delivery: keep bursts under the
-      // big providers' thresholds. Over budget → re-delay this job (no retry
-      // attempt consumed) until the window rolls over. Smarthost skips this
-      // (the relay meters its own throughput).
+      // Direct delivery throttling. Both checks re-delay the job (no retry
+      // attempt consumed) rather than failing. Smarthost skips this — the relay
+      // meters its own throughput and owns its reputation.
       if (config.type === "direct") {
+        // 1) Warm-up: ramp a young sending domain's daily volume so it doesn't
+        //    look like a spammer blasting from a cold IP.
+        const sendDomain = domainOf(extractEmail(from));
+        const warm = await consumeDailyQuota(sendDomain);
+        if (!warm.allowed) {
+          console.log(
+            `[worker] Warm-up cap ${warm.cap}/day reached for ${sendDomain} → deferring to next day`,
+          );
+          await job.moveToDelayed(Date.now() + warm.resetInMs, token);
+          throw new DelayedError();
+        }
+
+        // 2) Per-recipient-domain rate limit: keep bursts under the big
+        //    providers' per-minute thresholds.
         const domains = new Set(
           [...recipients, ...(cc ?? []), ...(bcc ?? [])].map((r) =>
             r.email.slice(r.email.lastIndexOf("@") + 1).toLowerCase(),

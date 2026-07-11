@@ -129,8 +129,14 @@ export {
   buildRecords,
   getDkimPrivateKey,
   findSigningDomain,
+  domainDeliverability,
 } from "./domains.service";
-export type { Domain, DnsRecord, DkimSigningKey } from "./domains.service";
+export type {
+  Domain,
+  DnsRecord,
+  DkimSigningKey,
+  DeliverabilityReport,
+} from "./domains.service";
 
 // Webhooks
 export {

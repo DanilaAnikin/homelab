@@ -25,6 +25,7 @@ import {
   createDomain,
   deleteDomain,
   verifyDomain,
+  domainDeliverability,
   buildRecords,
   listWebhooks,
   createWebhook,
@@ -389,6 +390,14 @@ export const domainsRouter = new Hono<AppVariables>()
     if (!d) return c.json({ error: "Not found" }, 404);
     audit(c, "domain.verify", d.domain);
     return c.json(safeDomain(d));
+  })
+  .get("/:id/deliverability", async (c) => {
+    const denied = requirePerm(c, "domain", "read");
+    if (denied) return denied;
+    const d = await getDomain(c.req.param("id"), c.get("organizationId")!);
+    if (!d) return c.json({ error: "Not found" }, 404);
+    const report = await domainDeliverability(d, c.get("organizationId")!);
+    return c.json(report);
   })
   .delete("/:id", async (c) => {
     const denied = requirePerm(c, "domain", "delete");

@@ -24,3 +24,23 @@ export async function verifyDomainAction(id: string) {
   revalidatePath(`/dashboard/domains/${id}`);
   return { success: true };
 }
+
+export interface DeliverabilityReport {
+  domain: string;
+  egressIp?: string;
+  heloHostname?: string;
+  checks: { key: string; label: string; ok: boolean; detail: string }[];
+  records: { type: string; name: string; value: string; purpose: string }[];
+  passed: number;
+  total: number;
+  ready: boolean;
+}
+
+export async function checkDeliverabilityAction(id: string) {
+  const res = await apiSend<DeliverabilityReport>(
+    "GET",
+    `/api/domains/${id}/deliverability`,
+  );
+  if (!res.ok) return { error: res.error };
+  return { report: res.data! };
+}

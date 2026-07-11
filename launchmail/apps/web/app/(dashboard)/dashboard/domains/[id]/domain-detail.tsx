@@ -15,7 +15,13 @@ import {
   CheckCircle2Icon,
   CircleDashedIcon,
 } from "lucide-react";
-import { verifyDomainAction, deleteDomainAction } from "../actions";
+import {
+  verifyDomainAction,
+  deleteDomainAction,
+  checkDeliverabilityAction,
+  type DeliverabilityReport,
+} from "../actions";
+import { XCircleIcon, ShieldCheckIcon } from "lucide-react";
 
 interface DnsRecord {
   type: string;
@@ -61,6 +67,16 @@ function Copyable({ text }: { text: string }) {
 export function DomainDetail({ domain }: { domain: DomainView }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
+  const [report, setReport] = useState<DeliverabilityReport | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  async function runDeliverability() {
+    setChecking(true);
+    const res = await checkDeliverabilityAction(domain.id);
+    setChecking(false);
+    if (res?.error) return toast.error(res.error);
+    setReport(res.report!);
+  }
 
   async function verify() {
     setBusy(true);
@@ -145,6 +161,78 @@ export function DomainDetail({ domain }: { domain: DomainView }) {
             </Card>
           ))}
         </div>
+      </section>
+
+      <section className="space-y-4">
+        <div className="flex items-end justify-between gap-4">
+          <div className="space-y-1">
+            <p className="text-eyebrow">Direct delivery</p>
+            <h2 className="text-section text-foreground">Deliverability</h2>
+            <p className="text-caption text-muted-foreground">
+              Checks that this domain is ready to send straight to recipient mail
+              servers (SPF, DKIM, DMARC, reverse DNS, port 25).
+            </p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={runDeliverability}
+            loading={checking}
+          >
+            {!checking && <ShieldCheckIcon className="mr-1 size-4" />}
+            {checking ? "Checking…" : "Run check"}
+          </Button>
+        </div>
+
+        {report && (
+          <div className="space-y-3">
+            <p className="text-caption text-muted-foreground">
+              {report.passed}/{report.total} passed
+              {report.egressIp ? ` · egress ${report.egressIp}` : ""}
+              {report.ready ? " · ready to send ✅" : ""}
+            </p>
+            {report.checks.map((c) => (
+              <div
+                key={c.key}
+                className="flex items-start gap-3 rounded-md bg-muted px-3 py-2"
+              >
+                {c.ok ? (
+                  <CheckCircle2Icon className="mt-0.5 size-4 shrink-0 text-success" />
+                ) : (
+                  <XCircleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
+                )}
+                <div className="min-w-0">
+                  <p className="text-body-strong">{c.label}</p>
+                  <p className="break-all text-mono text-xs text-muted-foreground">
+                    {c.detail}
+                  </p>
+                </div>
+              </div>
+            ))}
+            {report.records.length > 0 && (
+              <div className="space-y-3 pt-2">
+                <p className="text-eyebrow">Records to publish</p>
+                {report.records.map((r) => (
+                  <Card key={r.purpose}>
+                    <CardContent className="space-y-3 p-5">
+                      <div className="flex items-center gap-2">
+                        <span className="text-body-strong">{r.purpose}</span>
+                        <Badge
+                          variant="outline"
+                          className="text-mono text-[10px]"
+                        >
+                          {r.type}
+                        </Badge>
+                      </div>
+                      <Field label="Name" value={r.name} />
+                      <Field label="Value" value={r.value} />
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </section>
     </div>
   );
