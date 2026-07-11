@@ -117,17 +117,30 @@ where the clean IP is. Core (API, web, Postgres, Redis, tracking) stays home.
 - [ ] *Later (optional):* inbound SMTP listener on the egress node for
       bounce-only MX, removing the IMAP dependency.
 
-## Phase 4 — Deliverability console (~1–2 days)
+## Phase 4 — Deliverability console — ✅ DONE (2026-07-11)
 
-- [ ] Domain health check in UI (extends `domains.service.ts`): SPF record
-      contains egress IP? DKIM DNS TXT matches stored key? DMARC present?
-      **PTR/FCrDNS of egress IP resolves and matches heloHostname?**
-      Live port-25 probe from the delivery node.
-- [ ] Warm-up scheduler: per-domain daily send cap with ramp
-      (20 → 50 → 100 → 250 → …), enforced in the rate limiter; UI progress.
-- [ ] One-click copy of the full DNS set per sending domain.
+- [x] Domain health check (`deliverability.ts` + `domains.service.
+      domainDeliverability`): SPF authorizes egress IP? DKIM TXT matches stored
+      key? DMARC present? PTR/FCrDNS of egress IP == heloHostname? Live outbound
+      port-25 probe. Exposed at `GET /api/domains/:id/deliverability`.
+- [x] Warm-up (`warmup.ts`): per-sending-domain daily cap ramping by sender age
+      (50→100→250→…→unlimited); worker defers over-cap direct sends to next day.
+- [x] Records generator + one-click copy in the web Deliverability panel
+      (SPF `ip4:<egress>`, DKIM, DMARC, PTR advisory).
+- [x] Tests: deliverability + warmup (11).
 
-## Phase 5 — Egress delivery node (ops, ~0.5–1 day)
+## Phase 5 — Egress delivery node (ops) — 🔧 CODE/DOCS READY (2026-07-11)
+
+Code side done — deploy kit in the **homelab** repo:
+`compose/mail-egress/docker-compose.yml` (runs the launchmail worker via
+`start:worker`, host networking, homelab DB/Redis over tailnet),
+`scripts/egress-node-setup.sh` (installs Docker+Tailscale, preflights PTR +
+port 25), `docs/mail-egress-node.md` (full walkthrough). Remaining is pure ops:
+get an IP with PTR + port 25 (friend's box or ~€4/mo VPS).
+
+The ONLY rented ingredient: an IP with a controllable PTR and open port 25.
+The launchmail brain (queue, DKIM, tracking, UI, data) stays on the homelab.
+Two ways to get that IP, cheapest first:
 
 The ONLY rented ingredient: an IP with a controllable PTR and open port 25.
 The launchmail brain (queue, DKIM, tracking, UI, data) stays on the homelab.

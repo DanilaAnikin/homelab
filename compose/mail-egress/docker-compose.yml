@@ -1,0 +1,40 @@
+# ============================================================================
+# Mail egress node (launchmail direct-delivery worker).
+#
+# Runs ONLY the launchmail worker, on a host with a clean public IP (PTR set,
+# outbound port 25 open). It consumes the SAME BullMQ/Redis queue as the homelab
+# over Tailscale and delivers mail straight to recipient MX servers — so all the
+# brains (API, DB, UI, DKIM keys) stay on the homelab; only the "send" hop lives
+# here where the IP has a good reputation.
+#
+# Prereqs on this host (see scripts/egress-node-setup.sh + docs/mail-egress-node.md):
+#   • Tailscale up (reaches the homelab's Postgres + Redis over the tailnet)
+#   • PTR of this host's public IP == MAIL_HELO_HOSTNAME
+#   • outbound TCP 25 open (provider may need a ticket to unlock)
+#
+# ⚠️ When this node runs, the homelab launchmail must NOT also run a mail worker
+# (otherwise the home worker — no PTR, maybe blocked :25 — would grab direct
+# jobs). On the homelab, run the api with `start` (api only), not `start:all`.
+# ============================================================================
+services:
+  mail-worker:
+    build:
+      context: ../../launchmail
+      dockerfile: Dockerfile.api
+    container_name: mail-worker
+    restart: unless-stopped
+    # Worker only — no migrations (the homelab owns the schema), no API.
+    command: ["/bin/sh", "-c", "cd /app/apps/api && pnpm run start:worker"]
+    environment:
+      # Homelab services over the tailnet (use the homelab's MagicDNS name or
+      # 100.x Tailscale IP). Passwords are the ones from launchmail's env.
+      DATABASE_URL: ${DATABASE_URL:?postgres URL to homelab over tailscale}
+      REDIS_URL: ${REDIS_URL:?redis URL to homelab over tailscale}
+      # MUST equal the homelab launchmail value — it decrypts the SMTP configs
+      # and DKIM private keys stored in the DB.
+      MAIL_ENCRYPTION_KEY: ${MAIL_ENCRYPTION_KEY:?}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?}
+      TZ: Europe/Prague
+    # Host networking: reach the tailnet (tailscaled runs on the host) AND send
+    # from the host's public IP (the one whose PTR we control) on port 25.
+    network_mode: host

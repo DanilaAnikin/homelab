@@ -20,7 +20,8 @@ domény, databáze, SMTP a zálohy. Vše self-hosted, žádné měsíční platb
 | `compose/postgres/` | sdílený PostgreSQL 17 + PgBouncer pro všechny projekty |
 | `compose/smtp/` | interní SMTP služba (relay přes Brevo) pro všechny appky |
 | `compose/monitoring/` | Uptime Kuma |
-| `launchmail/` | **vlastní mail platforma** (nezávislá kopie launchmailu) — self-hosted ESP; roadmap na plné direct-MX doručování: `launchmail/DIRECT_DELIVERY_PLAN.md` |
+| `launchmail/` | **vlastní mail platforma** (nezávislá kopie launchmailu) — self-hosted ESP s direct-MX doručováním (Fáze 1–4 hotové: rate limity, greylist retry, bounce handling, warm-up, deliverability konzole); roadmap: `launchmail/DIRECT_DELIVERY_PLAN.md` |
+| `compose/mail-egress/` + `docs/mail-egress-node.md` | **egress node** pro plné vlastní odesílání (host s PTR + port 25); do té doby jede Seznam SMTP smarthost |
 | `docs/networking.md` | Cloudflare Tunnel, domény, Tailscale |
 | `docs/new-project-recipe.md` | 5min recept: nový projekt od DNS po deploy |
 | `docs/backups-restore.md` | R2 + USB setup a hlavně: JAK OBNOVIT |

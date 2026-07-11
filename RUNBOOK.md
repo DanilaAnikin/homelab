@@ -108,9 +108,12 @@ jen znovu vytvoř ten SmtpConfig (typ **smarthost**):
 - [ ] Test: pošli sám sobě → dorazí do inboxu ✔
 
 **Odesílání — ENDGAME: `direct` (vlastní ESP, 0 třetích stran).** Kód hotový
-(Fáze 1). Až bude egress host s PTR + portem 25 (kamarádův server, nebo levná
-VPS — viz `launchmail/DIRECT_DELIVERY_PLAN.md` Phase 5), vytvoř SmtpConfig typu
-**Direct**, nastav ho jako default a Seznam nech jako fallback.
+(Fáze 1–4: direct-MX, rate limity, greylist retry, bounce handling, warm-up,
+deliverability konzole). Poslední krok je **egress node** (host s PTR + portem
+25 — kamarádův server, nebo levná VPS): kompletní návod + skript + compose v
+**`docs/mail-egress-node.md`**, `scripts/egress-node-setup.sh`,
+`compose/mail-egress/`. Pak v launchmail UI vytvoř **Direct** SmtpConfig, publikuj
+záznamy z Deliverability panelu, a Seznam nech jako fallback.
 
 **Monitoring:**
 ```bash
