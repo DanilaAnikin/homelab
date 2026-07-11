@@ -401,6 +401,7 @@ export const domainsRouter = new Hono<AppVariables>()
 const webhookEvent = z.enum([
   "email.sent",
   "email.failed",
+  "email.bounced",
   "form.submission",
   "incoming.received",
 ]);

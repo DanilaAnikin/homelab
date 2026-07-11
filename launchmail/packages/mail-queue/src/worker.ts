@@ -176,6 +176,9 @@ export function startWorker() {
           attachments,
           smtpConfig: config,
           dkim: dkim ?? undefined,
+          // VERP: encode the log id in the return-path so this message's async
+          // bounces (Phase 3) map straight back to this row.
+          returnPathToken: trackingId,
         });
 
         // The mail is already out the door. Any failure past this point must

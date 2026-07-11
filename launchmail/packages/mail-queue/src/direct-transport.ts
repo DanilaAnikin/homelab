@@ -21,6 +21,7 @@
 import { resolveMx } from "node:dns/promises";
 import nodemailer from "nodemailer";
 import type { SendMailInput } from "./smtp";
+import { verpReturnPath } from "./bounce";
 
 // Receiving MTAs are patient with greetings but we don't want a dead MX to pin
 // a worker slot. 20 s each is generous for a real server, fatal for a black hole.
@@ -208,8 +209,12 @@ export async function sendDirect(
   }
 
   // Envelope return-path aligned to the From domain so SPF authenticates and
-  // DMARC aligns. (Dedicated bounces@ VERP mailbox arrives in Phase 3.)
-  const returnPath = extractEmail(input.from);
+  // DMARC aligns. With a VERP token (the email-log id) the return-path becomes
+  // bounces+<id>@domain, so an async DSN maps back to the exact message.
+  const fromDomain = domainOf(extractEmail(input.from));
+  const returnPath = input.returnPathToken
+    ? verpReturnPath(fromDomain, input.returnPathToken)
+    : extractEmail(input.from);
   const envelopeRecipients = [
     ...(input.to ?? []),
     ...(input.cc ?? []),

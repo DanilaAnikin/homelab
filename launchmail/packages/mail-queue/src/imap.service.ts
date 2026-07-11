@@ -5,6 +5,8 @@ import { incomingEmails } from "@workspace/db/schemas";
 import type { SmtpConfig } from "./smtp-configs.service";
 import { updateImapState } from "./smtp-configs.service";
 import { dispatchEvent } from "./webhooks.service";
+import { parseBounce, type BounceResult } from "./bounce";
+import { processBounce } from "./bounce-handler";
 
 // On the very first sync of a mailbox we pull the most recent N messages so the
 // inbox is useful immediately without dragging in years of history in one shot.
@@ -74,12 +76,19 @@ async function parseMessageToRow(
   uid: number,
   source: Buffer,
   internalDate?: string | Date,
+  bounces?: Map<number, BounceResult>,
 ): Promise<InsertRow | null> {
   let parsed: ParsedMail;
   try {
     parsed = await simpleParser(source);
   } catch {
     return null;
+  }
+  // Bounce detection: collect DSNs so the caller can suppress dead recipients
+  // after ingest. The message is still stored normally (users see the bounce).
+  if (bounces) {
+    const b = parseBounce(parsed);
+    if (b.isBounce) bounces.set(uid, b);
   }
   const from = toAddrs(parsed.from)[0];
   const attachments = (parsed.attachments ?? [])
@@ -204,6 +213,7 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
           let maxUid = lastUid;
           let minUid = Infinity;
           const rows: InsertRow[] = [];
+          const bounces = new Map<number, BounceResult>();
 
           for await (const msg of client.fetch(
             range,
@@ -224,6 +234,7 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
               uid,
               msg.source,
               msg.internalDate,
+              bounces,
             );
             if (!row) continue;
             rows.push(row);
@@ -232,6 +243,16 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
 
           const inserted = rows.length ? await ingest(rows) : [];
           fetched = inserted.length;
+
+          // Process permanent bounces among the genuinely-new messages: suppress
+          // the dead recipient + mark the original send bounced. Only new mail
+          // (not backfill) so we never act on ancient DSNs.
+          for (const m of inserted) {
+            const b = bounces.get(m.imapUid);
+            if (b?.permanent) {
+              void processBounce(config.organizationId, b).catch(() => undefined);
+            }
+          }
 
           // firstUid is the lowest UID we hold — the start point for backfill.
           // It only ever moves down (first sync sets it; backfill lowers it).

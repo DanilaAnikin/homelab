@@ -66,6 +66,9 @@ export interface SendMailInput {
   attachments?: { filename: string; content: string; contentType?: string }[];
   smtpConfig: SmtpConfig;
   dkim?: { domainName: string; keySelector: string; privateKey: string };
+  // For direct delivery: the email-log id, encoded into the VERP return-path
+  // (bounces+<id>@domain) so async bounces map back to this exact message.
+  returnPathToken?: string;
 }
 
 function formatRecipients(

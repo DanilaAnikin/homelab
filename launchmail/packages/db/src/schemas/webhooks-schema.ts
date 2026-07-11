@@ -12,6 +12,7 @@ import { organization } from "./auth-schema";
 export const WEBHOOK_EVENTS = [
   "email.sent",
   "email.failed",
+  "email.bounced",
   "form.submission",
   "incoming.received",
 ] as const;
