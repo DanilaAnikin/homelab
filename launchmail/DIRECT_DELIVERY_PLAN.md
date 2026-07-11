@@ -86,34 +86,36 @@ where the clean IP is. Core (API, web, Postgres, Redis, tracking) stays home.
       send to Gmail+Seznam → inbox, `spf=pass dkim=pass`. Code is ready; only
       blocked on a host with PTR + open port 25 (Phase 5).
 
-## Phase 2 — Queue hardening for direct mode (~1–2 days)
+## Phase 2 — Queue hardening for direct mode — ✅ DONE (2026-07-11)
 
-- [ ] Per-recipient-domain rate limiter (Redis token bucket in worker;
-      config: default N/min + per-domain overrides for gmail.com etc.).
-- [ ] Direct-mode retry schedule replacing the flat 3×: e.g.
-      1m → 5m → 15m → 1h → 4h → 8h → … cap 24–48 h (greylisting-friendly),
-      then permanent-fail. (BullMQ custom backoff strategy.)
-- [ ] Permanent 5xx → auto-insert into suppressions + webhook event + email
-      log status (`delivered | deferred | bounced` + last SMTP response).
-- [ ] Acceptance: forced 4xx (greylisting sim) retries on schedule; forced
-      5xx suppresses recipient and fires webhook.
+- [x] Per-domain rate limiter (`rate-limiter.ts`): Redis fixed-window caps
+      (Gmail 20/min, Outlook 15/min, Seznam 30/min, default 60/min). Over
+      budget → `job.moveToDelayed` + `DelayedError` (no retry consumed).
+      Direct-only; smarthost untouched.
+- [x] Greylisting-friendly retry schedule (`backoff.ts`): 1m → 5m → 15m → 1h
+      → 4h → 8h → 24h via BullMQ custom `backoffStrategy`; `attempts` = 8.
+- [x] Failures log `deferred` (will retry) vs `failed` vs `bounced`, upserted
+      by trackingId (one row/message); hard bounce → suppression + webhook.
+- [x] Unit tests: backoff + rate-limiter (8).
+- [ ] *Later:* live acceptance (forced 4xx/5xx) — needs a running stack.
 
-## Phase 3 — Bounce ingestion (DSN) via existing IMAP path (~2–3 days)
+## Phase 3 — Bounce ingestion (DSN) via IMAP path — ✅ DONE (2026-07-11)
 
-Async bounces (accepted then bounced later) arrive at the **return-path
-mailbox**. We already sync mailboxes via IMAP — reuse it:
-
-- [ ] Point `Return-Path`/`MAIL FROM` at `bounces@<sending-domain>`, mailbox
-      IMAP-synced by the existing `imap.service.ts` machinery.
-- [ ] VERP: `bounces+<messageId>@…` so each DSN maps to the exact message
-      without parsing the (often mangled) original.
-- [ ] DSN/ARF parser job: detect `multipart/report`, extract status +
-      recipient (`mailparser` is already in the stack via inbox) →
-      suppression + email-log update + webhook.
-- [ ] Acceptance: send to a nonexistent Gmail address → async DSN parsed,
-      recipient suppressed automatically, event visible in UI.
-- [ ] *Later (optional):* lightweight inbound SMTP listener on the delivery
-      node for bounce-only MX, removing the IMAP dependency.
+- [x] VERP: `verpReturnPath`/`parseVerpToken` (`bounce.ts`); worker passes the
+      log id as `returnPathToken`; direct-transport sets
+      `MAIL FROM = bounces+<logId>@domain`.
+- [x] DSN parser (`bounce.ts`): detects `multipart/report`/daemon/subject,
+      extracts Final-Recipient/Action/Status/Diagnostic (delivery-status part +
+      body fallback), permanent 5.x.x vs transient 4.x.x.
+- [x] `imap.service.ts` collects DSNs during sync; `bounce-handler.ts` marks
+      the email_log `bounced` (VERP token, else newest sent-to-recipient),
+      suppresses the address, fires `email.bounced` webhook. New-mail only.
+- [x] Unit tests: DSN parse + VERP (6).
+- [ ] **Ops (Phase 5):** a `bounces@<domain>` mailbox (plus-addressing /
+      catch-all) configured as a receive-enabled smtp_config so VERP DSNs are
+      IMAP-synced. Until then bounces surface via the From mailbox if synced.
+- [ ] *Later (optional):* inbound SMTP listener on the egress node for
+      bounce-only MX, removing the IMAP dependency.
 
 ## Phase 4 — Deliverability console (~1–2 days)
 
