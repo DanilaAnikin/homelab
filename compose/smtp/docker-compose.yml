@@ -1,0 +1,37 @@
+# ============================================================================
+# Vlastní SMTP služba pro všechny aplikace.
+# Appky posílají na smtp:587 (interní síť, bez auth) → Postfix relayuje ven
+# přes smarthost (Brevo free / Resend / SES — jen změna .env).
+# PROČ relay: domácí IP = blacklisty + blokovaný port 25 → přímé odesílání
+# nedoručuje. Detaily v PLAN.md sekce E-maily.
+#
+# Env pro aplikace:  SMTP_HOST=smtp  SMTP_PORT=587  (bez TLS, bez hesla)
+# ============================================================================
+services:
+  smtp:
+    image: boky/postfix:latest
+    container_name: smtp
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Prague
+      HOSTNAME: ${SMTP_HELO_HOSTNAME:?nastav v .env}            # napr. mail.tvoje-domena.cz
+      ALLOWED_SENDER_DOMAINS: ${ALLOWED_SENDER_DOMAINS:?}       # "domena1.cz domena2.cz"
+      RELAYHOST: ${RELAYHOST:?}                                 # [smtp-relay.brevo.com]:587
+      RELAYHOST_USERNAME: ${RELAYHOST_USERNAME:?}
+      RELAYHOST_PASSWORD: ${RELAYHOST_PASSWORD:?}
+      # přijímej poštu jen z interních docker sítí:
+      POSTFIX_mynetworks: "127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+    networks: [dokploy-network]
+
+  # ── Volitelné: Mailpit pro DEV — chytá maily místo odesílání ──────────────
+  # V dev prostředí nastav SMTP_HOST=mailpit, SMTP_PORT=1025; UI na :8025.
+  # mailpit:
+  #   image: axllent/mailpit:latest
+  #   container_name: mailpit
+  #   restart: unless-stopped
+  #   ports: ["127.0.0.1:8025:8025"]
+  #   networks: [dokploy-network]
+
+networks:
+  dokploy-network:
+    external: true

@@ -1,0 +1,21 @@
+# ── Secrets — NIKDY do gitu ─────────────────────────────────
+secrets/
+*.env
+*.env.*
+!*.env.example
+!.env.example
+compose/postgres/pgbouncer/userlist.txt
+
+# ── Velké / runtime věci ────────────────────────────────────
+iso/
+compose/postgres/data/
+compose/monitoring/data/
+
+# ── launchmail (build artefakty a závislosti) ───────────────
+launchmail/node_modules/
+launchmail/**/node_modules/
+launchmail/.turbo/
+launchmail/**/.turbo/
+launchmail/**/.next/
+launchmail/**/dist/
+launchmail/docker/

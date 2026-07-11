@@ -1,0 +1,150 @@
+services:
+  postgres:
+    container_name: postgres
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: launchmail
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d launchmail"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - app_network
+
+  redis:
+    container_name: redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-password}"]
+    networks:
+      - app_network
+
+  api:
+    container_name: api
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    # On a multi-network container Traefik must be told which network to use to
+    # reach it; otherwise it may pick app_network (where Traefik isn't) and return
+    # 502. This pins it to the proxy network for the relay.launchday.cz domain.
+    labels:
+      - "traefik.docker.network=dokploy-network"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-password}@postgres:5432/launchmail
+      REDIS_URL: redis://:${REDIS_PASSWORD:-password}@redis:6379
+      # Required secrets. Fail fast with a clear message if unset — set these in
+      # your host/PaaS environment (Dokploy/Coolify env settings), NOT a committed
+      # file. MAIL_ENCRYPTION_KEY must be set once and never changed.
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET (min 32 chars)}
+      MAIL_ENCRYPTION_KEY: ${MAIL_ENCRYPTION_KEY:?set MAIL_ENCRYPTION_KEY (any stable secret; set once, never change)}
+      # Public origin (the web domain) used for invite links, tracking pixels,
+      # click/unsubscribe links — all served same-origin and proxied to the api.
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:3000}
+      # Allowed browser origin(s) for CORS on the backend.
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      # Number of trusted reverse proxies in front of the API (PaaS proxy = 1)
+      # so the per-IP form rate-limit reads a trustworthy client address.
+      TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-1}
+    # Optional local convenience file — absent on a fresh git clone / PaaS, so it
+    # must not be required (vars above come from the platform environment).
+    env_file:
+      - path: .env
+        required: false
+    # Not published to the host — the web service proxies to it over the Docker
+    # network (http://api:5000). Only expose it in-cluster.
+    expose:
+      - "5000"
+    healthcheck:
+      # Probe 127.0.0.1 (not "localhost"): the server binds 0.0.0.0 (IPv4), but
+      # "localhost" can resolve to ::1 first in Alpine, making the check fail
+      # forever even though the API is up. The generous start_period covers the
+      # one-time migration + tsx cold-start before the server begins listening.
+      test:
+        ["CMD-SHELL", "wget -q -O - http://127.0.0.1:5000/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    # app_network for in-cluster comms; dokploy-network so the PaaS proxy can
+    # route the public api domain (relay.launchday.cz) to this container.
+    networks:
+      - app_network
+      - dokploy-network
+
+  web:
+    container_name: web
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Baked into the Next.js rewrite manifest at build time — must be the
+        # in-cluster backend, not localhost. (Runtime API_URL below only covers
+        # server-component fetches, not the baked proxy rewrites.)
+        API_URL: http://api:5000
+    restart: unless-stopped
+    # On a multi-network container Traefik must be told which network to use to
+    # reach it; otherwise it may pick app_network (where Traefik isn't) and return
+    # 502. This pins it to the proxy network for the mail.launchday.cz domain.
+    labels:
+      - "traefik.docker.network=dokploy-network"
+    # Wait for the api container to start, but do NOT gate the whole deploy on
+    # its healthcheck: `docker compose up` (used by the PaaS) fails the deploy if
+    # a service_healthy dependency isn't healthy within its wait window, and the
+    # api's one-time migration + tsx cold-start can exceed it. The web proxies to
+    # the api at request time and tolerates a few seconds of api warm-up.
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      # Internal proxy target — the web forwards /api,/f,/t,/u,/public to the
+      # backend over the Docker network. Always the service name, never an
+      # override from .env (which is meant for local dev = localhost:5000).
+      API_URL: http://api:5000
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-password}@postgres:5432/launchmail
+      REDIS_URL: redis://:${REDIS_PASSWORD:-password}@redis:6379
+    # Optional local convenience file — not required (absent on a fresh clone / PaaS).
+    env_file:
+      - path: .env
+        required: false
+    # Only exposed in-cluster; the PaaS reverse proxy (Dokploy/Coolify Traefik)
+    # routes the public domain to this container's port 3000 over its own
+    # network. Do NOT publish a fixed host port here — on a shared PaaS host
+    # `3000:3000` collides with whatever already holds host port 3000 ("port is
+    # already allocated"). For plain local `docker compose up`, add a
+    # docker-compose.override.yml with `ports: ["3000:3000"]`.
+    expose:
+      - "3000"
+    # ONLY dokploy-network. Dokploy/Traefik 502s a compose service that is on
+    # multiple networks (it may resolve the container on app_network, where
+    # Traefik isn't) — a known Dokploy issue. web doesn't need app_network: it
+    # only talks to the api, which is also on dokploy-network. Single network =
+    # unambiguous Traefik routing.
+    networks:
+      - dokploy-network
+
+volumes:
+  pg_data:
+
+networks:
+  app_network:
+    driver: bridge
+  # Created by Dokploy at install; the Traefik proxy is attached to it. Marked
+  # external so compose joins the existing network instead of creating a new one.
+  # If your PaaS proxy network has a different name, change it here (check with
+  # `docker network ls`).
+  dokploy-network:
+    external: true

@@ -1,0 +1,33 @@
+{
+  "name": "@workspace/mail-queue",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "lint": "eslint",
+    "format": "prettier --write \"**/*.{ts,tsx}\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@workspace/db": "workspace:*",
+    "bullmq": "^5.51.0",
+    "drizzle-orm": "^0.45.2",
+    "imapflow": "^1.4.3",
+    "ioredis": "^5.8.2",
+    "mailparser": "^3.9.12",
+    "nodemailer": "^6.10.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^25.1.0",
+    "@types/nodemailer": "^6.4.17",
+    "@workspace/eslint-config": "workspace:*",
+    "@workspace/typescript-config": "workspace:*",
+    "eslint": "^9.39.2",
+    "typescript": "^5.9.3"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

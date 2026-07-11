@@ -1,0 +1,68 @@
+# ============================================================================
+# Sdílený PostgreSQL 17 + PgBouncer pro VŠECHNY projekty.
+# Model jako Supabase: pooled port 6432 (aplikace) / direct 5432 (migrace).
+#
+# Před startem (viz RUNBOOK fáze 5):
+#   1) cp .env.example .env  a vyplň hesla (openssl rand -hex 24)
+#   2) vygeneruj pgbouncer/userlist.txt z .env
+#   3) docker compose up -d
+# Nové databáze pak: /srv/homelab/scripts/newdb.sh <projekt>
+# ============================================================================
+services:
+  postgres:
+    image: postgres:17
+    container_name: shared-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?nastav v .env}
+      PGBOUNCER_PASSWORD: ${PGBOUNCER_PASSWORD:?nastav v .env}
+      POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=und"
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=4GB          # ~1/8 RAM stroje: DB dostane slušný kus, appky zbytek
+      - -c
+      - effective_cache_size=8GB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1        # NVMe
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - log_min_duration_statement=500   # loguj dotazy pomalejší než 500 ms
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"   # jen localhost — admin z notebooku přes ssh -L
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [dokploy-network]
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: shared-pgbouncer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    networks: [dokploy-network]
+
+networks:
+  dokploy-network:
+    external: true   # síť vytváří Dokploy — instaluj Dokploy PŘED spuštěním

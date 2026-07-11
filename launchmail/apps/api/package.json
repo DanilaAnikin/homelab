@@ -1,0 +1,26 @@
+{
+  "name": "api",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "concurrently -n api,worker -c blue,green \"tsx watch src/server.ts\" \"tsx watch src/worker.ts\"",
+    "start": "tsx src/server.ts",
+    "start:worker": "tsx src/worker.ts",
+    "start:all": "concurrently --kill-others-on-fail -n api,worker -c blue,green \"tsx src/server.ts\" \"tsx src/worker.ts\""
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@workspace/db": "workspace:*",
+    "@workspace/mail-queue": "workspace:*",
+    "@workspace/server": "workspace:*",
+    "@workspace/templates": "workspace:*",
+    "hono": "^4.12.21"
+  },
+  "devDependencies": {
+    "@types/node": "^25.1.0",
+    "@workspace/typescript-config": "workspace:*",
+    "concurrently": "^10.0.3",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}

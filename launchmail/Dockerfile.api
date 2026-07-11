@@ -1,0 +1,38 @@
+FROM node:20-alpine AS base
+
+FROM base AS pruner
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g turbo
+WORKDIR /app
+COPY . .
+RUN turbo prune api --docker
+
+FROM base AS installer
+WORKDIR /app
+COPY --from=pruner /app/out/json/ .
+COPY --from=pruner /app/out/pnpm-lock.yaml .
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store,id=pnpm \
+    --mount=type=cache,target=/root/.npm \
+    npm install -g pnpm && pnpm install --frozen-lockfile
+
+FROM base AS builder
+WORKDIR /app
+COPY --from=pruner /app/out/pnpm-lock.yaml ./
+COPY --from=installer /app/node_modules ./node_modules
+COPY --from=pruner /app/out/full/ .
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store,id=pnpm \
+    npm install -g pnpm && pnpm install --offline
+
+FROM base AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+RUN npm install -g pnpm
+COPY --from=builder /app/apps/api ./apps/api
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/packages ./packages
+COPY --from=builder /app/package.json ./package.json
+EXPOSE 5000
+# Apply the idempotent migration (schema + backfill), then run the API + worker on Node.
+# Use '&&' so a failed migration aborts startup (non-zero exit) and Docker's
+# restart policy retries — never start the app against an unmigrated schema.
+CMD ["/bin/sh", "-c", "cd /app/packages/db && pnpm exec tsx src/migrate.ts && cd /app/apps/api && pnpm run start:all"]

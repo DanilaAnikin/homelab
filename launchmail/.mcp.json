@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "launchmail": {
+      "command": "pnpm",
+      "args": ["--silent", "--filter", "mcp", "start"],
+      "env": {
+        "LAUNCHMAIL_API_URL": "http://localhost:5000",
+        "LAUNCHMAIL_API_KEY": "${LAUNCHMAIL_API_KEY}"
+      }
+    }
+  }
+}

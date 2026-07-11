@@ -1,0 +1,30 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "tui",
+  "globalEnv": ["DATABASE_URL", "REDIS_URL", "BETTER_AUTH_SECRET", "BETTER_AUTH_URL", "API_URL", "PUBLIC_API_URL", "NEXT_PUBLIC_API_URL", "WEB_ORIGIN", "MAIL_ENCRYPTION_KEY", "LAUNCHMAIL_API_URL", "LAUNCHMAIL_API_KEY", "PORT", "TRACKING_DISABLED", "TRUSTED_PROXY_COUNT"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", ".env*"],
+      "outputs": [".next/**", "!.next/cache/**"]
+    },
+    "lint": {
+      "dependsOn": ["^lint"]
+    },
+    "format": {
+      "dependsOn": ["^format"]
+    },
+    "typecheck": {
+      "dependsOn": ["^typecheck"]
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "env": ["DATABASE_URL", "REDIS_URL", "MAILPIT_API_URL", "SMTP_HOST", "SMTP_PORT", "MAIL_ENCRYPTION_KEY"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true,
+      "env": ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"]
+    }
+  }
+}

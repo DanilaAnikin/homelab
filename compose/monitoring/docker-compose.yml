@@ -1,0 +1,20 @@
+# ============================================================================
+# Uptime Kuma — hlídá weby (HTTP), postgres/smtp (TCP) a zálohy (push monitor).
+# UI: http://homelab:3001 (přes Tailscale) nebo http://<LAN-IP>:3001.
+# Je v dokploy-network → interní služby hlídá jménem (shared-postgres, smtp).
+# Alerty: v Kuma UI si nastav notifikaci (e-mail přes smtp:587 / Telegram).
+# ============================================================================
+services:
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "3001:3001"   # LAN + Tailscale; z internetu nedostupné (NAT, žádný forward)
+    networks: [dokploy-network]
+
+networks:
+  dokploy-network:
+    external: true

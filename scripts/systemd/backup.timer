@@ -1,0 +1,10 @@
+[Unit]
+Description=Denni homelab zaloha ve 3:30
+
+[Timer]
+OnCalendar=*-*-* 03:30
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
