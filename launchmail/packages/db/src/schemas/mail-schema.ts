@@ -113,7 +113,7 @@ export const emailLogs = pgTable(
     from: text("from").notNull(),
     to: jsonb("to").notNull().$type<{ email: string; name?: string }[]>(),
     subject: text("subject").notNull(),
-    status: text("status").notNull(), // sent | failed | suppressed
+    status: text("status").notNull(), // sent | deferred | failed | bounced | suppressed
     // The message body we composed (HTML + text), so the logs drawer can show
     // its content (previously only metadata was persisted). Stored WITHOUT
     // tracking artifacts — open/click pixels are injected only into the

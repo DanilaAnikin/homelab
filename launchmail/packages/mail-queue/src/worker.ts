@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Worker } from "bullmq";
+import { Worker, DelayedError } from "bullmq";
 import { REDIS_URL } from "./redis";
 import { sendMail } from "./smtp";
 import { getSmtpConfigById } from "./smtp-configs.service";
@@ -7,6 +7,9 @@ import { filterSuppressed, addSuppression } from "./suppressions.service";
 import { dispatchEvent } from "./webhooks.service";
 import { injectTracking, trackingEnabled } from "./tracking.service";
 import { findSigningDomain } from "./domains.service";
+import { classifyDeliveryError } from "./direct-transport";
+import { mailBackoffDelay, MAIL_JOB_ATTEMPTS } from "./backoff";
+import { consumeDomainToken } from "./rate-limiter";
 import { db } from "@workspace/db";
 import { emailLogs } from "@workspace/db/schemas";
 import { and, eq } from "drizzle-orm";
@@ -55,7 +58,7 @@ function isHardBounce(err: { responseCode?: number; message?: string }): boolean
 export function startWorker() {
   const worker = new Worker<EmailJobData>(
     "mail-queue",
-    async (job) => {
+    async (job, token) => {
       const {
         smtpConfigId,
         organizationId,
@@ -122,6 +125,31 @@ export function startWorker() {
             error: "All recipients are suppressed",
           });
           return { skipped: true };
+        }
+      }
+
+      // Per-domain rate limiting for direct delivery: keep bursts under the
+      // big providers' thresholds. Over budget → re-delay this job (no retry
+      // attempt consumed) until the window rolls over. Smarthost skips this
+      // (the relay meters its own throughput).
+      if (config.type === "direct") {
+        const domains = new Set(
+          [...recipients, ...(cc ?? []), ...(bcc ?? [])].map((r) =>
+            r.email.slice(r.email.lastIndexOf("@") + 1).toLowerCase(),
+          ),
+        );
+        let waitMs = 0;
+        for (const d of domains) {
+          if (!d) continue;
+          const decision = await consumeDomainToken(d);
+          if (!decision.allowed) waitMs = Math.max(waitMs, decision.retryAfterMs);
+        }
+        if (waitMs > 0) {
+          console.log(
+            `[worker] Rate-limited ${job.id} → re-delaying ${waitMs}ms`,
+          );
+          await job.moveToDelayed(Date.now() + waitMs, token);
+          throw new DelayedError();
         }
       }
 
@@ -193,21 +221,47 @@ export function startWorker() {
         const smtpErr = err as { responseCode?: number; message?: string };
         const errMessage =
           err instanceof Error ? err.message : String(err);
-        await db.insert(emailLogs).values({
-          smtpConfigId,
-          organizationId: organizationId ?? null,
-          userId: userId ?? null,
-          from,
-          to,
-          subject,
-          status: "failed",
-          html: html ?? null,
-          text: text ?? null,
-          inReplyTo: inReplyTo ?? null,
-          error: errMessage,
-        });
 
-        if (organizationId) {
+        const hardBounce = isHardBounce(smtpErr);
+        const attemptsMade = job.attemptsStarted ?? 1;
+        const maxAttempts = job.opts.attempts ?? MAIL_JOB_ATTEMPTS;
+        // Will BullMQ retry this job? Only if attempts remain AND the error is
+        // transient (network / 4xx). A hard bounce or an out-of-attempts send
+        // is terminal.
+        const willRetry =
+          !hardBounce &&
+          attemptsMade < maxAttempts &&
+          classifyDeliveryError(smtpErr).retryable;
+        const status = hardBounce
+          ? "bounced"
+          : willRetry
+            ? "deferred"
+            : "failed";
+
+        // One log row per message (keyed by trackingId), updated each attempt:
+        // deferred → deferred → … → failed/bounced. Avoids a row per retry.
+        await db
+          .insert(emailLogs)
+          .values({
+            id: trackingId,
+            smtpConfigId,
+            organizationId: organizationId ?? null,
+            userId: userId ?? null,
+            from,
+            to,
+            subject,
+            status,
+            html: html ?? null,
+            text: text ?? null,
+            inReplyTo: inReplyTo ?? null,
+            error: errMessage,
+          })
+          .onConflictDoUpdate({
+            target: emailLogs.id,
+            set: { status, error: errMessage },
+          });
+
+        if (organizationId && !willRetry) {
           void dispatchEvent(organizationId, "email.failed", {
             to: recipients.map((r) => r.email),
             subject,
@@ -216,7 +270,7 @@ export function startWorker() {
         }
 
         // Auto-suppress recipients on a hard bounce to protect reputation.
-        if (organizationId && isHardBounce(smtpErr)) {
+        if (organizationId && hardBounce) {
           for (const r of recipients) {
             await addSuppression(organizationId, r.email, "bounce").catch(
               () => undefined,
@@ -225,7 +279,7 @@ export function startWorker() {
         }
 
         console.error(
-          `[worker] Failed: ${job.id} (attempt ${job.attemptsStarted}/${job.opts.attempts}): ${errMessage}`,
+          `[worker] ${status}: ${job.id} (attempt ${attemptsMade}/${maxAttempts}): ${errMessage}`,
         );
         throw err;
       }
@@ -236,6 +290,11 @@ export function startWorker() {
       limiter: {
         max: 50,
         duration: 1000,
+      },
+      // Greylisting-friendly retry spacing (see backoff.ts). Job opts set
+      // backoff.type = "custom" so this strategy is used.
+      settings: {
+        backoffStrategy: (attemptsMade: number) => mailBackoffDelay(attemptsMade),
       },
     },
   );

@@ -1,5 +1,6 @@
 import { Queue } from "bullmq";
 import { REDIS_URL } from "./redis";
+import { MAIL_JOB_ATTEMPTS } from "./backoff";
 
 export interface EmailJobData {
   smtpConfigId: string;
@@ -25,8 +26,10 @@ export interface EmailJobData {
 export const mailQueue = new Queue<EmailJobData>("mail-queue", {
   connection: { url: REDIS_URL },
   defaultJobOptions: {
-    attempts: 3,
-    backoff: { type: "exponential", delay: 5000 },
+    // Greylisting-friendly retries: the worker's custom backoffStrategy
+    // (backoff.ts) spaces attempts 1m → 5m → 15m → 1h → 4h → 8h → 24h.
+    attempts: MAIL_JOB_ATTEMPTS,
+    backoff: { type: "custom" },
     removeOnComplete: { age: 3600 * 24 },
     removeOnFail: { age: 3600 * 24 * 7 },
   },
