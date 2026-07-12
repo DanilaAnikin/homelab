@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { LaunchMailClient } from "@workspace/sdk";
+import { LaunchMailClient } from "@danilaanikin/launchmail";
 
 const baseUrl = process.env.LAUNCHMAIL_API_URL ?? "http://localhost:5000";
 const apiKey = process.env.LAUNCHMAIL_API_KEY;

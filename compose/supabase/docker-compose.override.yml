@@ -1,0 +1,27 @@
+# ============================================================================
+# Our overrides on top of the upstream supabase-docker/docker-compose.yml.
+# Run BOTH files:
+#   docker compose -f supabase-docker/docker-compose.yml \
+#                  -f docker-compose.override.yml up -d
+#
+# This layer ONLY adds env (compose merges env additively). Service REMOVAL
+# (supavisor) and port hardening are done by editing the fetched base — an
+# override can't delete a service or a published port. See README.
+# ============================================================================
+services:
+  # Point the Storage API at Cloudflare R2 instead of the local filesystem
+  # volume. Object metadata + RLS still live in Postgres (storage schema); only
+  # the bytes go to R2. Values come from .env (STORAGE_BACKEND / STORAGE_S3_*).
+  # If you prefer the filesystem backend, set STORAGE_BACKEND=file in .env and
+  # this block is a harmless no-op (falls back to the base volume).
+  storage:
+    environment:
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-file}
+      GLOBAL_S3_BUCKET: ${STORAGE_S3_BUCKET:-stub}
+      GLOBAL_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-}
+      GLOBAL_S3_PROTOCOL: https
+      GLOBAL_S3_FORCE_PATH_STYLE: "true"   # required for R2 (non-AWS S3)
+      REGION: ${STORAGE_S3_REGION:-auto}
+      AWS_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_ACCESS_KEY:-}
+      TUS_ALLOW_S3_TAGS: "false"           # R2 lacks x-amz-tagging → TUS uploads 500 without this

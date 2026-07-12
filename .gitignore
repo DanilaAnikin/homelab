@@ -10,6 +10,8 @@ compose/postgres/pgbouncer/userlist.txt
 iso/
 compose/postgres/data/
 compose/monitoring/data/
+compose/supabase/supabase-docker/
+compose/supabase/.tmp-supabase/
 
 # ── launchmail (build artefakty a závislosti) ───────────────
 launchmail/node_modules/

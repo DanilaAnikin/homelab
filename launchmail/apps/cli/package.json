@@ -10,7 +10,7 @@
     "format": "prettier --write \"**/*.{ts,tsx}\""
   },
   "dependencies": {
-    "@workspace/sdk": "workspace:*",
+    "@danilaanikin/launchmail": "workspace:*",
     "commander": "^12.1.0"
   },
   "devDependencies": {

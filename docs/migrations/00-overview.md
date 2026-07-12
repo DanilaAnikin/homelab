@@ -87,8 +87,13 @@ RLS-heavy produkcí jdi **Strategií A**. U connection-string appek Strategií B
 - `type-mobile-expo.md` — Expo mobil (hummy, explain-and-act mobil) — API vrstva
 - `type-python-and-static.md` — Python boti + statické (nate_trader, openClawTrader, teriProjekt)
 
-**Deep runbook:**
+**Per-projekt runbooky:**
 - `migrate-freio.md` — kompletní pečlivý postup pro Freio (produkce, klienti, data)
+- `leadcrm.md` — referenční vzor (Strategie B); jen čtený audit + cutover přes zmražení zápisů, pozor na sdílený projekt s leadgen
+
+**Připravené artefakty (v den migrace jen spustíš):**
+- `compose/supabase/` — kostra self-hosted Supabase stacku pro Dokploy (Strategie A)
+- `launchmail/packages/sdk/` (`@danilaanikin/launchmail`) — SDK, co appky importují místo kopírování LaunchMail klienta
 
 ---
 

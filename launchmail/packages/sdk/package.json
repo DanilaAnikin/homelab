@@ -1,21 +1,46 @@
 {
-  "name": "@workspace/sdk",
-  "version": "0.0.0",
+  "name": "@danilaanikin/launchmail",
+  "version": "0.1.0",
+  "description": "Typed, zero-dependency client for the self-hosted LaunchMail API (send, inbox pull, webhook verification).",
   "type": "module",
-  "private": true,
+  "license": "UNLICENSED",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DanilaAnikin/homelab.git",
+    "directory": "launchmail/packages/sdk"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "main": "./dist/index.cjs",
+    "module": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "require": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": ["dist"],
   "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
     "lint": "eslint",
     "format": "prettier --write \"**/*.{ts,tsx}\"",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "tsup"
   },
   "devDependencies": {
     "@types/node": "^25.1.0",
     "@workspace/eslint-config": "workspace:*",
     "@workspace/typescript-config": "workspace:*",
     "eslint": "^9.39.2",
+    "tsup": "^8.3.5",
     "typescript": "^5.9.3"
-  },
-  "exports": {
-    ".": "./src/index.ts"
   }
 }

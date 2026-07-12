@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { LaunchMailClient } from "@workspace/sdk";
+import { LaunchMailClient } from "@danilaanikin/launchmail";
 
 function client(): LaunchMailClient {
   const apiKey = process.env.LAUNCHMAIL_API_KEY;
