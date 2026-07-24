@@ -1,7 +1,6 @@
 "use client"
 
 import { useState } from "react"
-import { useRouter } from "next/navigation"
 import Link from "next/link"
 import { EyeIcon, EyeOffIcon } from "lucide-react"
 import { authClient } from "@/lib/auth-client"
@@ -16,7 +15,6 @@ function safeRedirect(raw: string | null): string {
 }
 
 export default function LoginPage() {
-  const router = useRouter()
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [showPassword, setShowPassword] = useState(false)
@@ -41,8 +39,13 @@ export default function LoginPage() {
       setError(authError.message ?? "Something went wrong")
       setLoading(false)
     } else {
-      router.push(redirectTo)
-      router.refresh()
+      // Full-page navigation (not router.push): the session lives in the
+      // lm_token cookie that better-auth's onSuccess just wrote client-side, and
+      // a soft RSC navigation can serve a prefetched logged-out /dashboard from
+      // the router cache (its RSC render ran getSession before the cookie
+      // existed) -> instant bounce back to /login. A hard load guarantees the
+      // server renders /dashboard with the cookie present.
+      window.location.href = redirectTo
     }
   }
 

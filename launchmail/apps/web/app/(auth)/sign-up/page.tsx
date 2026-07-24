@@ -1,7 +1,6 @@
 "use client"
 
 import { useState } from "react"
-import { useRouter } from "next/navigation"
 import Link from "next/link"
 import { EyeIcon, EyeOffIcon } from "lucide-react"
 import { authClient } from "@/lib/auth-client"
@@ -16,7 +15,6 @@ function safeRedirect(raw: string | null): string {
 }
 
 export default function SignUpPage() {
-  const router = useRouter()
   const [name, setName] = useState("")
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
@@ -43,8 +41,10 @@ export default function SignUpPage() {
       setError(authError.message ?? "Something went wrong")
       setLoading(false)
     } else {
-      router.push(redirectTo)
-      router.refresh()
+      // Full-page navigation (not router.push): see login/page.tsx — a soft RSC
+      // navigation can bounce to /login off a prefetched logged-out /dashboard
+      // before the just-written lm_token cookie is used. A hard load avoids it.
+      window.location.href = redirectTo
     }
   }
 
