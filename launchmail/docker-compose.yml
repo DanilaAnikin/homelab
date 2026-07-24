@@ -1,6 +1,11 @@
+# NOTE: internal service names MUST be project-unique on a shared Dokploy host.
+# Generic names like `postgres`/`redis` collide with the shared cluster
+# (`shared-postgres` is aliased `postgres` on dokploy-network) and with other
+# projects — a multi-network container then resolves the WRONG DB and fails auth
+# (28P01). Hence the `launchmail-` prefix everywhere below.
 services:
-  postgres:
-    container_name: postgres
+  launchmail-postgres:
+    container_name: launchmail-postgres
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -17,16 +22,16 @@ services:
     networks:
       - app_network
 
-  redis:
-    container_name: redis
+  launchmail-redis:
+    container_name: launchmail-redis
     image: redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-password}"]
     networks:
       - app_network
 
-  api:
-    container_name: api
+  launchmail-api:
+    container_name: launchmail-api
     build:
       context: .
       dockerfile: Dockerfile.api
@@ -37,13 +42,13 @@ services:
     labels:
       - "traefik.docker.network=dokploy-network"
     depends_on:
-      postgres:
+      launchmail-postgres:
         condition: service_healthy
-      redis:
+      launchmail-redis:
         condition: service_started
     environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-password}@postgres:5432/launchmail
-      REDIS_URL: redis://:${REDIS_PASSWORD:-password}@redis:6379
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-password}@launchmail-postgres:5432/launchmail
+      REDIS_URL: redis://:${REDIS_PASSWORD:-password}@launchmail-redis:6379
       # Required secrets. Fail fast with a clear message if unset — set these in
       # your host/PaaS environment (Dokploy/Coolify env settings), NOT a committed
       # file. MAIL_ENCRYPTION_KEY must be set once and never changed.
@@ -64,7 +69,7 @@ services:
       - path: .env
         required: false
     # Not published to the host — the web service proxies to it over the Docker
-    # network (http://api:5000). Only expose it in-cluster.
+    # network (http://launchmail-api:5000). Only expose it in-cluster.
     expose:
       - "5000"
     healthcheck:
@@ -84,8 +89,8 @@ services:
       - app_network
       - dokploy-network
 
-  web:
-    container_name: web
+  launchmail-web:
+    container_name: launchmail-web
     build:
       context: .
       dockerfile: Dockerfile
@@ -93,7 +98,7 @@ services:
         # Baked into the Next.js rewrite manifest at build time — must be the
         # in-cluster backend, not localhost. (Runtime API_URL below only covers
         # server-component fetches, not the baked proxy rewrites.)
-        API_URL: http://api:5000
+        API_URL: http://launchmail-api:5000
     restart: unless-stopped
     # On a multi-network container Traefik must be told which network to use to
     # reach it; otherwise it may pick app_network (where Traefik isn't) and return
@@ -106,16 +111,16 @@ services:
     # api's one-time migration + tsx cold-start can exceed it. The web proxies to
     # the api at request time and tolerates a few seconds of api warm-up.
     depends_on:
-      api:
+      launchmail-api:
         condition: service_started
     environment:
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
       # Internal proxy target — the web forwards /api,/f,/t,/u,/public to the
       # backend over the Docker network. Always the service name, never an
       # override from .env (which is meant for local dev = localhost:5000).
-      API_URL: http://api:5000
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-password}@postgres:5432/launchmail
-      REDIS_URL: redis://:${REDIS_PASSWORD:-password}@redis:6379
+      API_URL: http://launchmail-api:5000
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-password}@launchmail-postgres:5432/launchmail
+      REDIS_URL: redis://:${REDIS_PASSWORD:-password}@launchmail-redis:6379
     # Optional local convenience file — not required (absent on a fresh clone / PaaS).
     env_file:
       - path: .env
