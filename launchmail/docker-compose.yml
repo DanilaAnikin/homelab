@@ -36,6 +36,13 @@ services:
       context: .
       dockerfile: Dockerfile.api
     restart: unless-stopped
+    # Use public resolvers directly instead of the host/router DNS. A mail
+    # platform does a lot of DNS (DKIM/SPF/DMARC checks, MX lookups); the local
+    # router had cached NXDOMAIN for a just-published DKIM record for up to its
+    # 1h negative TTL, blocking domain verification. Public resolvers avoid that.
+    dns:
+      - "1.1.1.1"
+      - "8.8.8.8"
     # On a multi-network container Traefik must be told which network to use to
     # reach it; otherwise it may pick app_network (where Traefik isn't) and return
     # 502. This pins it to the proxy network for the relay.launchday.cz domain.
