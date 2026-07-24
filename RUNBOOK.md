@@ -74,12 +74,18 @@ sudo rsync -a ~/homelab/compose ~/homelab/scripts ~/homelab/secrets /srv/homelab
 
 **Postgres + PgBouncer:**
 ✅ Hesla už jsou vygenerovaná předem (2026-07-11): `.env` + `pgbouncer/userlist.txt`
-jsou součástí kitu (rsync je přenesl, jsou chmod 600). Stačí:
+jsou součástí kitu (rsync je přenesl). Stačí:
 ```bash
 cd /srv/homelab/compose/postgres
 ls -l .env pgbouncer/userlist.txt      # ověř, že dorazily (jinak viz .env.example)
+# ⚠️ userlist.txt MUSÍ být čitelný pro pgbouncer kontejner (běží pod jiným uid) —
+#    jinak "could not open auth_file ... Permission denied". .env nech 600 (čte ho
+#    jen docker compose na hostu), userlist 644 (bind-mountuje se DO kontejneru):
+chmod 644 pgbouncer/userlist.txt
 sudo docker compose up -d && sudo docker logs -f shared-postgres   # Ctrl+C až uvidíš "ready to accept connections"
 ```
+> Pozn.: `pgbouncer.ini` má `auth_dbname = postgres` (auth_query běží proti DB
+> `postgres`, kde je funkce `pgbouncer.get_auth`) — jinak "bouncer config error".
 
 **E-maily — vlastní launchmail instance (bez jakékoli třetí strany):**
 
