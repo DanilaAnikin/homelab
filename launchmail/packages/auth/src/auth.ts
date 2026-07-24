@@ -22,6 +22,8 @@ export const auth = betterAuth({
   secret: process.env.BETTER_AUTH_SECRET!,
   url: process.env.BETTER_AUTH_URL!,
   trustedOrigins,
+  // Temporary: verbose logging to diagnose intermittent empty sessions.
+  logger: { level: "debug" },
   database: drizzleAdapter(db, { provider: "pg" }),
   emailAndPassword: {
     enabled: true,
