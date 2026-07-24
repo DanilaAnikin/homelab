@@ -210,7 +210,29 @@ app.get(
 app.get("/scalar", Scalar({ url: "/api/openapi.json" }));
 
 app.on(["POST", "GET"], "/auth/*", (c) => {
-  return auth.handler(c.req.raw);
+  const raw = c.req.raw;
+  const authz = raw.headers.get("authorization");
+  // The web stores the bearer token URL-encoded (lm_token cookie =
+  // encodeURIComponent(token)) and some server-side reads forward it still
+  // encoded (%2B, %2F, %3D). The token signature is base64, so an encoded value
+  // fails verification -> empty session -> dashboard bounce. Decode it back
+  // before Better Auth sees it. (The client sends it already-decoded, which has
+  // no "%", so this only touches the encoded case.)
+  if (authz && /^Bearer\s+\S*%/.test(authz)) {
+    const token = decodeURIComponent(authz.replace(/^Bearer\s+/, ""));
+    const headers = new Headers(raw.headers);
+    headers.set("authorization", `Bearer ${token}`);
+    const req = new Request(raw.url, {
+      method: raw.method,
+      headers,
+      body:
+        raw.method === "GET" || raw.method === "HEAD" ? undefined : raw.body,
+      // @ts-expect-error duplex is required by undici when a body is streamed
+      duplex: "half",
+    });
+    return auth.handler(req);
+  }
+  return auth.handler(raw);
 });
 
 export default app;

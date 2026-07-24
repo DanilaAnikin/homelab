@@ -5,7 +5,12 @@ import { redirect } from "next/navigation";
 const API_URL = process.env.API_URL ?? "http://localhost:5000";
 
 export async function bearerToken(): Promise<string | undefined> {
-  return (await cookies()).get("lm_token")?.value;
+  const raw = (await cookies()).get("lm_token")?.value;
+  // The token is stored URL-encoded (setToken uses encodeURIComponent). Decode
+  // it so the base64 signature (+, /, =) is intact when sent as a Bearer token;
+  // otherwise the API rejects it and the session reads empty. Safe to always
+  // run: an already-decoded value has no "%" escapes to change.
+  return raw ? decodeURIComponent(raw) : undefined;
 }
 
 export async function apiFetch(
