@@ -19,6 +19,11 @@ export interface SendEmailInput {
   html?: string;
   text?: string;
   /**
+   * File attachments. `content` is the file bytes **base64-encoded**;
+   * `contentType` is an optional MIME type (e.g. "application/pdf").
+   */
+  attachments?: { filename: string; content: string; contentType?: string }[];
+  /**
    * ISO 8601 timestamp. MUST be UTC ending in "Z" (e.g. "2026-07-20T10:00:00Z")
    * — the server validates with Zod `.datetime()`, which rejects timezone
    * offsets like "+02:00" with HTTP 400. A future timestamp => scheduled delivery.

@@ -25,6 +25,20 @@ export const sendEmailSchema = z.object({
   subject: z.string().min(1),
   html: z.string().optional(),
   text: z.string().optional(),
+  // File attachments. `content` is the file bytes base64-encoded; the SMTP
+  // transport decodes it to a Buffer for nodemailer. The queue/worker/transport
+  // already carry attachments through — this just exposes them on the public
+  // send API (e.g. LaunchMail sending an audit-report PDF for Lokwave).
+  attachments: z
+    .array(
+      z.object({
+        filename: z.string().min(1),
+        content: z.string(),
+        contentType: z.string().optional(),
+      }),
+    )
+    .max(20)
+    .optional(),
   sendAt: z.string().datetime().optional(),
 });
 
