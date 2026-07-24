@@ -40,4 +40,8 @@ COPY --from=builder --chown=nextjs:nodejs /app/apps/web/public ./apps/web/public
 USER nextjs
 EXPOSE 3000
 ENV PORT=3000
+# Bind to all interfaces. Next.js standalone binds to $HOSTNAME, and Docker sets
+# HOSTNAME to the container id → it would listen on only one network IP, so the
+# reverse proxy (Traefik on dokploy-network) can't reach it and returns 502.
+ENV HOSTNAME=0.0.0.0
 CMD ["node", "apps/web/server.js"]
