@@ -1,7 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { organization, bearer } from "better-auth/plugins";
 import { db } from "@workspace/db";
+import {
+  member as memberTable,
+  organization as organizationTable,
+} from "@workspace/db/schemas";
 import { enqueueEmail, getDefaultSmtpConfig } from "@workspace/mail-queue";
 import { ac, admin, writer, reader } from "./permissions";
 import { renderInvitationEmail } from "./invitation-email";
@@ -38,6 +43,36 @@ export const auth = betterAuth({
         before: async (user) => ({
           data: { ...user, emailVerified: true },
         }),
+        // Give every new user a personal workspace at sign-up. The org-scoped
+        // dashboard needs a context on the very first render; without an org the
+        // client's org reads come back empty and the dashboard bounces to
+        // /login before the on-demand ensurePersonalOrg (/api/me) can run.
+        after: async (user) => {
+          try {
+            const base =
+              (user.name || "My")
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, "-")
+                .replace(/^-+|-+$/g, "") || "workspace";
+            const orgId = randomUUID();
+            await db.insert(organizationTable).values({
+              id: orgId,
+              name: `${user.name || "My"}'s Workspace`,
+              slug: `${base}-${orgId.slice(0, 6)}`,
+            });
+            await db.insert(memberTable).values({
+              id: randomUUID(),
+              organizationId: orgId,
+              userId: user.id,
+              role: "admin",
+            });
+          } catch (e) {
+            console.error(
+              "[auth] failed to create personal org for new user:",
+              (e as Error).message,
+            );
+          }
+        },
       },
     },
   },
