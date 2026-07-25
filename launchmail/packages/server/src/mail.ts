@@ -115,8 +115,13 @@ const mailRouter = new Hono<AppVariables>()
         return c.json({ error: "Insufficient permissions to send" }, 403);
       }
 
-      const config = boundConfigId
-        ? await getSmtpConfigById(boundConfigId)
+      // A token bound to a specific SMTP config is locked to it (can't spoof
+      // other senders). An unbound token may pick any of its org's configs
+      // per-request via `smtpConfigId`, falling back to the org default. This
+      // lets one token send from every per-domain mailbox (Lokwave email bot).
+      const chosenConfigId = boundConfigId ?? data.smtpConfigId;
+      const config = chosenConfigId
+        ? await getSmtpConfigById(chosenConfigId)
         : await getDefaultSmtpConfig(organizationId);
       if (!config || config.organizationId !== organizationId) {
         return c.json(
