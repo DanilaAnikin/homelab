@@ -40,6 +40,12 @@ export const sendEmailSchema = z.object({
     .max(20)
     .optional(),
   sendAt: z.string().datetime().optional(),
+  // Threading headers (RFC 5322) so autonomous replies land in the original
+  // conversation. `references` is a space-separated list of Message-Ids. The
+  // queue/worker/transports already honour these — this exposes them on the
+  // public send API (Lokwave email bot replying in-thread).
+  inReplyTo: z.string().optional(),
+  references: z.string().optional(),
 });
 
 export type SendEmailInput = z.infer<typeof sendEmailSchema>;
