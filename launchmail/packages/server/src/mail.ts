@@ -14,6 +14,10 @@ import { describeRoute } from "hono-openapi";
 // Extend the base send schema with an optional reply-to address (CONTRACT #6).
 const sendMailRequestSchema = sendEmailSchema.extend({
   replyTo: z.string().email().optional(),
+  // Per-request SMTP config selection (unbound tokens): pick which of the org's
+  // configs / sender mailboxes to send from. Without this in the schema Zod
+  // strips it and the send silently falls back to the org default config.
+  smtpConfigId: z.string().uuid().optional(),
 });
 
 const mailRouter = new Hono<AppVariables>()
