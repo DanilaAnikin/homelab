@@ -23,6 +23,7 @@ BACKUP_TARGETS=(
   "ripieno-postgres|postgres|ripieno"
   "launchmail-postgres|postgres|launchmail"
   "supabase-db|postgres|freio"
+  "gorillatype-supabase-db|supabase_admin|postgres"
   "dokploy-postgres|dokploy|dokploy"
 )
 BACKUP_KEY="/srv/homelab/secrets/freio-backup-key.txt"   # AES-256 pass (mimo git; kopie off-box!)
