@@ -1,0 +1,13 @@
+[Unit]
+Description=Homelab self-healing agent webhook (Kuma poll -> Claude Code)
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=anakin
+ExecStart=/usr/bin/python3 /srv/homelab/self-healing/poller.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

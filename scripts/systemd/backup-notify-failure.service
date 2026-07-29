@@ -1,0 +1,6 @@
+[Unit]
+Description=Telegram alert pri selhani homelab zalohy
+
+[Service]
+Type=oneshot
+ExecStart=/srv/homelab/self-healing/notify.sh "❌ NIGHTLY BACKUP SELHAL (backup.service). Zkontroluj: journalctl -u backup.service -n 50"

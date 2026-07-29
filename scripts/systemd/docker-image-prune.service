@@ -1,0 +1,6 @@
+[Unit]
+Description=Tydenni docker image prune (disk hygiena, BEZ volumes)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker image prune -af --filter until=168h

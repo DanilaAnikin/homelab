@@ -1,0 +1,63 @@
+alerting:
+  alertmanagers:
+    - static_configs: [{ targets: ['obs-alertmanager:9093'] }]
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 15s
+scrape_configs:
+  - job_name: frem
+    static_configs: [{ targets: ['frem-worker:8080'] }]
+  - job_name: prometheus
+    static_configs: [{ targets: ['localhost:9090'] }]
+  - job_name: node
+    static_configs: [{ targets: ['obs-node-exporter:9100'], labels: { host: homelab } }]
+  - job_name: cadvisor
+    static_configs: [{ targets: ['obs-cadvisor:8080'] }]
+  - job_name: postgres
+    static_configs: [{ targets: ['obs-postgres-exporter:9187'] }]
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets:
+          - https://vetlocal.cz
+          - https://salonlocal.cz
+          - https://bistrolocal.cz
+          - https://fitlocal.cz
+          - https://autolocal.cz
+          - https://lokwave.cz
+          - https://dentallocal.cz
+          - https://mail.ripieno.xyz
+          - https://www.ripieno.xyz
+          - https://freio.cz
+          - https://www.freio.cz
+          - http://inngest:8288
+          - http://dokploy:3000
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: obs-blackbox:9115
+  - job_name: blackbox-tcp
+    metrics_path: /probe
+    params: { module: [tcp_connect] }
+    static_configs:
+      - targets:
+          - shared-postgres:5432
+          - ripieno-postgres:5432
+          - shared-pgbouncer:6432
+          - inngest-redis:6379
+          - launchmail-redis:6379
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: obs-blackbox:9115

@@ -1,0 +1,143 @@
+# Poplachová pravidla pro celý homelab.
+#
+# Filozofie: hlásit jen to, kvůli čemu bys reálně vstal od počítače. Alert, který
+# se ozývá zbytečně, se za týden začne ignorovat a pak přehlédneš i ten důležitý.
+# Proto všude "for:" (musí to trvat), ne okamžité pípnutí na jeden výkyv.
+#
+# Nasazení: soubor se připojí do obs-prometheus a odkáže se na něj v prometheus.yml
+# přes rule_files. Pak `docker exec obs-prometheus kill -HUP 1`.
+
+groups:
+  # ------------------------------------------------------------------ server
+  - name: server
+    rules:
+      - alert: DiskDochazi
+        expr: (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 > 85
+        for: 15m
+        labels: { severity: kriticke }
+        annotations:
+          summary: "Docházi místo na disku ({{ $value | printf \"%.0f\" }} %)"
+          description: "Frem si bere ~750 MB na video. Ukliď staré snímky nebo přidej disk."
+
+      - alert: DiskDojedeDoTydne
+        # předpověď z posledních 6 hodin — varuje dřív, než je pozdě
+        expr: predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[6h], 7*24*3600) < 0
+        for: 1h
+        labels: { severity: varovani }
+        annotations:
+          summary: "Disk se podle trendu zaplní do týdne"
+
+      - alert: MaloPameti
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 92
+        for: 20m
+        labels: { severity: varovani }
+        annotations:
+          summary: "Paměť skoro plná ({{ $value | printf \"%.0f\" }} %)"
+
+      - alert: VysokaZatez
+        # 8 jader → load 16 znamená dvojnásobné přetížení
+        expr: node_load15 > 16
+        for: 30m
+        labels: { severity: varovani }
+        annotations:
+          summary: "Server je dlouhodobě přetížený (load15 {{ $value | printf \"%.1f\" }})"
+
+      - alert: ServerRestartovan
+        expr: time() - node_boot_time_seconds < 600
+        labels: { severity: info }
+        annotations:
+          summary: "Server byl restartován"
+          description: "Ověř, že naběhly všechny služby (Frem se navazuje sám)."
+
+  # -------------------------------------------------------------- kontejnery
+  - name: kontejnery
+    rules:
+      - alert: KontejnerSeRestartuje
+        expr: increase(container_last_seen{name!=""}[1h]) and changes(container_start_time_seconds{name!=""}[1h]) > 3
+        for: 10m
+        labels: { severity: kriticke }
+        annotations:
+          summary: "Kontejner {{ $labels.name }} se opakovaně restartuje"
+
+      - alert: KontejnerZeraPamet
+        expr: container_memory_usage_bytes{name!=""} / container_spec_memory_limit_bytes{name!=""} > 0.9 and container_spec_memory_limit_bytes{name!=""} > 0
+        for: 20m
+        labels: { severity: varovani }
+        annotations:
+          summary: "{{ $labels.name }} je na hranici paměťového limitu"
+
+  # ------------------------------------------------------------------- weby
+  - name: weby
+    rules:
+      - alert: WebNedostupny
+        expr: probe_success == 0
+        for: 5m
+        labels: { severity: kriticke }
+        annotations:
+          summary: "{{ $labels.instance }} neodpovídá"
+
+      - alert: WebPomaly
+        expr: probe_duration_seconds > 5
+        for: 15m
+        labels: { severity: varovani }
+        annotations:
+          summary: "{{ $labels.instance }} odpovídá pomalu ({{ $value | printf \"%.1f\" }} s)"
+
+      - alert: CertifikatBrzyVyprsi
+        expr: (probe_ssl_earliest_cert_expiry - time()) / 86400 < 14
+        for: 1h
+        labels: { severity: varovani }
+        annotations:
+          summary: "Certifikát {{ $labels.instance }} vyprší za {{ $value | printf \"%.0f\" }} dní"
+
+  # --------------------------------------------------------------- databáze
+  - name: databaze
+    rules:
+      - alert: PostgresNedostupny
+        expr: pg_up == 0
+        for: 3m
+        labels: { severity: kriticke }
+        annotations:
+          summary: "PostgreSQL neodpovídá"
+
+      - alert: PostgresDochazejiSpojeni
+        expr: sum(pg_stat_activity_count) by (instance) / on(instance) pg_settings_max_connections > 0.85
+        for: 10m
+        labels: { severity: varovani }
+        annotations:
+          summary: "PostgreSQL má obsazeno {{ $value | printf \"%.0f\" }} % spojení"
+
+  # ------------------------------------------------------------------- Frem
+  - name: frem
+    rules:
+      - alert: FremVideoZaseknute
+        expr: frem_videos{stav="blokovano"} > 0
+        for: 10m
+        labels: { severity: varovani }
+        annotations:
+          summary: "{{ $value }} videí čeká na zásah"
+          description: "Podrobnosti na http://homelab.frem — typicky moderace promptu nebo captcha."
+
+      - alert: FremHiggsfieldOdhlasen
+        # striktně == 0; hodnota -1 znamená "nezjištěno" (běží výroba), ne odhlášení
+        expr: frem_higgsfield_prihlaseno == 0
+        for: 15m
+        labels: { severity: kriticke }
+        annotations:
+          summary: "Higgsfield session vypršela — výroba stojí"
+          description: "Přihlas se přes http://homelab:6080/vnc.html"
+
+      - alert: FremDochazejiZnakyNaHlas
+        # ~11 500 znaků na video → pod 25 000 zbývají ~2 videa
+        expr: frem_elevenlabs_znaky >= 0 and frem_elevenlabs_znaky < 25000
+        for: 30m
+        labels: { severity: varovani }
+        annotations:
+          summary: "ElevenLabs: zbývá {{ $value | printf \"%.0f\" }} znaků (~2 videa)"
+
+      - alert: FremWorkerNeodpovida
+        expr: up{job="frem"} == 0
+        for: 10m
+        labels: { severity: kriticke }
+        annotations:
+          summary: "Frem worker neodpovídá — výroba i konzole stojí"

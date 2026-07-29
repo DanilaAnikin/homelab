@@ -1,0 +1,10 @@
+[Unit]
+Description=Denni health-review v 7:00
+
+[Timer]
+OnCalendar=*-*-* 07:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
