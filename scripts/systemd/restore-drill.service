@@ -1,0 +1,8 @@
+[Unit]
+Description=Tydenni restore drill (overeni obnovitelnosti zaloh do throwaway DB)
+After=network-online.target docker.service
+OnFailure=notify-failure@restore-drill.service
+
+[Service]
+Type=oneshot
+ExecStart=/srv/homelab/self-healing/restore-drill.sh

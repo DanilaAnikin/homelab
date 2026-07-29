@@ -35,6 +35,19 @@ dle železných pravidel v `self-healing/CLAUDE.md` (nikdy nemazat data/volumes/
 preferuj nejmenší zásah, při nejistotě ESKALACE). **Každý výsledek** (OPRAVENO / ESKALACE /
 timeout) jde na **Telegram** (dřív končily eskalace tiše jen v `incidents.log`).
 
+## 2b. Restore drill (`self-healing/restore-drill.sh`, `restore-drill.timer` So 05:00)
+„Netestovaný dump není záloha." Týdně: stáhne nejnovější `db_{freio,ripieno,lokwave}`
+.enc z R2, dešifruje, obnoví do **izolovaného throwaway** `supabase/postgres:17.6.1.136`
+kontejneru (`pg-restore-drill`, žádná prod síť/volume), ověří schema (počet tabulek) +
+data (nejlidnatější tabulka > 0 řádků), uklidí, hlásí na Telegram. Ověřeno 2026-07-29:
+freio 62 tab / test_questions 63600, ripieno 33 / events 3312, lokwave 38 / outreach_prospects 670.
+
+## 2c. Watchdog-on-watchdog
+Poller pushuje heartbeat do Kuma push monitoru „self-healing alive" každý cyklus (90s).
+Když poller **tiše zamrzne** (ne jen spadne — to řeší `Restart=always`), monitor jde DOWN
+a Kuma **SÁM** pošle Telegram přes vlastní notifikaci „Telegram-owner" (nezávisle na polleru,
+který se neumí hlídat sám). URL v `kuma-selfheal-push-url.txt`.
+
 ## 3. Proaktivní health-review (`self-healing/daily-health-review.sh`)
 `daily-health-review.timer` denně 07:00 → LLM agent projde disk, kontejnery (unhealthy/
 restart county), certy (freio/ripieno/lokwave), **stáří poslední R2 zálohy**, firing alerty,

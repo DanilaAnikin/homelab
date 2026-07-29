@@ -1,0 +1,10 @@
+[Unit]
+Description=Tydenni restore drill (So 05:00, po nocnich zalohach)
+
+[Timer]
+OnCalendar=Sat 05:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -18,6 +18,10 @@ INCIDENTS_LOG = "/srv/homelab/self-healing/incidents.log"
 NOTIFY = "/srv/homelab/self-healing/notify.sh"
 RESPOND = "/srv/homelab/self-healing/respond.sh"
 PROM_CONTAINER = "obs-prometheus"
+# Watchdog-on-watchdog: poller pushuje heartbeat do Kuma "self-healing alive" monitoru.
+# Když poller tiše zamrzne/umře, monitor jde DOWN a Kuma SÁM (nezávisle) pošle Telegram —
+# poller se totiž neumí hlídat sám. Soubor obsahuje jen push URL (nebo je prázdný).
+ALIVE_PUSH_FILE = "/srv/homelab/secrets/kuma-selfheal-push-url.txt"
 
 # Prometheus alerty, které agent umí BEZPEČNĚ řešit dle CLAUDE.md runbooku.
 # (WebNedostupny řeší Kuma; info/predictive/frem-specific se zde záměrně nespouští.)
@@ -49,6 +53,17 @@ def log_incident(text):
     try:
         with open(INCIDENTS_LOG, "a") as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
+    except Exception:
+        pass
+
+
+def alive_ping():
+    """Heartbeat do Kuma 'self-healing alive' — dokládá, že poller žije (ne zamrzl)."""
+    try:
+        url = open(ALIVE_PUSH_FILE).read().strip()
+        if url:
+            subprocess.run(["curl", "-fsS", "-m", "10", f"{url}?status=up&msg=OK"],
+                           timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
@@ -141,4 +156,5 @@ def run_source(tag, fn):
 while True:
     run_source("kuma", poll_kuma)
     run_source("prom", poll_prometheus)
+    alive_ping()   # heartbeat — poller žije (watchdog-on-watchdog)
     time.sleep(90)
