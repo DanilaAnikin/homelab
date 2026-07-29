@@ -24,3 +24,6 @@ launchmail/docker/
 
 # lokální dump/cutover artefakty — NIKDY do gitu
 backups/
+
+# stack env soubory se secrety — nikdy do gitu
+compose/**/.env
