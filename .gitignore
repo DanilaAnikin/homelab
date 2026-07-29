@@ -21,3 +21,6 @@ launchmail/**/.turbo/
 launchmail/**/.next/
 launchmail/**/dist/
 launchmail/docker/
+
+# lokální dump/cutover artefakty — NIKDY do gitu
+backups/
