@@ -1,0 +1,6 @@
+[Unit]
+Description=Post-deploy health gate + auto-rollback (Dokploy swarm apky)
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/srv/homelab/self-healing/deploy-watchdog.sh

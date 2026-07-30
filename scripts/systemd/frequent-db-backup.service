@@ -1,0 +1,7 @@
+[Unit]
+Description=Caste sifrovane dumpy prod DB a 10 min (RPO ~10 min)
+After=network-online.target docker.service
+OnFailure=notify-failure@frequent-db-backup.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/frequent-db-backup.sh

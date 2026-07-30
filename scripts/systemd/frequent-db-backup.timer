@@ -1,0 +1,7 @@
+[Unit]
+Description=Caste dumpy prod DB kazdych 10 min
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+[Install]
+WantedBy=timers.target

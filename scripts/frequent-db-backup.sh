@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# hourly-db-backup.sh — hodinové ŠIFROVANÉ dumpy prod DB → R2 (RPO 24h→1h).
+# frequent-db-backup.sh — časté ŠIFROVANÉ dumpy prod DB á 10 min → R2 (RPO ~10 min).
 # Lehčí než nightly (jen DB, žádný config/secrets bundle). Krátká retence 48h.
 # Doplněk nočních záloh (ty drží 30 dní + config + secrets).
 # ============================================================================
@@ -8,7 +8,7 @@ set -uo pipefail
 BACKUP_KEY="/srv/homelab/secrets/freio-backup-key.txt"
 R2_REMOTE="r2:homelab-backups"
 R2_CONF="/srv/homelab/secrets/rclone.conf"
-PREFIX="hourly/$(date +%Y-%m-%d)"
+PREFIX="frequent/$(date +%Y-%m-%d)"
 KEEP_HOURS=48
 TS=$(date +%Y%m%dT%H%M%SZ)
 WORK=$(mktemp -d /tmp/hbk.XXXXXX)
@@ -40,9 +40,9 @@ done
 
 N=$(ls "$WORK"/*.enc 2>/dev/null | wc -l)
 if [[ "$N" -gt 0 ]] && $RC copy "$WORK" "$R2_REMOTE/$PREFIX/" --include '*.enc' --transfers 4 -q; then
-  $RC delete "$R2_REMOTE/hourly" --min-age "${KEEP_HOURS}h" -q || true
-  echo "✔ hourly OK ($N DB, $TS)"
+  $RC delete "$R2_REMOTE/frequent" --min-age "${KEEP_HOURS}h" -q || true
+  echo "✔ frequent OK ($N DB, $TS)"
   [[ $FAIL -eq 0 ]] && exit 0 || exit 1
 else
-  echo "✘ hourly upload/dump selhal"; exit 1
+  echo "✘ frequent upload/dump selhal"; exit 1
 fi
