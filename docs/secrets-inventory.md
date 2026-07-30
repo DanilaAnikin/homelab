@@ -27,8 +27,12 @@ workstationu (`~/programming/homelab/secrets/`, gitignored). Off-site: šifrovan
 `brevo.txt`, `cloudflare-api-token.txt`, `contact-mailboxes.txt`, `grafana-login.txt`,
 `inngest.env`, `r2-lokwave.txt`, `wedos-dns-snapshot.txt`, `launchmail-domain-ids.txt`.
 
+## Interní identifikátory (neexploitovatelné, ale mimo git)
+- `homelab.conf` — TUNNEL_ID, DOKPLOY_API/ENV_ID/GITHUB_ID, TELEGRAM_CHAT_ID/TOKEN_FILE (server i workstation).
+- `dokploy-apps.conf` (server) — mapování appName→appId pro self-healing agenta.
+
 ## Externí (mimo homelab)
-- Telegram bot token: `/srv/frem/telegram-token` (server), chat_id 1692631422.
-- Grafana admin pw + PG exporter DSN: inline v `compose/observability/docker-compose.yml` (follow-up: přesunout do env).
+- Telegram bot token: `/srv/frem/telegram-token` (server), chat_id (v secrets/homelab.conf).
+- Grafana admin pw + PG exporter DSN: v `compose/observability/.env` (gitignored); v gitu jen `${VAR}` šablona.
 
 \* server vs workstation se historicky rozešly — při DR ber jako zdroj pravdy R2 secrets bundle (nejnovější).

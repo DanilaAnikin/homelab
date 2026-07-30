@@ -8,8 +8,19 @@ Token: homelab/secrets/cloudflare-api-token.txt  (Account.Zone:Edit, Zone.DNS:Ed
 import sys, json, urllib.request, urllib.error
 from pathlib import Path
 
-TOKEN = Path("/home/anakin/programming/homelab/secrets/cloudflare-api-token.txt").read_text().strip()
-TUNNEL_ID = "215c5edb-467c-470a-9e34-1d46e65fcfef"
+SECRETS = Path("/home/anakin/programming/homelab/secrets")
+TOKEN = (SECRETS / "cloudflare-api-token.txt").read_text().strip()
+
+
+def _conf(key):
+    """Interní identifikátory mimo git — secrets/homelab.conf (gitignored)."""
+    for line in (SECRETS / "homelab.conf").read_text().splitlines():
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1].strip()
+    raise SystemExit(f"chybí {key} v secrets/homelab.conf")
+
+
+TUNNEL_ID = _conf("TUNNEL_ID")
 TUNNEL_CNAME = f"{TUNNEL_ID}.cfargotunnel.com"
 API = "https://api.cloudflare.com/client/v4"
 

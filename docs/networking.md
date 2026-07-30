@@ -35,8 +35,8 @@ DNS → Records → `*` → **CNAME** → `<TUNNEL_ID>.cfargotunnel.com` → Pro
 (Root hostname si CNAME vytvoří automaticky.)
 
 Náš tunel `homelab` (vytvořen 2026-07-11):
-- Tunnel ID: `215c5edb-467c-470a-9e34-1d46e65fcfef`
-- wildcard CNAME cíl: `215c5edb-467c-470a-9e34-1d46e65fcfef.cfargotunnel.com`
+- Tunnel ID: `<TUNNEL_ID — viz secrets/homelab.conf>`
+- wildcard CNAME cíl: `<TUNNEL_ID — viz secrets/homelab.conf>.cfargotunnel.com`
 - token: `secrets/cloudflared-token.txt` (na serveru `/srv/homelab/secrets/`)
 
 Od té chvíle **jakákoli subdoména** téhle domény teče na server — nové appky už řešíš jen v Dokploy, do Cloudflare nesaháš.

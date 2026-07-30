@@ -2,10 +2,21 @@
 """Vytvoří + nakonfiguruje Dokploy app pro jeden lokwave vertical (klon vet)."""
 import os, sys, json, urllib.request, urllib.error
 
-DK = "http://100.111.188.8:3000/api"
-KEY = open("/home/anakin/programming/homelab/secrets/dokploy-api-token.txt").read().strip()
-ENV_ID = "qk9MKMpCkCkD03aYMzKz6"        # stejné environment jako vet
-GITHUB_ID = "UAzoSybnNB-qH5BsJAjyX"
+SEC = "/home/anakin/programming/homelab/secrets"
+
+
+def _conf(key):
+    """Interní identifikátory mimo git — secrets/homelab.conf (gitignored)."""
+    for line in open(f"{SEC}/homelab.conf"):
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1].strip()
+    raise SystemExit(f"chybí {key} v secrets/homelab.conf")
+
+
+DK = _conf("DOKPLOY_API")
+KEY = open(f"{SEC}/dokploy-api-token.txt").read().strip()
+ENV_ID = _conf("DOKPLOY_ENV_ID")        # stejné environment jako vet
+GITHUB_ID = _conf("DOKPLOY_GITHUB_ID")
 # Stripe publishable key (pk_live_) — z designu veřejný, ale držíme ho mimo repo.
 # Nastav před spuštěním:  export STRIPE_PK=pk_live_...
 STRIPE_PK = os.environ.get("STRIPE_PK", "")

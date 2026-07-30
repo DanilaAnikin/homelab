@@ -60,7 +60,7 @@ sudo rsync -a ~/homelab/compose ~/homelab/scripts ~/homelab/secrets /srv/homelab
 
 ## Fáze 4 — Cloudflare Tunnel (~5 min)
 
-- [x] Tunel `homelab` vytvořen 2026-07-11 (Tunnel ID `215c5edb-467c-470a-9e34-1d46e65fcfef`),
+- [x] Tunel `homelab` vytvořen 2026-07-11 (Tunnel ID `<TUNNEL_ID — viz secrets/homelab.conf>`),
       token uložen v `secrets/cloudflared-token.txt`, testovací hostname `test.ripieno.xyz → localhost:80`.
 - [ ] Na serveru už jen:
   ```bash
