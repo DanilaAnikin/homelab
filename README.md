@@ -1,33 +1,105 @@
-# 🏠 Homelab — stavebnice domácího serveru
+# 🏠 Homelab — self-hosted production infrastructure
 
-Kompletní kit pro Acemagic F1A (i9-12900H, 32 GB, 1 TB): Dokploy + všechny weby,
-domény, databáze, SMTP a zálohy. Vše self-hosted, žádné měsíční platby.
+> One mini-PC that replaced **Vercel + Supabase Cloud + Railway + Resend** — running real
+> SaaS products in production, fully self-hosted, with autonomous self-healing, encrypted
+> off-site backups, and zero monthly platform fees.
 
-## Kudy do toho
+This repo is the reproducible blueprint for a home server that hosts several live products
+behind a Cloudflare Tunnel with the operational maturity of a managed platform: one-command
+deploys, per-app self-hosted Supabase, full observability, and a set of LLM-powered agents
+that keep it running without manual babysitting.
 
-1. **[PLAN.md](PLAN.md)** — co stavíme a proč (architektura, rozhodnutí, kapacita)
-2. **[RUNBOOK.md](RUNBOOK.md)** — krok-za-krokem checklist od vybalení po první projekt
+---
 
-## Mapa složek
+## 🖥️ The machine
 
-| Cesta | Co je uvnitř |
+| | |
 |---|---|
-| `iso/` | Ubuntu Server 24.04 installer (stažený + checksum) |
-| `scripts/bootstrap.sh` | jednorázový setup čerstvého serveru (hardening, Docker, Dokploy, Tailscale, cloudflared) |
-| `scripts/newdb.sh` | „Supabase zážitek": nová DB + user + connection stringy jedním příkazem |
-| `scripts/backup.sh` + `scripts/systemd/` | denní zálohy Postgresu → USB SSD + Cloudflare R2 |
-| `scripts/smoke-test.sh` | kontrola, že všechno běží, jak má |
-| `compose/postgres/` | sdílený PostgreSQL 17 + PgBouncer pro všechny projekty |
-| `compose/smtp/` | interní SMTP služba (relay přes Brevo) pro všechny appky |
-| `compose/monitoring/` | Uptime Kuma |
-| `launchmail/` | **vlastní mail platforma** (nezávislá kopie launchmailu) — self-hosted ESP s direct-MX doručováním (Fáze 1–4 hotové: rate limity, greylist retry, bounce handling, warm-up, deliverability konzole); roadmap: `launchmail/DIRECT_DELIVERY_PLAN.md` |
-| `compose/mail-egress/` + `docs/mail-egress-node.md` | **egress node** pro plné vlastní odesílání (host s PTR + port 25); do té doby jede Seznam SMTP smarthost |
-| `compose/supabase/` | připravená kostra **self-hosted Supabase stacku** (Strategie A migrace) — fetch upstreamu + naše .env + R2 override + README |
-| `launchmail/packages/sdk/` (`@danilaanikin/launchmail`) | publikovatelný **LaunchMail SDK** — projekty importují místo kopírování klienta (send + inbox pull + webhook verify) |
-| `docs/migrations/` | **migrace všech projektů** na náš stack (přehled + per-typ + Freio) — začni `docs/migrations/00-overview.md` |
-| `docs/networking.md` | Cloudflare Tunnel, domény, Tailscale |
-| `docs/new-project-recipe.md` | 5min recept: nový projekt od DNS po deploy |
-| `docs/backups-restore.md` | R2 + USB setup a hlavně: JAK OBNOVIT |
-| `docs/migrate-from-supabase.md` | přesun LeadCRM / Hummy / agent-farm |
+| **Hardware** | Lenovo ThinkCentre M920q · Intel Core i7-9700T (8 cores) · 32 GB RAM · 1 TB NVMe |
+| **OS** | Ubuntu Server 24.04 LTS |
+| **Runtime** | Docker (Swarm + Compose), ~40 containers |
+| **Exposure** | **Zero open inbound ports** — everything via Cloudflare Tunnel |
+| **Uptime** | 99.9% |
 
-> Tip: až to poběží, udělej si z této složky git repo — je to tvoje infrastruktura jako kód.
+## 🌐 What runs on it (production)
+
+- **[anikin.cz](https://anikin.cz)** — personal portfolio
+- **[freio.cz](https://freio.cz)** — EdTech SaaS (self-hosted Supabase, Stripe, own SMTP)
+- **[ripieno.xyz](https://www.ripieno.xyz)** — autonomous AI dev platform
+- **[lokwave.cz](https://lokwave.cz)** + 6 NicheLocal verticals — B2B SaaS family (dental/auto/vet/bistro/salon/fit)
+- **gorillatype.anikin.cz**, **classio.anikin.cz** — self-hosted Supabase apps
+- **LaunchMail** — own email platform (self-hosted ESP)
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart TD
+    U[Internet] --> CF[Cloudflare · DNS + Tunnel + TLS]
+    CF -->|encrypted tunnel| CD[cloudflared]
+    CD --> TR[Traefik reverse proxy]
+    TR --> APPS[Next.js apps<br/>Dokploy-managed]
+    TR --> KONG[Supabase Kong gateways<br/>per app]
+    TR --> LM[LaunchMail]
+    APPS --> PG[(PostgreSQL<br/>shared + per-app)]
+    KONG --> SB[GoTrue · PostgREST · Storage · Realtime]
+    SB --> PG
+    subgraph Ops [Autonomy & Observability]
+      OBS[Prometheus · Grafana · Loki · Uptime Kuma]
+      HEAL[Self-healing + meta agents · LLM]
+    end
+    OBS -.watches.-> APPS
+    HEAL -.remediates.-> APPS
+    PG -->|nightly + 10-min encrypted| R2[(Cloudflare R2<br/>+ DR bucket)]
+```
+
+## ⭐ Autonomy & resilience
+
+The server is designed to **run itself** — detect problems, fix the safe ones, and shout
+loudly (Telegram) about the rest. Everything below is live and version-controlled here.
+
+| Capability | What it does |
+|---|---|
+| 🩹 **Self-healing agent** | Polls Uptime Kuma + Prometheus alerts + Loki log-spikes → an LLM (Claude Code, headless) diagnoses & safely remediates per iron-clad guardrails; **verify-and-escalate** (recurring incident → human) |
+| 🧠 **Self-improvement meta-agent** | Weekly: reviews incidents, metrics, config drift → writes postmortems, applies safe preventive fixes, proposes the rest (already caught & fixed an 11h silent crashloop) |
+| 📋 **Daily health review** | Morning LLM digest: disk, certs, backup freshness, DB connections → Telegram |
+| 🧪 **Synthetic checks** | Every 10 min: real auth (apikey health), DB queries, page render — deeper than uptime |
+| 💾 **Backups** | Nightly full (all DBs + config + secrets, AES-256) → R2 + **DR bucket**; **10-min** DB snapshots (RPO ~10 min); key stored off-box |
+| ✅ **Restore drills** | Weekly automated restore into a throwaway DB — an untested backup is not a backup |
+| 🛡️ **Security** | Trivy CVE scanning, fail2ban, unattended OS upgrades, secrets never in git |
+| ⬆️ **Safe auto-updates** | Weekly image updates with health-gate + **rollback**; pinned prod images left untouched |
+| ↩️ **Deploy watchdog** | Post-deploy health gate → `docker service rollback` if a fresh deploy fails |
+| 🐕 **Watchdog-on-watchdog** | The self-healer heartbeats Uptime Kuma; if it freezes, Kuma alerts independently |
+
+## 📂 Repository layout
+
+| Path | Contents |
+|---|---|
+| `scripts/bootstrap.sh` | One-shot fresh-server setup (hardening, Docker, Dokploy, Tailscale, cloudflared) |
+| `scripts/backup.sh` · `scripts/frequent-db-backup.sh` | Encrypted nightly + 10-min DB backups → R2 |
+| `scripts/trivy-scan.sh` · `scripts/auto-update.sh` | CVE scanning · health-gated auto-updates with rollback |
+| `scripts/supabase-selfhost/` | Generalized per-app self-hosted Supabase provisioner |
+| `scripts/systemd/` | All timers & services (backups, drills, agents, watchdogs) |
+| `self-healing/` | Poller, responder, meta-agent, synthetic checks, deploy-watchdog + agent guardrails (`CLAUDE.md`) |
+| `compose/` | Postgres, observability (Prometheus/Grafana/Loki/Kuma), SMTP, inngest |
+| `launchmail/` | Self-hosted email platform (own ESP, direct-MX delivery) |
+| `docs/` | Networking, backups & restore, resilience, migrations, secrets inventory |
+| `RUNBOOK.md` | Step-by-step: from bare metal to first running project |
+
+## 🧭 Design principles
+
+- **Zero-trust ingress** — no open ports; Cloudflare Tunnel terminates TLS.
+- **Secrets never in git** — `secrets/` gitignored; encrypted off-site; decryption key off-box.
+- **Reproducible** — infra as code; a fresh box rebuilds from this repo + secrets bundle.
+- **Fail loud, then self-heal** — every failure alerts; the safe ones auto-remediate.
+- **Tested recovery** — backups are restore-drilled weekly.
+
+## 📖 Where to start
+
+1. **[RUNBOOK.md](RUNBOOK.md)** — bring a fresh box to production, step by step
+2. **[docs/resilience.md](docs/resilience.md)** — the backup + self-healing architecture in depth
+3. **[docs/networking.md](docs/networking.md)** — Cloudflare Tunnel, domains, Tailscale
+
+---
+
+<sub>Built and operated by <a href="https://anikin.cz">Danila Sergejevič Anikin</a>. Infrastructure as a
+craft — a server you can rebuild from git and trust to heal itself is worth more than any managed platform.</sub>

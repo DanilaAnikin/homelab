@@ -1,6 +1,6 @@
 # Master plán: domácí server pro ~100 projektů
 
-**Hardware:** Acemagic F1A — i9-12900H (14c/20t), 32 GB DDR4, 1 TB NVMe
+**Hardware:** Lenovo ThinkCentre M920q — i7-9700T (8c), 32 GB RAM, 1 TB NVMe
 **OS:** Ubuntu Server 24.04 LTS (nudné = spolehlivé; podpora do 2029)
 **Cíl:** všechny weby, domény, databáze a odchozí e-maily vlastních projektů na jednom stroji doma, bez měsíčních plateb, s pořádnými zálohami.
 

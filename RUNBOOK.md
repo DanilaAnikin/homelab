@@ -29,7 +29,7 @@ Postupuj shora dolů, odškrtávej. Odhad: den D = ~1,5–2 h čistého času.
 - [ ] Ubuntu installer volby:
   - Language: English, keyboard: dle chuti
   - Network: ethernet přes DHCP → **poznamenej si IP**
-  - Storage: **Use entire disk** a ⚠️ **ODŠKRTNI „Set up this disk as an LVM group"** (jinak Ubuntu použije jen ~100 GB disku — klasická past). Potvrdit smazání Windows ✓ (Acemagic bloatware tím zmizí).
+  - Storage: **Use entire disk** a ⚠️ **ODŠKRTNI „Set up this disk as an LVM group"** (jinak Ubuntu použije jen ~100 GB disku — klasická past). Potvrdit smazání Windows ✓ (OEM/Windows bloatware tím zmizí).
   - Profile: name `anakin`, server `homelab`, user `anakin`, heslo dočasné (po bootstrapu se stejně přihlašuje jen klíčem)
   - **SSH: ✅ Install OpenSSH server**, import keys: přeskoč
   - Featured snaps: nic

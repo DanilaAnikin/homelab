@@ -1,70 +1,122 @@
-# Homelab — odolnost (backup + self-healing)
+# Resilience & Autonomy — architecture in depth
 
-Přehled „nerozbitného" systému nasazeného 2026-07-29 po 4 auditech (backup/DR,
-self-healing, boot/zdroje, reprodukovatelnost). Cíl: nic se tiše nerozbije, a co
-se rozbít dá, se samo opraví nebo hlasitě upozorní.
+How this homelab keeps itself alive: nothing breaks silently, and what *can* break either
+self-heals or shouts loudly (Telegram). Everything here is live, scheduled by systemd
+timers, and version-controlled in this repo.
 
-## 1. Zálohy (`scripts/backup.sh` → `/usr/local/bin/homelab-backup.sh`)
-- `backup.timer` denně 03:30. Zálohuje **šifrovaně** (openssl AES-256, klíč
-  `freio-backup-key.txt`) na Cloudflare R2 `r2:homelab-backups/nightly/YYYY-MM/`:
-  - **DB**: freio (LIVE), lokwave, inngest, ripieno, launchmail, dokploy(metadata) +
-    pg globals každého clusteru. Rehearsal/system DB (`freio_src*`, `_supabase`) se vynechávají.
-  - **config bundle**: `/etc/dokploy` + `/srv/homelab/{compose,self-healing,email-bot}` + systemd unity.
-  - **secrets bundle**: `/srv/homelab/secrets` (nejcitlivější, šifrované).
-- **Klíč mimo stroj** (jinak jsou šifrované zálohy po ztrátě disku k ničemu):
-  `freio-backup-key.txt` je i na workstationu (`~/programming/homelab/secrets/`, gitignored)
-  a v Obsidian vaultu (`Projects/homelab/secrets/`). SHA všech 3 se musí shodovat.
-- **Fail-loud**: skript vrací exit 1 při jakémkoli dílčím selhání →
-  `OnFailure=backup-notify-failure.service` → Telegram. Úspěch pinguje Kuma push
-  monitor „Nightly backup" (interval 25h) → když ping nedorazí (skript vůbec neběžel),
-  monitor jde DOWN → poller → agent.
-- **Retence**: `rclone delete r2:homelab-backups/nightly --min-age 30d` — scoped JEN na
-  `nightly/`, nikdy nemaže `freio-migration/` ani `ripieno/` point-in-time captures.
-- **Restore**: stáhni `.enc`, `openssl enc -d -aes-256-cbc -pbkdf2 -in X.enc -out X -pass file:freio-backup-key.txt`,
-  pak `pg_restore`. Ověřeno 2026-07-29 (freio dump = 1559 objektů, 97 tabulek, restorovatelný).
+---
 
-## 2. Reaktivní self-healing (`self-healing/poller.py` + `respond.sh`)
-`self-healing.service` (User=anakin, Restart=always) polluje každých 90s **dva zdroje**:
-- **Uptime Kuma** DOWN monitory (web/DB/infra dostupnost).
-- **Prometheus** FIRING alerty (přes `docker exec obs-prometheus`, není publikovaný na host).
-  Actionable třídy → agent: `DiskDochazi, KontejnerSeRestartuje, PostgresNedostupny,
-  MaloPameti, KontejnerZeraPamet, PostgresDochazejiSpojeni, CertifikatBrzyVyprsi`.
+## 1. Backups
 
-Incident (dedup 30 min) → `respond.sh` → `claude -p` headless (Bash, NOPASSWD sudo)
-dle železných pravidel v `self-healing/CLAUDE.md` (nikdy nemazat data/volumes/DNS/secrets,
-preferuj nejmenší zásah, při nejistotě ESKALACE). **Každý výsledek** (OPRAVENO / ESKALACE /
-timeout) jde na **Telegram** (dřív končily eskalace tiše jen v `incidents.log`).
+### Nightly full backup — `scripts/backup.sh` (`backup.timer`, 03:30)
+Encrypted (OpenSSL AES-256) to Cloudflare R2 under `nightly/YYYY-MM/`:
+- **Databases** — every production DB dumped individually (`pg_dump -Fc`): freio, lokwave,
+  inngest, ripieno, launchmail, dokploy metadata, plus each cluster's role globals.
+  Rehearsal/system DBs are excluded. Dump filenames are namespaced per container so
+  same-named DBs (e.g. two `postgres`) never collide.
+- **Config bundle** — `/etc/dokploy` + `compose/` + `self-healing/` + systemd units.
+- **Secrets bundle** — `/srv/homelab/secrets`, encrypted.
+- **Second off-site** — mirrored to a separate `homelab-backups-dr` bucket (90-day
+  retention) to survive accidental deletion / retention-nuke of the primary.
 
-## 2b. Restore drill (`self-healing/restore-drill.sh`, `restore-drill.timer` So 05:00)
-„Netestovaný dump není záloha." Týdně: stáhne nejnovější `db_{freio,ripieno,lokwave}`
-.enc z R2, dešifruje, obnoví do **izolovaného throwaway** `supabase/postgres:17.6.1.136`
-kontejneru (`pg-restore-drill`, žádná prod síť/volume), ověří schema (počet tabulek) +
-data (nejlidnatější tabulka > 0 řádků), uklidí, hlásí na Telegram. Ověřeno 2026-07-29:
-freio 62 tab / test_questions 63600, ripieno 33 / events 3312, lokwave 38 / outreach_prospects 670.
+### Frequent DB snapshots — `scripts/frequent-db-backup.sh` (`frequent-db-backup.timer`, every 10 min)
+All production DBs, encrypted → R2 `frequent/` (48 h retention). Brings **RPO down to ~10 min**
+with zero changes to the live databases (plain `pg_dump`, just more often).
 
-## 2c. Watchdog-on-watchdog
-Poller pushuje heartbeat do Kuma push monitoru „self-healing alive" každý cyklus (90s).
-Když poller **tiše zamrzne** (ne jen spadne — to řeší `Restart=always`), monitor jde DOWN
-a Kuma **SÁM** pošle Telegram přes vlastní notifikaci „Telegram-owner" (nezávisle na polleru,
-který se neumí hlídat sám). URL v `kuma-selfheal-push-url.txt`.
+### Off-box key
+The AES key (`freio-backup-key.txt`) lives on the server **and** on the workstation
+(gitignored) **and** in an Obsidian vault — three failure domains, matching SHA-256.
+Without this, encrypted off-site backups would be undecryptable after disk loss.
 
-## 3. Proaktivní health-review (`self-healing/daily-health-review.sh`)
-`daily-health-review.timer` denně 07:00 → LLM agent projde disk, kontejnery (unhealthy/
-restart county), certy (freio/ripieno/lokwave), **stáří poslední R2 zálohy**, firing alerty,
-pg spojení. Bezpečně opraví jen prune (>80 % disk) a restart čistě spadlého kontejneru,
-zbytek jen nahlásí. Pošle **Telegram digest**. Chytá pomalé problémy dřív, než z nich je incident.
+### Fail-loud
+`backup.sh` exits non-zero on any partial failure → `OnFailure=` → Telegram. Success pings
+an Uptime Kuma push monitor (25 h window) — so even a *no-run* surfaces as DOWN → agent.
 
-## 4. Guardrails / SPOF
-- **Cloudflare tunnel** (`cloudflared`, SPOF pro veřejný HTTPS): `OnFailure` → Telegram +
-  runbook v CLAUDE.md (agent umí `systemctl restart cloudflared`). Když padne víc webů
-  najednou a kontejnery jsou healthy → podezření na tunel.
-- **docker-image-prune.timer** týdně (Ne 04:30) — disk hygiena, BEZ `--volumes`.
-- **freio.cz + www.freio.cz** přidány do Prometheus blackbox (cert + uptime).
-- Memory limity kontejnerů **záměrně nenasazeny** (22Gi volných, riziko OOM > přínos);
-  paměťové problémy detekují alerty `MaloPameti`/`KontejnerZeraPamet` → agent.
+### Tested recovery — `self-healing/restore-drill.sh` (`restore-drill.timer`, Sat 05:00)
+Weekly: pulls the latest encrypted dumps, decrypts, restores into an **isolated throwaway**
+Postgres container, asserts schema (table count) + data (largest table > 0 rows), cleans up,
+reports to Telegram. *An untested backup is not a backup.*
 
-## 5. Známé follow-upy
-- `compose/observability/docker-compose.yml` má inline secrety (Grafana pw, PG exporter DSN)
-  → před commitem sanitizovat na `${VAR}`; zatím jen v šifrovaném config bundlu na R2.
-- Restore drill (týdenní automatická verifikace dumpů do throwaway DB) — zatím ruční.
-- Secrets inventory viz `docs/secrets-inventory.md`.
+---
+
+## 2. Reactive self-healing — `self-healing/poller.py` + `respond.sh`
+
+`self-healing.service` (Restart=always) polls **three signal sources** every 90 s:
+
+1. **Uptime Kuma** — DOWN monitors (web / DB / infra reachability).
+2. **Prometheus** — FIRING alerts (disk, container crashloop, Postgres down, memory,
+   connection exhaustion, cert expiry) — read via `docker exec obs-prometheus` (not host-exposed).
+3. **Loki** — error-log **spikes** (panic / fatal / OOM / 5xx / "too many connections"),
+   detected against an EWMA baseline so steady-state log noise never triggers.
+
+An incident (deduped, 30-min cooldown) → `respond.sh` → **Claude Code headless** diagnoses
+and remediates within the iron-clad guardrails in `self-healing/CLAUDE.md` (never touch
+data / volumes / DNS / secrets; smallest intervention first; escalate when unsure). It must
+**verify** the fix before reporting success; every outcome (FIXED / ESCALATION / timeout)
+goes to Telegram.
+
+- **Verify-and-escalate** — if the same incident recurs 3× within a window (the agent claimed
+  FIXED but it didn't hold), it stops retrying, backs off, and escalates to a human.
+- **Watchdog-on-watchdog** — the poller heartbeats a Kuma push monitor each cycle. If the
+  poller *silently freezes* (not just crashes — that's covered by Restart=always), the monitor
+  goes DOWN and Kuma alerts independently.
+
+---
+
+## 3. Proactive & self-improving
+
+### Daily health review — `daily-health-review.sh` (07:00)
+LLM agent checks disk trend, unhealthy/high-restart containers, cert days-remaining, **last
+backup age**, firing alerts, Postgres connections. Auto-fixes only trivial classes (prune,
+restart a cleanly-exited container); everything else → Telegram digest. Catches slow-burn
+issues before they become 2 a.m. incidents.
+
+### Weekly self-improvement meta-agent — `self-improve.sh` (Sun 08:00)
+The "brain": reviews incident history + metrics + config drift (server vs git), writes
+**postmortems** with root causes, **applies safe preventive fixes**, and proposes the rest —
+then reports. On its first run it found and fixed an **11-hour silent crashloop** (two realtime
+containers, a role-password mismatch after a redeploy) that uptime monitoring had missed.
+
+### Synthetic checks — `synthetic-check.sh` (every 10 min)
+Deeper than uptime: authenticated `apikey` health (proves GoTrue + Kong + DB are alive, not
+just that Kong is up), a real PostgREST query, and page-render keyword checks — each retried
+to absorb transient blips.
+
+---
+
+## 4. Security & safe updates
+
+| Component | Behaviour |
+|---|---|
+| **Trivy** (`trivy-scan.sh`, Mon 06:00) | Weekly CVE scan of running images → Telegram if CRITICAL |
+| **Auto-update** (`auto-update.sh`, Sun 05:30) | Observability stack only: pull → **health-gate → rollback** on failure. Pinned prod images (Supabase/Kong/Postgres) are never auto-bumped; app images rebuild via git push |
+| **Deploy watchdog** (`deploy-watchdog.sh`, every 3 min) | Post-deploy health gate: a freshly-deployed swarm service that fails → `docker service rollback` to the last working spec (2 h anti-loop) |
+| **Cloudflare tunnel** | `OnFailure` → Telegram + a runbook the agent can act on; a SPOF for all public HTTPS |
+| **Baseline hardening** | fail2ban, unattended OS security upgrades, weekly image prune (no volumes), zero open inbound ports |
+
+---
+
+## 5. Schedule at a glance
+
+| When | Job |
+|---|---|
+| every 90 s | self-healing poller (Kuma + Prometheus + Loki) |
+| every 3 min | deploy watchdog (auto-rollback) |
+| every 10 min | frequent DB snapshots · synthetic checks |
+| daily 03:30 | full encrypted backup (+ DR bucket) |
+| daily 07:00 | health-review agent |
+| Sat 05:00 | restore drill |
+| Sun 05:30 | safe auto-update |
+| Sun 08:00 | self-improvement meta-agent |
+| Mon 06:00 | Trivy CVE scan |
+| Sun 04:30 | docker image prune |
+
+---
+
+## 6. Deliberate non-choices
+
+- **Container memory limits** — intentionally not set (plenty of free RAM; risk of spurious
+  OOM-kills outweighs the benefit). Memory pressure is caught by Prometheus alerts → agent.
+- **WAL / point-in-time recovery** — evaluated, then chose **10-min encrypted dumps** instead:
+  RPO ~10 min with *zero* configuration change to the live customer database, versus adding a
+  replication slot + auth changes to a paying-customer DB. The safe trade for this workload.
