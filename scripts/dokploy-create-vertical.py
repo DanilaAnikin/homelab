@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Vytvoří + nakonfiguruje Dokploy app pro jeden lokwave vertical (klon vet)."""
-import sys, json, urllib.request, urllib.error
+import os, sys, json, urllib.request, urllib.error
 
 DK = "http://100.111.188.8:3000/api"
 KEY = open("/home/anakin/programming/homelab/secrets/dokploy-api-token.txt").read().strip()
 ENV_ID = "qk9MKMpCkCkD03aYMzKz6"        # stejné environment jako vet
 GITHUB_ID = "UAzoSybnNB-qH5BsJAjyX"
-STRIPE_PK = "pk_live_51TXNh6L71YQXjEyi3pow8fpU3N5xTHHwVXAWwTLQVy9CziYcNuWIe2XIGDAxFPP3RnwqHamHBVD96mxGjOY1RZDj00fybB2AtW"
+# Stripe publishable key (pk_live_) — z designu veřejný, ale držíme ho mimo repo.
+# Nastav před spuštěním:  export STRIPE_PK=pk_live_...
+STRIPE_PK = os.environ.get("STRIPE_PK", "")
 
 def post(ep, body):
     req = urllib.request.Request(DK + "/" + ep, data=json.dumps(body).encode(),
