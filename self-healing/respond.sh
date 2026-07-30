@@ -20,7 +20,7 @@ trap 'rm -f "$OUT"' EXIT
 
 if timeout 900 claude -p "INCIDENT: $INCIDENT
 
-Diagnostikuj a BEZPEČNĚ oprav dle CLAUDE.md (železná pravidla dodrž!). Nakonec napiš shrnutí: příčina → akce → výsledek (OPRAVENO nebo ESKALACE:...)." \
+Diagnostikuj a BEZPEČNĚ oprav dle CLAUDE.md (železná pravidla dodrž!). POVINNÉ OVĚŘENÍ: než napíšeš OPRAVENO, znovu ověř, že služba reálně běží (docker ps + healthcheck / curl / pg_isready dle typu). Když po opravě stále nefunguje NEBO si nejsi jistý, napiš ESKALACE. Nakonec napiš shrnutí: příčina → akce → OVĚŘENÍ → výsledek (OPRAVENO nebo ESKALACE:...)." \
   --dangerously-skip-permissions \
   --allowedTools "Bash" \
   --output-format text > "$OUT" 2>&1; then

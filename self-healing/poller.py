@@ -1,35 +1,41 @@
 #!/usr/bin/env python3
-"""Self-healing poller: dva zdroje incidentů → respond.sh (dedup + cooldown).
+"""Self-healing poller: TŘI zdroje incidentů → respond.sh (dedup + cooldown).
 
   1) Uptime Kuma DOWN monitory (web/DB/infra dostupnost).
-  2) Prometheus FIRING alerty (disk/crashloop/cert/pamět/postgres) — actionable
-     třídy, které agent umí bezpečně opravit dle CLAUDE.md. Prometheus/Alertmanager
-     nejsou publikované na host (Swarm overlay), proto se čtou přes `docker exec`.
+  2) Prometheus FIRING alerty (disk/crashloop/cert/pamět/postgres) — actionable třídy.
+  3) Loki chybové SPIKY v logách appek (panic/fatal/OOM/too-many-connections/5xx…) —
+     spike-detekce přes EWMA baseline, ať steady-state log-šum netriggeruje agenta.
 
-Robustní: každý zdroj má vlastní try/except (jeden padlý neoslepí druhý) a po N
+Prometheus/Loki nejsou publikované na host (Swarm overlay), čtou se přes `docker exec
+obs-prometheus wget` (obs-prometheus má wget a je na stejné síti jako obs-loki).
+
+Robustní: každý zdroj má vlastní try/except (jeden padlý neoslepí ostatní) a po N
 po sobě jdoucích chybách pollu eskaluje na Telegram + do incidents.log.
 """
-import subprocess, time, json
+import subprocess, time, json, urllib.parse
 
 KUMA = "http://localhost:3001"; USER = "DanilaAnikin"
-COOLDOWN = 1800           # 30 min per incident-key (ať agent nemlátí to samé dokola)
-ERROR_ESCALATE_AFTER = 5  # po tolika po sobě jdoucích chybách pollu eskaluj (~7.5 min)
+COOLDOWN = 1800           # 30 min per incident-key
+ERROR_ESCALATE_AFTER = 5  # po tolika chybách pollu eskaluj (~7.5 min)
 INCIDENTS_LOG = "/srv/homelab/self-healing/incidents.log"
 NOTIFY = "/srv/homelab/self-healing/notify.sh"
 RESPOND = "/srv/homelab/self-healing/respond.sh"
 PROM_CONTAINER = "obs-prometheus"
-# Watchdog-on-watchdog: poller pushuje heartbeat do Kuma "self-healing alive" monitoru.
-# Když poller tiše zamrzne/umře, monitor jde DOWN a Kuma SÁM (nezávisle) pošle Telegram —
-# poller se totiž neumí hlídat sám. Soubor obsahuje jen push URL (nebo je prázdný).
 ALIVE_PUSH_FILE = "/srv/homelab/secrets/kuma-selfheal-push-url.txt"
 
-# Prometheus alerty, které agent umí BEZPEČNĚ řešit dle CLAUDE.md runbooku.
-# (WebNedostupny řeší Kuma; info/predictive/frem-specific se zde záměrně nespouští.)
 ACTIONABLE = {
     "DiskDochazi", "KontejnerSeRestartuje", "PostgresNedostupny",
     "MaloPameti", "KontejnerZeraPamet", "PostgresDochazejiSpojeni",
     "CertifikatBrzyVyprsi",
 }
+
+# Loki: závažné vzory (bez literálních závorek → čistý RE2 regex, žádné escape peklo).
+LOKI_PATTERN = ("(?i)(panic|fatal|oomkill|out of memory|segfault|too many connections|"
+                "connection refused|internal server error|service unavailable|"
+                "unhandledrejection|traceback)")
+LOKI_QUERY = (f'sum(count_over_time({{container=~".+"}} |~ "{LOKI_PATTERN}" [5m])) by (container)')
+LOKI_SEVERE_MIN = 15      # min. absolutní počet za 5m, aby vůbec šlo o incident
+LOKI_SPIKE_MULT = 3.0     # a zároveň > 3× klouzavý baseline (spike, ne steady-state)
 
 
 def kuma_pass():
@@ -40,6 +46,12 @@ def kuma_pass():
 
 PASS = kuma_pass()
 handled = {}
+ewma = {}     # per-container klouzavý baseline chybovosti (Loki)
+recur = {}    # key -> (count, first_ts): verify-and-escalate na úrovni detekce
+
+RECUR_ESCALATE = 3        # 3× v okně → agent to trvale neopravil → eskaluj člověku
+RECUR_WINDOW = 4 * 3600   # okno pro počítání opakování
+RECUR_BACKOFF = 4 * 3600  # po eskalaci prodluž cooldown (přestaň mlátit to samé)
 
 
 def notify(msg):
@@ -58,7 +70,6 @@ def log_incident(text):
 
 
 def alive_ping():
-    """Heartbeat do Kuma 'self-healing alive' — dokládá, že poller žije (ne zamrzl)."""
     try:
         url = open(ALIVE_PUSH_FILE).read().strip()
         if url:
@@ -69,13 +80,32 @@ def alive_ping():
 
 
 def trigger(key, incident):
-    """Dedup dle key + cooldown → spusť responder."""
     now = time.time()
     if now - handled.get(key, 0) < COOLDOWN:
         return
     handled[key] = now
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] TRIGGER agent: {key}", flush=True)
+    # Verify-and-escalate: když se incident vrací (agent tvrdil OPRAVENO, ale nedrží),
+    # po RECUR_ESCALATE opakováních v okně eskaluj člověku a přestaň spouštět agenta.
+    c, first = recur.get(key, (0, now))
+    if now - first > RECUR_WINDOW:
+        c, first = 0, now
+    c += 1
+    recur[key] = (c, first)
+    if c >= RECUR_ESCALATE:
+        handled[key] = now + RECUR_BACKOFF - COOLDOWN   # prodluž cooldown (back-off)
+        msg = (f"opakovaný incident '{key}' ({c}× za {int((now - first) / 60)} min) — "
+               f"self-healing to nedokázal trvale opravit. Nutný zásah člověka.")
+        log_incident("ESCALATION (recurrence): " + msg)
+        notify("🔁 " + msg)
+        return
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] TRIGGER agent: {key} (pokus {c})", flush=True)
     subprocess.Popen([RESPOND, incident])
+
+
+def _prom_wget(url):
+    return subprocess.check_output(
+        ["sudo", "docker", "exec", PROM_CONTAINER, "wget", "-qO-", url],
+        timeout=25, text=True)
 
 
 # ── Zdroj 1: Uptime Kuma ─────────────────────────────────────────────────────
@@ -108,14 +138,9 @@ def poll_kuma():
         api.disconnect()
 
 
-# ── Zdroj 2: Prometheus FIRING alerty (přes docker exec) ─────────────────────
+# ── Zdroj 2: Prometheus FIRING alerty ────────────────────────────────────────
 def poll_prometheus():
-    raw = subprocess.check_output(
-        ["sudo", "docker", "exec", PROM_CONTAINER, "wget", "-qO-",
-         "http://localhost:9090/api/v1/alerts"],
-        timeout=25, text=True,
-    )
-    data = json.loads(raw)
+    data = json.loads(_prom_wget("http://localhost:9090/api/v1/alerts"))
     for a in data.get("data", {}).get("alerts", []):
         if a.get("state") != "firing":
             continue
@@ -132,9 +157,34 @@ def poll_prometheus():
         trigger(f"prom:{name}:{inst}", incident)
 
 
-print("[self-healing poller] start (Kuma + Prometheus)", flush=True)
-consec = {"kuma": 0, "prom": 0}
-escalated = {"kuma": False, "prom": False}
+# ── Zdroj 3: Loki chybové spiky (spike-detekce přes EWMA) ────────────────────
+def poll_loki():
+    q = urllib.parse.quote(LOKI_QUERY)
+    data = json.loads(_prom_wget(f"http://obs-loki:3100/loki/api/v1/query?query={q}"))
+    for r in data.get("data", {}).get("result", []):
+        cont = r.get("metric", {}).get("container", "?")
+        try:
+            val = float(r.get("value", [None, "0"])[1])
+        except Exception:
+            continue
+        base = ewma.get(cont)
+        if base is None:
+            ewma[cont] = val            # warm-up: první pozorování jen nastaví baseline
+            continue
+        if val >= LOKI_SEVERE_MIN and val > LOKI_SPIKE_MULT * max(base, 1.0):
+            trigger(
+                f"loki:{cont}",
+                f"Loki: kontejner '{cont}' má SPIKE závažných chyb v logách "
+                f"({int(val)} shod za 5m, baseline ~{base:.0f}). Vzory: panic/fatal/OOM/"
+                f"too-many-connections/5xx. Zdiagnostikuj z `docker logs` příčinu a "
+                f"bezpečně oprav dle CLAUDE.md (při nejistotě ESKALACE).",
+            )
+        ewma[cont] = 0.7 * base + 0.3 * val   # posuň baseline (sustained stav přestane alertovat)
+
+
+print("[self-healing poller] start (Kuma + Prometheus + Loki)", flush=True)
+consec = {"kuma": 0, "prom": 0, "loki": 0}
+escalated = {"kuma": False, "prom": False, "loki": False}
 
 
 def run_source(tag, fn):
@@ -156,5 +206,6 @@ def run_source(tag, fn):
 while True:
     run_source("kuma", poll_kuma)
     run_source("prom", poll_prometheus)
-    alive_ping()   # heartbeat — poller žije (watchdog-on-watchdog)
+    run_source("loki", poll_loki)
+    alive_ping()
     time.sleep(90)
