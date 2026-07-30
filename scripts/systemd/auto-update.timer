@@ -1,0 +1,8 @@
+[Unit]
+Description=Tydenni auto-update (Ne 05:30, po restore-drill)
+[Timer]
+OnCalendar=Sun 05:30
+RandomizedDelaySec=15m
+Persistent=true
+[Install]
+WantedBy=timers.target

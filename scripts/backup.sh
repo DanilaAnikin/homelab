@@ -24,6 +24,7 @@ BACKUP_TARGETS=(
   "launchmail-postgres|postgres|launchmail"
   "supabase-db|postgres|freio"
   "gorillatype-supabase-db|supabase_admin|postgres"
+  "classio-supabase-db|supabase_admin|postgres"
   "dokploy-postgres|dokploy|dokploy"
 )
 BACKUP_KEY="/srv/homelab/secrets/freio-backup-key.txt"   # AES-256 pass (mimo git; kopie off-box!)
@@ -65,10 +66,10 @@ for target in "${BACKUP_TARGETS[@]}"; do
 
   for db in $dbs; do
     log "   pg_dump $prefix/$db"
-    if docker exec "$cname" pg_dump -U "$user" -Fc -Z6 "$db" > "$WORK/db_${db}_$TS.dump" 2>/dev/null && [[ -s "$WORK/db_${db}_$TS.dump" ]]; then
-      enc "$WORK/db_${db}_$TS.dump" "$WORK/db_${db}_$TS.dump.enc" && rm -f "$WORK/db_${db}_$TS.dump"
+    if docker exec "$cname" pg_dump -U "$user" -Fc -Z6 "$db" > "$WORK/db_${prefix}_${db}_$TS.dump" 2>/dev/null && [[ -s "$WORK/db_${prefix}_${db}_$TS.dump" ]]; then
+      enc "$WORK/db_${prefix}_${db}_$TS.dump" "$WORK/db_${prefix}_${db}_$TS.dump.enc" && rm -f "$WORK/db_${prefix}_${db}_$TS.dump"
     else
-      echo "!! selhal dump $prefix/$db"; FAIL=1; rm -f "$WORK/db_${db}_$TS.dump"
+      echo "!! selhal dump $prefix/$db"; FAIL=1; rm -f "$WORK/db_${prefix}_${db}_$TS.dump"
     fi
   done
 done
@@ -83,6 +84,7 @@ tar --exclude='*/data' --exclude='*.log' --exclude='*/node_modules' \
     -C / srv/homelab/compose srv/homelab/self-healing srv/homelab/email-bot \
     2>/dev/null || echo "!! config tar částečně selhal (pokračuji)"
 # systemd unity homelabu
+tar -rf "${CFG_TAR%.gz}" -C /usr/local/bin homelab-backup.sh 2>/dev/null || true
 tar -rf "${CFG_TAR%.gz}" -C /etc/systemd/system \
   backup.service backup.timer self-healing.service email-bot.service \
   freio-email-outbox.service freio-email-outbox.timer 2>/dev/null || true
@@ -100,6 +102,33 @@ else
   echo "!! secrets bundle selhal"; FAIL=1
 fi
 
+# ── 4b) Frem: hlas a scénáře (jediné, co nejde vyrobit znovu zdarma) ─────────
+# Snímky i hotové video se dají přegenerovat bez nákladů (Higgsfield Unlimited),
+# ale hlas z ElevenLabs stojí reálné peníze (~0,60 $ na video, přes 27 videí
+# už ~16 $). Záloha je proto úzká: hlas, časy a texty. Snímky (750 MB na video)
+# a final.mp4 se nezálohují schválně.
+#
+# NEŠIFRUJE se, a to ze dvou důvodů: (1) hlas i texty jsou určené k publikaci
+# na YouTube, takže tu není co chránit, (2) šifrování dá při každém běhu jiný
+# ciphertext, takže by se každou noc znovu vozily celé gigabajty. Takhle
+# rclone copy přeskočí, co už na R2 leží, a jede jen nový hlas (~33 MB/video).
+#
+# Retence maže jen uvnitř nightly/, takže tenhle prefix zůstává navždy.
+FREM_VIDEOS=/srv/frem/repo/videos
+if [[ -d "$FREM_VIDEOS" ]]; then
+  log "   Frem: hlas + scénáře → R2"
+  if $RC copy "$FREM_VIDEOS" "$R2_REMOTE/frem/videos/" \
+      --include '*/voice.wav' --include '*/transcription.txt' \
+      --include '*/timestamps.json' --include '*/script.md' \
+      --include '*/package.md' --include '*/images/prompts.tsv' \
+      --transfers 4 -q; then
+    FREM_N=$($RC ls "$R2_REMOTE/frem/videos/" 2>/dev/null | grep -c 'voice.wav' || true)
+    log "✔ Frem záloha OK (hlasů na R2: ${FREM_N:-?})"
+  else
+    echo "!! záloha Fremu selhala"; FAIL=1
+  fi
+fi
+
 # ── 5) Odvoz na R2 (jen .enc soubory) ────────────────────────────────────────
 ENC_COUNT=$(ls "$WORK"/*.enc 2>/dev/null | wc -l)
 if [[ "$ENC_COUNT" -eq 0 ]]; then echo "!! žádné .enc k odvozu"; FAIL=1; fi
@@ -107,6 +136,9 @@ if $RC copy "$WORK" "$R2_REMOTE/$NIGHTLY_PREFIX/" --include '*.enc' --transfers 
   log "✔ upload OK ($ENC_COUNT souborů → $R2_REMOTE/$NIGHTLY_PREFIX/)"
   # retence: maž JEN uvnitř nightly/ (ne migration/ripieno point-in-time!)
   $RC delete "$R2_REMOTE/nightly" --min-age "${KEEP_R2_DAYS}d" -q || true
+  # 2. off-site (DR bucket, delší 90d retence — chrání proti retenci/smazání primárního)
+  $RC copy "$WORK" "r2:homelab-backups-dr/$NIGHTLY_PREFIX/" --include '*.enc' --transfers 4 -q || echo "!! DR copy selhalo (nefatální)"
+  $RC delete "r2:homelab-backups-dr" --min-age 90d -q || true
 else
   echo "!! upload do R2 selhal"; FAIL=1
 fi

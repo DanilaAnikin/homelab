@@ -1,0 +1,7 @@
+[Unit]
+Description=Hodinovy sifrovany dump prod DB (RPO 1h)
+After=network-online.target docker.service
+OnFailure=notify-failure@hourly-db-backup.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hourly-db-backup.sh

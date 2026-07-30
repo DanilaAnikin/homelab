@@ -1,0 +1,7 @@
+[Unit]
+Description=Tydenni Trivy sken zranitelnosti image
+After=network-online.target docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/trivy-scan.sh
+TimeoutStartSec=3600

@@ -1,0 +1,6 @@
+[Unit]
+Description=Synthetic funkcni checky (auth/DB/render)
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/synthetic-check.sh
