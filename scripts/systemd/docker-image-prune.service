@@ -1,6 +1,11 @@
 [Unit]
-Description=Tydenni docker image prune (disk hygiena, BEZ volumes)
+Description=Tydenni docker image + build-cache prune (disk hygiena, BEZ volumes)
 
 [Service]
 Type=oneshot
+# Nepouzite images starsi nez 7 dni.
 ExecStart=/usr/bin/docker image prune -af --filter until=168h
+# Build cache starsi nez 7 dni (nechava cerstvou cache kvuli rychlosti buildu).
+# BEZ tohoto build cache neomezene roste pri castych buildech (napr. rebuildy
+# agent-farm/freio) a spusti trendovy disk alert. Volumes se zamerne nepruneuji.
+ExecStart=/usr/bin/docker builder prune -af --filter until=168h
