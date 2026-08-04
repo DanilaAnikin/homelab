@@ -13,6 +13,9 @@ export interface IncomingEmailFull {
   subject: string | null;
   text: string | null;
   html: string | null;
+  sourceSizeBytes: number | null;
+  sourceTruncated: boolean;
+  contentTruncated: boolean;
   hasAttachments: boolean;
   attachments: { filename: string; contentType: string; size: number }[] | null;
   seen: boolean;

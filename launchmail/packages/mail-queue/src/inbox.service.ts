@@ -1,6 +1,18 @@
 import { db } from "@workspace/db";
 import { incomingEmails, smtpConfigs } from "@workspace/db/schemas";
 import { and, eq, desc, lt, or, ilike, sql, isNotNull } from "drizzle-orm";
+import {
+  INCOMING_ADDRESS_MAX_CHARS,
+  INCOMING_ADDRESS_MAX_ITEMS,
+  INCOMING_ATTACHMENT_MAX_ITEMS,
+  INCOMING_CONTENT_TYPE_MAX_CHARS,
+  INCOMING_FILENAME_MAX_CHARS,
+  INCOMING_HEADER_MAX_CHARS,
+  INCOMING_HTML_MAX_CHARS,
+  INCOMING_NAME_MAX_CHARS,
+  INCOMING_SUBJECT_MAX_CHARS,
+  INCOMING_TEXT_MAX_CHARS,
+} from "./incoming-email-limits";
 
 export type InboxFolder = "inbox" | "archived" | "starred" | "all";
 
@@ -136,7 +148,127 @@ export async function listIncomingEmails(
 
 export async function getIncomingEmail(id: string, organizationId: string) {
   const rows = await db
-    .select()
+    .select({
+      id: incomingEmails.id,
+      organizationId: incomingEmails.organizationId,
+      smtpConfigId: incomingEmails.smtpConfigId,
+      imapUid: incomingEmails.imapUid,
+      messageId: sql<
+        string | null
+      >`left(${incomingEmails.messageId}, ${INCOMING_HEADER_MAX_CHARS})`,
+      inReplyTo: sql<
+        string | null
+      >`left(${incomingEmails.inReplyTo}, ${INCOMING_HEADER_MAX_CHARS})`,
+      references: sql<
+        string | null
+      >`left(${incomingEmails.references}, ${INCOMING_HEADER_MAX_CHARS})`,
+      fromAddress: sql<string>`left(${incomingEmails.fromAddress}, ${INCOMING_ADDRESS_MAX_CHARS})`,
+      fromName: sql<
+        string | null
+      >`left(${incomingEmails.fromName}, ${INCOMING_NAME_MAX_CHARS})`,
+      toAddresses: sql<{ email: string; name?: string }[]>`coalesce((
+        select jsonb_agg(value)
+        from (
+          select jsonb_strip_nulls(jsonb_build_object(
+            'email', left(value ->> 'email', ${INCOMING_ADDRESS_MAX_CHARS}),
+            'name', left(value ->> 'name', ${INCOMING_NAME_MAX_CHARS})
+          )) as value
+          from jsonb_array_elements(coalesce(${incomingEmails.toAddresses}, '[]'::jsonb)) as items(value)
+          limit ${INCOMING_ADDRESS_MAX_ITEMS}
+        ) as limited_to
+      ), '[]'::jsonb)`,
+      ccAddresses: sql<{ email: string; name?: string }[] | null>`case
+        when ${incomingEmails.ccAddresses} is null then null
+        else (
+          select coalesce(jsonb_agg(value), '[]'::jsonb)
+          from (
+            select jsonb_strip_nulls(jsonb_build_object(
+              'email', left(value ->> 'email', ${INCOMING_ADDRESS_MAX_CHARS}),
+              'name', left(value ->> 'name', ${INCOMING_NAME_MAX_CHARS})
+            )) as value
+            from jsonb_array_elements(${incomingEmails.ccAddresses}) as items(value)
+            limit ${INCOMING_ADDRESS_MAX_ITEMS}
+          ) as limited_cc
+        )
+      end`,
+      subject: sql<
+        string | null
+      >`left(${incomingEmails.subject}, ${INCOMING_SUBJECT_MAX_CHARS})`,
+      snippet: sql<string | null>`left(${incomingEmails.snippet}, 240)`,
+      text: sql<
+        string | null
+      >`left(${incomingEmails.text}, ${INCOMING_TEXT_MAX_CHARS})`,
+      html: sql<
+        string | null
+      >`left(${incomingEmails.html}, ${INCOMING_HTML_MAX_CHARS})`,
+      sourceSizeBytes: incomingEmails.sourceSizeBytes,
+      sourceTruncated: incomingEmails.sourceTruncated,
+      contentTruncated: sql<boolean>`(
+        ${incomingEmails.contentTruncated}
+        or coalesce(char_length(${incomingEmails.messageId}) > ${INCOMING_HEADER_MAX_CHARS}, false)
+        or coalesce(char_length(${incomingEmails.inReplyTo}) > ${INCOMING_HEADER_MAX_CHARS}, false)
+        or coalesce(char_length(${incomingEmails.references}) > ${INCOMING_HEADER_MAX_CHARS}, false)
+        or char_length(${incomingEmails.fromAddress}) > ${INCOMING_ADDRESS_MAX_CHARS}
+        or coalesce(char_length(${incomingEmails.fromName}) > ${INCOMING_NAME_MAX_CHARS}, false)
+        or jsonb_array_length(coalesce(${incomingEmails.toAddresses}, '[]'::jsonb)) > ${INCOMING_ADDRESS_MAX_ITEMS}
+        or jsonb_array_length(coalesce(${incomingEmails.ccAddresses}, '[]'::jsonb)) > ${INCOMING_ADDRESS_MAX_ITEMS}
+        or exists (
+          select 1 from (
+            select value
+            from jsonb_array_elements(coalesce(${incomingEmails.toAddresses}, '[]'::jsonb)) as items(value)
+            limit ${INCOMING_ADDRESS_MAX_ITEMS}
+          ) as bounded_to
+          where char_length(value ->> 'email') > ${INCOMING_ADDRESS_MAX_CHARS}
+             or char_length(value ->> 'name') > ${INCOMING_NAME_MAX_CHARS}
+        )
+        or exists (
+          select 1 from (
+            select value
+            from jsonb_array_elements(coalesce(${incomingEmails.ccAddresses}, '[]'::jsonb)) as items(value)
+            limit ${INCOMING_ADDRESS_MAX_ITEMS}
+          ) as bounded_cc
+          where char_length(value ->> 'email') > ${INCOMING_ADDRESS_MAX_CHARS}
+             or char_length(value ->> 'name') > ${INCOMING_NAME_MAX_CHARS}
+        )
+        or coalesce(char_length(${incomingEmails.subject}) > ${INCOMING_SUBJECT_MAX_CHARS}, false)
+        or coalesce(char_length(${incomingEmails.text}) > ${INCOMING_TEXT_MAX_CHARS}, false)
+        or coalesce(char_length(${incomingEmails.html}) > ${INCOMING_HTML_MAX_CHARS}, false)
+        or jsonb_array_length(coalesce(${incomingEmails.attachments}, '[]'::jsonb)) > ${INCOMING_ATTACHMENT_MAX_ITEMS}
+        or exists (
+          select 1 from (
+            select value
+            from jsonb_array_elements(coalesce(${incomingEmails.attachments}, '[]'::jsonb)) as items(value)
+            limit ${INCOMING_ATTACHMENT_MAX_ITEMS}
+          ) as bounded_attachments
+          where char_length(value ->> 'filename') > ${INCOMING_FILENAME_MAX_CHARS}
+             or char_length(value ->> 'contentType') > ${INCOMING_CONTENT_TYPE_MAX_CHARS}
+        )
+      )`,
+      hasAttachments: incomingEmails.hasAttachments,
+      attachments: sql<
+        { filename: string; contentType: string; size: number }[] | null
+      >`case
+        when ${incomingEmails.attachments} is null then null
+        else (
+          select coalesce(jsonb_agg(value), '[]'::jsonb)
+          from (
+            select jsonb_build_object(
+              'filename', left(coalesce(value ->> 'filename', 'attachment'), ${INCOMING_FILENAME_MAX_CHARS}),
+              'contentType', left(coalesce(value ->> 'contentType', 'application/octet-stream'), ${INCOMING_CONTENT_TYPE_MAX_CHARS}),
+              'size', coalesce(value -> 'size', '0'::jsonb)
+            ) as value
+            from jsonb_array_elements(${incomingEmails.attachments}) as items(value)
+            limit ${INCOMING_ATTACHMENT_MAX_ITEMS}
+          ) as limited_attachments
+        )
+      end`,
+      seen: incomingEmails.seen,
+      starred: incomingEmails.starred,
+      archived: incomingEmails.archived,
+      repliedAt: incomingEmails.repliedAt,
+      receivedAt: incomingEmails.receivedAt,
+      createdAt: incomingEmails.createdAt,
+    })
     .from(incomingEmails)
     .where(
       and(

@@ -13,6 +13,17 @@ import {
   syncMailbox,
   backfillMailbox,
   fetchAttachment,
+  IncomingEmailContentTooLargeError,
+  INCOMING_ADDRESS_MAX_CHARS,
+  INCOMING_ADDRESS_MAX_ITEMS,
+  INCOMING_ATTACHMENT_MAX_ITEMS,
+  INCOMING_CONTENT_TYPE_MAX_CHARS,
+  INCOMING_FILENAME_MAX_CHARS,
+  INCOMING_HEADER_MAX_CHARS,
+  INCOMING_HTML_MAX_CHARS,
+  INCOMING_NAME_MAX_CHARS,
+  INCOMING_SUBJECT_MAX_CHARS,
+  INCOMING_TEXT_MAX_CHARS,
   getSmtpConfig,
   getSmtpConfigById,
   enqueueEmail,
@@ -24,6 +35,96 @@ import type { AppVariables } from ".";
 import { requirePerm } from "./org-context";
 
 type InboxContext = Parameters<typeof requirePerm>[0];
+
+function boundedString(
+  value: unknown,
+  max: number,
+): { value: unknown; truncated: boolean } {
+  if (typeof value !== "string" || value.length <= max) {
+    return { value, truncated: false };
+  }
+  return { value: value.slice(0, max), truncated: true };
+}
+
+/**
+ * Final response boundary for message detail. Ingestion and the DB projection
+ * already apply these limits; keeping a serializer guard means an old row or a
+ * future service regression still cannot produce an unbounded JSON response.
+ */
+function boundedIncomingEmailDetail(
+  message: Record<string, unknown>,
+): Record<string, unknown> {
+  const detail = { ...message };
+  let truncated = detail.contentTruncated === true;
+  const stringLimits: Record<string, number> = {
+    messageId: INCOMING_HEADER_MAX_CHARS,
+    inReplyTo: INCOMING_HEADER_MAX_CHARS,
+    references: INCOMING_HEADER_MAX_CHARS,
+    fromAddress: INCOMING_ADDRESS_MAX_CHARS,
+    fromName: INCOMING_NAME_MAX_CHARS,
+    subject: INCOMING_SUBJECT_MAX_CHARS,
+    snippet: 240,
+    text: INCOMING_TEXT_MAX_CHARS,
+    html: INCOMING_HTML_MAX_CHARS,
+  };
+  for (const [key, max] of Object.entries(stringLimits)) {
+    const bounded = boundedString(detail[key], max);
+    detail[key] = bounded.value;
+    truncated ||= bounded.truncated;
+  }
+
+  for (const key of ["toAddresses", "ccAddresses"] as const) {
+    if (!Array.isArray(detail[key])) continue;
+    const source = detail[key] as unknown[];
+    if (source.length > INCOMING_ADDRESS_MAX_ITEMS) truncated = true;
+    detail[key] = source.slice(0, INCOMING_ADDRESS_MAX_ITEMS).map((entry) => {
+      if (!entry || typeof entry !== "object") return {};
+      const record = entry as Record<string, unknown>;
+      const email = boundedString(record.email, INCOMING_ADDRESS_MAX_CHARS);
+      const name = boundedString(record.name, INCOMING_NAME_MAX_CHARS);
+      truncated ||= email.truncated || name.truncated;
+      return {
+        ...(typeof email.value === "string" ? { email: email.value } : {}),
+        ...(typeof name.value === "string" ? { name: name.value } : {}),
+      };
+    });
+  }
+
+  if (Array.isArray(detail.attachments)) {
+    const source = detail.attachments as unknown[];
+    if (source.length > INCOMING_ATTACHMENT_MAX_ITEMS) truncated = true;
+    detail.attachments = source
+      .slice(0, INCOMING_ATTACHMENT_MAX_ITEMS)
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return {};
+        const record = entry as Record<string, unknown>;
+        const filename = boundedString(
+          record.filename,
+          INCOMING_FILENAME_MAX_CHARS,
+        );
+        const contentType = boundedString(
+          record.contentType,
+          INCOMING_CONTENT_TYPE_MAX_CHARS,
+        );
+        truncated ||= filename.truncated || contentType.truncated;
+        return {
+          ...(typeof filename.value === "string"
+            ? { filename: filename.value }
+            : {}),
+          ...(typeof contentType.value === "string"
+            ? { contentType: contentType.value }
+            : {}),
+          size:
+            typeof record.size === "number" && Number.isFinite(record.size)
+              ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, record.size))
+              : 0,
+        };
+      });
+  }
+
+  detail.contentTruncated = truncated;
+  return detail;
+}
 
 async function authorizedIncomingEmail(c: InboxContext, id: string) {
   const msg = await getIncomingEmail(id, c.get("organizationId")!);
@@ -190,7 +291,9 @@ const incomingEmailsRouter = new Hono<AppVariables>()
     if (denied) return denied;
     const msg = await authorizedIncomingEmail(c, c.req.param("id"));
     if (!msg) return c.json({ error: "Not found" }, 404);
-    return c.json(msg);
+    return c.json(
+      boundedIncomingEmailDetail(msg as unknown as Record<string, unknown>),
+    );
   })
 
   // Mark read / unread.
@@ -418,7 +521,18 @@ const incomingEmailsRouter = new Hono<AppVariables>()
     if (!Number.isInteger(index) || index < 0) {
       return c.json({ error: "Invalid attachment index" }, 400);
     }
-    const att = await fetchAttachment(config, msg.imapUid, index);
+    let att;
+    try {
+      att = await fetchAttachment(config, msg.imapUid, index);
+    } catch (error) {
+      if (error instanceof IncomingEmailContentTooLargeError) {
+        return c.json(
+          { error: "Message exceeds the safe attachment download limit" },
+          413,
+        );
+      }
+      throw error;
+    }
     if (!att) return c.json({ error: "Attachment not found" }, 404);
 
     const safeName =

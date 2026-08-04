@@ -1,4 +1,9 @@
-import { ImapFlow, type ImapFlowOptions } from "imapflow";
+import {
+  ImapFlow,
+  type ImapFlowOptions,
+  type MessageAddressObject,
+  type MessageEnvelopeObject,
+} from "imapflow";
 import { simpleParser, type AddressObject, type ParsedMail } from "mailparser";
 import { db } from "@workspace/db";
 import { incomingEmails } from "@workspace/db/schemas";
@@ -7,34 +12,114 @@ import { updateImapState } from "./smtp-configs.service";
 import { dispatchEvent } from "./webhooks.service";
 import { parseBounce, type BounceResult } from "./bounce";
 import { processBounce } from "./bounce-handler";
+import {
+  INCOMING_ADDRESS_MAX_CHARS,
+  INCOMING_ADDRESS_MAX_ITEMS,
+  INCOMING_ATTACHMENT_MAX_BYTES,
+  INCOMING_ATTACHMENT_MAX_ITEMS,
+  INCOMING_CONTENT_TYPE_MAX_CHARS,
+  INCOMING_FILENAME_MAX_CHARS,
+  INCOMING_HEADER_MAX_CHARS,
+  INCOMING_HTML_MAX_CHARS,
+  INCOMING_NAME_MAX_CHARS,
+  INCOMING_PROTOCOL_MAX_LINE_BYTES,
+  INCOMING_SOURCE_MAX_BYTES,
+  INCOMING_SUBJECT_MAX_CHARS,
+  INCOMING_TEXT_MAX_CHARS,
+} from "./incoming-email-limits";
 
 // On the very first sync of a mailbox we pull the most recent N messages so the
 // inbox is useful immediately without dragging in years of history in one shot.
 // Subsequent polls only fetch UIDs above the stored cursor, so the rest of the
 // archive is left alone unless explicitly backfilled later.
 const INITIAL_SYNC_LIMIT = 200;
-// Hard cap on messages ingested in a single poll, so a mailbox that received a
-// huge burst can't make one sync run unbounded. The remainder lands next tick.
-const MAX_PER_SYNC = 300;
+// Hard cap on messages ingested in a single poll. Each row is individually
+// bounded, and this batch ceiling also keeps the accumulated parsed rows below
+// a predictable memory budget. The remainder lands on the next tick.
+const MAX_PER_SYNC = 50;
 
 type Addr = { email: string; name?: string };
 
-function toAddrs(obj?: AddressObject | AddressObject[]): Addr[] {
-  if (!obj) return [];
+interface Bounded<T> {
+  value: T;
+  truncated: boolean;
+}
+
+function boundString(value: string, max: number): Bounded<string> {
+  return value.length > max
+    ? { value: value.slice(0, max), truncated: true }
+    : { value, truncated: false };
+}
+
+function toAddrs(obj?: AddressObject | AddressObject[]): Bounded<Addr[]> {
+  if (!obj) return { value: [], truncated: false };
   const list = Array.isArray(obj) ? obj : [obj];
   const out: Addr[] = [];
+  let truncated = false;
   for (const o of list) {
     for (const a of o.value ?? []) {
       if (!a.address) continue;
-      out.push(a.name ? { email: a.address, name: a.name } : { email: a.address });
+      if (out.length >= INCOMING_ADDRESS_MAX_ITEMS) {
+        truncated = true;
+        break;
+      }
+      const email = boundString(a.address, INCOMING_ADDRESS_MAX_CHARS);
+      const name = a.name ? boundString(a.name, INCOMING_NAME_MAX_CHARS) : null;
+      truncated ||= email.truncated || Boolean(name?.truncated);
+      out.push(
+        name
+          ? { email: email.value, name: name.value }
+          : { email: email.value },
+      );
     }
   }
-  return out;
+  return { value: out, truncated };
 }
 
-function buildSnippet(parsed: ParsedMail): string {
-  const base = (parsed.text ?? parsed.subject ?? "").replace(/\s+/g, " ").trim();
+function envelopeAddrs(items?: MessageAddressObject[]): Bounded<Addr[]> {
+  if (!items) return { value: [], truncated: false };
+  const out: Addr[] = [];
+  let truncated = false;
+  for (const item of items) {
+    if (!item.address) continue;
+    if (out.length >= INCOMING_ADDRESS_MAX_ITEMS) {
+      truncated = true;
+      break;
+    }
+    const email = boundString(item.address, INCOMING_ADDRESS_MAX_CHARS);
+    const name = item.name
+      ? boundString(item.name, INCOMING_NAME_MAX_CHARS)
+      : null;
+    truncated ||= email.truncated || Boolean(name?.truncated);
+    out.push(
+      name ? { email: email.value, name: name.value } : { email: email.value },
+    );
+  }
+  return { value: out, truncated };
+}
+
+function buildSnippet(text: string | null, subject: string | null): string {
+  // Normalize only a small prefix; running the regex across the entire body
+  // would create another large temporary string before we slice it.
+  const base = (text ?? subject ?? "")
+    .slice(0, 4 * 1024)
+    .replace(/\s+/g, " ")
+    .trim();
   return base.slice(0, 240);
+}
+
+function safeSourceSize(value: number | undefined, fallback: number): number {
+  if (!Number.isFinite(value) || value == null || value < 0) return fallback;
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(value));
+}
+
+function safeDate(...values: Array<Date | string | undefined>): Date {
+  for (const value of values) {
+    if (value == null) continue;
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  return new Date();
 }
 
 // Escape hatch for self-hosted mail servers with self-signed certificates.
@@ -59,6 +144,8 @@ function clientFor(config: SmtpConfig): ImapFlow {
     greetingTimeout: 15000,
     socketTimeout: 60000,
     connectionTimeout: 15000,
+    maxLiteralSize: INCOMING_SOURCE_MAX_BYTES,
+    maxLineLength: INCOMING_PROTOCOL_MAX_LINE_BYTES,
   };
   return new ImapFlow(opts);
 }
@@ -77,48 +164,141 @@ async function parseMessageToRow(
   source: Buffer,
   internalDate?: string | Date,
   bounces?: Map<number, BounceResult>,
+  announcedSize?: number,
+  envelope?: MessageEnvelopeObject,
 ): Promise<InsertRow | null> {
-  let parsed: ParsedMail;
+  const sourceSizeBytes = safeSourceSize(announcedSize, source.length);
+  const sourceTruncated =
+    sourceSizeBytes > source.length ||
+    (announcedSize == null && source.length >= INCOMING_SOURCE_MAX_BYTES);
+
+  let parsed: ParsedMail | null = null;
   try {
-    parsed = await simpleParser(source);
+    parsed = await simpleParser(source, {
+      // Avoid secondary body inflation. The bounded HTML remains available to
+      // callers; we do not synthesize another text copy or inline CID images.
+      skipHtmlToText: true,
+      skipImageLinks: true,
+    });
   } catch {
-    return null;
+    // A partial MIME tail can be syntactically incomplete. Preserve a safe
+    // envelope-only row for an oversized message instead of silently losing it.
+    if (!sourceTruncated) return null;
   }
   // Bounce detection: collect DSNs so the caller can suppress dead recipients
-  // after ingest. The message is still stored normally (users see the bounce).
-  if (bounces) {
+  // after ingest. Never act on an incomplete DSN because its terminal fields
+  // may have been cut off by the source ceiling.
+  if (bounces && parsed && !sourceTruncated) {
     const b = parseBounce(parsed);
     if (b.isBounce) bounces.set(uid, b);
   }
-  const from = toAddrs(parsed.from)[0];
-  const attachments = (parsed.attachments ?? [])
-    .filter((a) => a.filename || a.related === false)
-    .map((a) => ({
-      filename: a.filename ?? "attachment",
-      contentType: a.contentType ?? "application/octet-stream",
-      size: a.size ?? 0,
-    }));
+
+  const parsedFrom = parsed ? toAddrs(parsed.from) : null;
+  const fallbackFrom = envelopeAddrs(envelope?.from);
+  const from = parsedFrom?.value[0] ?? fallbackFrom.value[0];
+  const to = parsed ? toAddrs(parsed.to) : envelopeAddrs(envelope?.to);
+  const cc = parsed ? toAddrs(parsed.cc) : envelopeAddrs(envelope?.cc);
+
+  const subject = boundString(
+    parsed?.subject ?? envelope?.subject ?? "",
+    INCOMING_SUBJECT_MAX_CHARS,
+  );
+  const messageId = boundString(
+    parsed?.messageId ?? envelope?.messageId ?? "",
+    INCOMING_HEADER_MAX_CHARS,
+  );
+  const inReplyTo = boundString(
+    parsed?.inReplyTo ?? envelope?.inReplyTo ?? "",
+    INCOMING_HEADER_MAX_CHARS,
+  );
+  const rawReferences = Array.isArray(parsed?.references)
+    ? parsed.references.join(" ")
+    : (parsed?.references ?? "");
+  const references = boundString(rawReferences, INCOMING_HEADER_MAX_CHARS);
+
+  const rawText = parsed?.text ?? null;
+  const text = rawText
+    ? boundString(rawText, INCOMING_TEXT_MAX_CHARS)
+    : { value: null, truncated: false };
+  const rawHtml = parsed?.html === false ? null : (parsed?.html ?? null);
+  const html = rawHtml
+    ? boundString(rawHtml, INCOMING_HTML_MAX_CHARS)
+    : { value: null, truncated: false };
+
+  const attachments: NonNullable<InsertRow["attachments"]> = [];
+  let attachmentsTruncated = false;
+  for (const attachment of parsed?.attachments ?? []) {
+    if (!attachment.filename && attachment.related !== false) continue;
+    if (attachments.length >= INCOMING_ATTACHMENT_MAX_ITEMS) {
+      attachmentsTruncated = true;
+      break;
+    }
+    const filename = boundString(
+      attachment.filename ?? "attachment",
+      INCOMING_FILENAME_MAX_CHARS,
+    );
+    const contentType = boundString(
+      attachment.contentType ?? "application/octet-stream",
+      INCOMING_CONTENT_TYPE_MAX_CHARS,
+    );
+    attachmentsTruncated ||=
+      filename.truncated ||
+      contentType.truncated ||
+      (attachment.size ?? 0) > INCOMING_ATTACHMENT_MAX_BYTES;
+    attachments.push({
+      filename: filename.value,
+      contentType: contentType.value,
+      size: Math.max(
+        0,
+        Math.min(Number.MAX_SAFE_INTEGER, attachment.size ?? 0),
+      ),
+    });
+  }
+
+  const fromEmail = boundString(
+    from?.email ?? "unknown@unknown",
+    INCOMING_ADDRESS_MAX_CHARS,
+  );
+  const fromName = from?.name
+    ? boundString(from.name, INCOMING_NAME_MAX_CHARS)
+    : null;
+  const contentTruncated =
+    sourceTruncated ||
+    Boolean(parsedFrom?.truncated) ||
+    fallbackFrom.truncated ||
+    to.truncated ||
+    cc.truncated ||
+    subject.truncated ||
+    messageId.truncated ||
+    inReplyTo.truncated ||
+    references.truncated ||
+    text.truncated ||
+    html.truncated ||
+    attachmentsTruncated ||
+    fromEmail.truncated ||
+    Boolean(fromName?.truncated);
 
   return {
     organizationId: config.organizationId,
     smtpConfigId: config.id,
     imapUid: uid,
-    messageId: parsed.messageId ?? null,
-    inReplyTo: parsed.inReplyTo ?? null,
-    references: Array.isArray(parsed.references)
-      ? parsed.references.join(" ")
-      : (parsed.references ?? null),
-    fromAddress: from?.email ?? "unknown@unknown",
-    fromName: from?.name ?? null,
-    toAddresses: toAddrs(parsed.to),
-    ccAddresses: toAddrs(parsed.cc),
-    subject: parsed.subject ?? null,
-    snippet: buildSnippet(parsed),
-    text: parsed.text ?? null,
-    html: parsed.html === false ? null : (parsed.html ?? null),
+    messageId: messageId.value || null,
+    inReplyTo: inReplyTo.value || null,
+    references: references.value || null,
+    fromAddress: fromEmail.value,
+    fromName: fromName?.value ?? null,
+    toAddresses: to.value,
+    ccAddresses: cc.value,
+    subject: subject.value || null,
+    snippet: buildSnippet(text.value, subject.value || null),
+    text: text.value,
+    html: html.value,
+    sourceSizeBytes,
+    sourceTruncated,
+    contentTruncated,
     hasAttachments: attachments.length > 0,
     attachments: attachments.length > 0 ? attachments : null,
-    receivedAt: new Date(parsed.date ?? internalDate ?? Date.now()),
+    receivedAt: safeDate(parsed?.date, envelope?.date, internalDate),
   };
 }
 
@@ -129,6 +309,8 @@ interface InsertedRow {
   fromName: string | null;
   subject: string | null;
   receivedAt: Date;
+  sourceTruncated: boolean;
+  contentTruncated: boolean;
 }
 
 /** Insert rows in small chunks; returns ONLY the rows genuinely inserted (the
@@ -150,6 +332,8 @@ async function ingest(rows: InsertRow[]): Promise<InsertedRow[]> {
         fromName: incomingEmails.fromName,
         subject: incomingEmails.subject,
         receivedAt: incomingEmails.receivedAt,
+        sourceTruncated: incomingEmails.sourceTruncated,
+        contentTruncated: incomingEmails.contentTruncated,
       });
     inserted.push(...chunk);
   }
@@ -212,19 +396,27 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
 
           let maxUid = lastUid;
           let minUid = Infinity;
+          let examined = 0;
           const rows: InsertRow[] = [];
           const bounces = new Map<number, BounceResult>();
 
           for await (const msg of client.fetch(
             range,
-            { uid: true, source: true, internalDate: true },
+            {
+              uid: true,
+              size: true,
+              envelope: true,
+              source: { start: 0, maxLength: INCOMING_SOURCE_MAX_BYTES },
+              internalDate: true,
+            },
             useUid ? { uid: true } : undefined,
           )) {
             const uid = msg.uid;
             if (cursorValid && uid <= lastUid) continue;
             // Stop before advancing past the per-run cap, so the remainder is
             // re-fetched next tick rather than skipped forever.
-            if (rows.length >= MAX_PER_SYNC) break;
+            if (examined >= MAX_PER_SYNC) break;
+            examined += 1;
             // Advance across the processing window (including skipped messages)
             // so a single bad message can't wedge the cursor.
             if (uid > maxUid) maxUid = uid;
@@ -235,6 +427,8 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
               msg.source,
               msg.internalDate,
               bounces,
+              msg.size,
+              msg.envelope,
             );
             if (!row) continue;
             rows.push(row);
@@ -282,6 +476,8 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
               fromName: m.fromName,
               subject: m.subject,
               receivedAt: m.receivedAt,
+              sourceTruncated: m.sourceTruncated,
+              contentTruncated: m.contentTruncated,
             });
           }
         }
@@ -349,11 +545,20 @@ export async function backfillMailbox(
           if (hi < 1) {
             await updateImapState(config.id, { backfillComplete: true });
           } else {
-            const low = Math.max(1, firstUid - batch);
+            const safeBatch = Number.isFinite(batch)
+              ? Math.min(MAX_PER_SYNC, Math.max(1, Math.trunc(batch)))
+              : INITIAL_SYNC_LIMIT;
+            const low = Math.max(1, firstUid - safeBatch);
             const rows: InsertRow[] = [];
             for await (const msg of client.fetch(
               `${low}:${hi}`,
-              { uid: true, source: true, internalDate: true },
+              {
+                uid: true,
+                size: true,
+                envelope: true,
+                source: { start: 0, maxLength: INCOMING_SOURCE_MAX_BYTES },
+                internalDate: true,
+              },
               { uid: true },
             )) {
               const uid = msg.uid;
@@ -365,6 +570,9 @@ export async function backfillMailbox(
                 uid,
                 msg.source,
                 msg.internalDate,
+                undefined,
+                msg.size,
+                msg.envelope,
               );
               if (row) rows.push(row);
             }
@@ -399,6 +607,13 @@ export interface FetchedAttachment {
   content: Buffer;
 }
 
+export class IncomingEmailContentTooLargeError extends Error {
+  constructor() {
+    super("Incoming email exceeds the safe content limit");
+    this.name = "IncomingEmailContentTooLargeError";
+  }
+}
+
 /**
  * Re-fetch a single attachment on demand (we store only metadata, not blobs).
  * `index` is the position in the stored attachments array.
@@ -414,17 +629,42 @@ export async function fetchAttachment(
   try {
     const lock = await client.getMailboxLock("INBOX");
     try {
-      const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
+      const msg = await client.fetchOne(
+        String(uid),
+        {
+          size: true,
+          source: { start: 0, maxLength: INCOMING_SOURCE_MAX_BYTES },
+        },
+        { uid: true },
+      );
       if (!msg || !msg.source) return null;
-      const parsed = await simpleParser(msg.source);
+      if (
+        (msg.size != null && msg.size > msg.source.length) ||
+        (msg.size == null && msg.source.length >= INCOMING_SOURCE_MAX_BYTES)
+      ) {
+        throw new IncomingEmailContentTooLargeError();
+      }
+      const parsed = await simpleParser(msg.source, {
+        skipHtmlToText: true,
+        skipImageLinks: true,
+      });
       const atts = (parsed.attachments ?? []).filter(
         (a) => a.filename || a.related === false,
       );
       const att = atts[index];
       if (!att) return null;
+      if (att.content.length > INCOMING_ATTACHMENT_MAX_BYTES) {
+        throw new IncomingEmailContentTooLargeError();
+      }
       return {
-        filename: att.filename ?? "attachment",
-        contentType: att.contentType ?? "application/octet-stream",
+        filename: boundString(
+          att.filename ?? "attachment",
+          INCOMING_FILENAME_MAX_CHARS,
+        ).value,
+        contentType: boundString(
+          att.contentType ?? "application/octet-stream",
+          INCOMING_CONTENT_TYPE_MAX_CHARS,
+        ).value,
         content: att.content,
       };
     } finally {
@@ -459,6 +699,8 @@ export async function testImapConnection(
     tls: { rejectUnauthorized: TLS_REJECT_UNAUTHORIZED },
     greetingTimeout: 15000,
     connectionTimeout: 15000,
+    maxLiteralSize: INCOMING_SOURCE_MAX_BYTES,
+    maxLineLength: INCOMING_PROTOCOL_MAX_LINE_BYTES,
   });
   try {
     await client.connect();

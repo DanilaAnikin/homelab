@@ -26,6 +26,7 @@ import {
   XIcon,
   ImageIcon,
   SendIcon,
+  TriangleAlertIcon,
 } from "lucide-react";
 import { RichTextEditor } from "@/components/rich-text-editor";
 import { blockRemoteImages } from "@/lib/email-html";
@@ -243,6 +244,19 @@ export function MessageReader({
 
       {/* Body */}
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {detail.contentTruncated && (
+          <div
+            role="status"
+            className="flex items-start gap-2 border-b border-border bg-warning-tint/40 px-5 py-2 text-caption text-warning-on"
+          >
+            <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              {detail.sourceTruncated
+                ? "This message exceeded the safe receive limit. Only a bounded preview is shown, and attachment downloads are unavailable."
+                : "Long message content was shortened to keep the inbox response safe."}
+            </span>
+          </div>
+        )}
         {blockedResult.blocked && !showImages && (
           <div className="flex items-center justify-between gap-3 border-b border-border bg-warning-tint/40 px-5 py-2 text-caption">
             <span className="flex items-center gap-1.5 text-warning-on">
@@ -278,20 +292,37 @@ export function MessageReader({
               {detail.attachments.length > 1 ? "s" : ""}
             </p>
             <div className="flex flex-wrap gap-2">
-              {detail.attachments.map((a, i) => (
-                <a
-                  key={i}
-                  href={`/dashboard/incoming-emails/${detail.id}/attachments/${i}`}
-                  className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-body transition-colors hover:bg-muted/50"
-                >
-                  <PaperclipIcon className="size-4 shrink-0 text-muted-foreground" />
-                  <span className="max-w-[14rem] truncate">{a.filename}</span>
-                  <span className="text-caption tabular-nums text-muted-foreground">
-                    {formatBytes(a.size)}
+              {detail.attachments.map((a, i) => {
+                const content = (
+                  <>
+                    <PaperclipIcon className="size-4 shrink-0 text-muted-foreground" />
+                    <span className="max-w-[14rem] truncate">{a.filename}</span>
+                    <span className="text-caption tabular-nums text-muted-foreground">
+                      {formatBytes(a.size)}
+                    </span>
+                    {!detail.sourceTruncated && (
+                      <DownloadIcon className="size-3.5 text-muted-foreground" />
+                    )}
+                  </>
+                );
+                return detail.sourceTruncated ? (
+                  <span
+                    key={i}
+                    title="Download unavailable because the source was truncated"
+                    className="flex cursor-not-allowed items-center gap-2 rounded-md border border-border px-3 py-2 text-body opacity-60"
+                  >
+                    {content}
                   </span>
-                  <DownloadIcon className="size-3.5 text-muted-foreground" />
-                </a>
-              ))}
+                ) : (
+                  <a
+                    key={i}
+                    href={`/dashboard/incoming-emails/${detail.id}/attachments/${i}`}
+                    className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-body transition-colors hover:bg-muted/50"
+                  >
+                    {content}
+                  </a>
+                );
+              })}
             </div>
           </div>
         )}

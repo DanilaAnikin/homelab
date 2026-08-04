@@ -5,6 +5,10 @@ import {
   type SmtpConfig,
 } from "./smtp-configs.service";
 import { syncMailbox, backfillMailbox } from "./imap.service";
+import {
+  INCOMING_PROTOCOL_MAX_LINE_BYTES,
+  INCOMING_SOURCE_MAX_BYTES,
+} from "./incoming-email-limits";
 
 const TLS_REJECT_UNAUTHORIZED =
   process.env.INBOX_IMAP_REJECT_UNAUTHORIZED !== "false";
@@ -99,6 +103,8 @@ export function startInboxIdle(opts?: {
       tls: { rejectUnauthorized: TLS_REJECT_UNAUTHORIZED },
       greetingTimeout: 15000,
       connectionTimeout: 15000,
+      maxLiteralSize: INCOMING_SOURCE_MAX_BYTES,
+      maxLineLength: INCOMING_PROTOCOL_MAX_LINE_BYTES,
     });
     const conn: Conn = {
       client,

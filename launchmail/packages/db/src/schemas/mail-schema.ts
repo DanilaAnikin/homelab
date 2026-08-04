@@ -172,6 +172,12 @@ export const incomingEmails = pgTable(
     snippet: text("snippet"),
     text: text("text"),
     html: text("html"),
+    // RFC822.SIZE reported by IMAP, plus explicit truncation markers. Source
+    // truncation means only the bounded prefix was parsed; content truncation
+    // also covers individual fields trimmed before storage/API serialization.
+    sourceSizeBytes: bigint("source_size_bytes", { mode: "number" }),
+    sourceTruncated: boolean("source_truncated").notNull().default(false),
+    contentTruncated: boolean("content_truncated").notNull().default(false),
     hasAttachments: boolean("has_attachments").notNull().default(false),
     attachments: jsonb("attachments").$type<
       { filename: string; contentType: string; size: number }[]

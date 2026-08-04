@@ -14,6 +14,17 @@ const queueMocks = vi.hoisted(() => ({
   syncMailbox: vi.fn(),
   backfillMailbox: vi.fn(),
   fetchAttachment: vi.fn(),
+  IncomingEmailContentTooLargeError: class extends Error {},
+  INCOMING_ADDRESS_MAX_CHARS: 320,
+  INCOMING_ADDRESS_MAX_ITEMS: 100,
+  INCOMING_ATTACHMENT_MAX_ITEMS: 100,
+  INCOMING_CONTENT_TYPE_MAX_CHARS: 255,
+  INCOMING_FILENAME_MAX_CHARS: 255,
+  INCOMING_HEADER_MAX_CHARS: 8 * 1024,
+  INCOMING_HTML_MAX_CHARS: 512 * 1024,
+  INCOMING_NAME_MAX_CHARS: 512,
+  INCOMING_SUBJECT_MAX_CHARS: 2 * 1024,
+  INCOMING_TEXT_MAX_CHARS: 256 * 1024,
   getSmtpConfig: vi.fn(),
   getSmtpConfigById: vi.fn(),
   enqueueEmail: vi.fn(),
@@ -138,6 +149,105 @@ describe("SMTP-config-bound message access", () => {
     expect(await response.json()).toMatchObject({
       id: "freio-message",
       smtpConfigId: BOUND_CONFIG_ID,
+    });
+  });
+
+  it("keeps a normal detail body intact and reports no truncation", async () => {
+    queueMocks.getIncomingEmail.mockResolvedValue({
+      id: "freio-message",
+      smtpConfigId: BOUND_CONFIG_ID,
+      subject: "Reply",
+      text: "A normal reply.",
+      html: "<p>A normal reply.</p>",
+      contentTruncated: false,
+    });
+
+    const response = await inboxApp().request(
+      "/api/incoming-emails/freio-message",
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      text: "A normal reply.",
+      html: "<p>A normal reply.</p>",
+      contentTruncated: false,
+    });
+  });
+
+  it("bounds every large detail collection/body before JSON serialization", async () => {
+    queueMocks.getIncomingEmail.mockResolvedValue({
+      id: "freio-message",
+      smtpConfigId: BOUND_CONFIG_ID,
+      subject: "s".repeat(queueMocks.INCOMING_SUBJECT_MAX_CHARS + 1),
+      text: "t".repeat(queueMocks.INCOMING_TEXT_MAX_CHARS + 1),
+      html: "h".repeat(queueMocks.INCOMING_HTML_MAX_CHARS + 1),
+      toAddresses: Array.from(
+        { length: queueMocks.INCOMING_ADDRESS_MAX_ITEMS + 1 },
+        () => ({
+          email: `${"e".repeat(queueMocks.INCOMING_ADDRESS_MAX_CHARS)}@x`,
+          name: "n".repeat(queueMocks.INCOMING_NAME_MAX_CHARS + 1),
+        }),
+      ),
+      attachments: Array.from(
+        { length: queueMocks.INCOMING_ATTACHMENT_MAX_ITEMS + 1 },
+        () => ({
+          filename: "f".repeat(queueMocks.INCOMING_FILENAME_MAX_CHARS + 1),
+          contentType: "c".repeat(
+            queueMocks.INCOMING_CONTENT_TYPE_MAX_CHARS + 1,
+          ),
+          size: 12,
+        }),
+      ),
+      contentTruncated: false,
+    });
+
+    const response = await inboxApp().request(
+      "/api/incoming-emails/freio-message",
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect((body.subject as string).length).toBe(
+      queueMocks.INCOMING_SUBJECT_MAX_CHARS,
+    );
+    expect((body.text as string).length).toBe(
+      queueMocks.INCOMING_TEXT_MAX_CHARS,
+    );
+    expect((body.html as string).length).toBe(
+      queueMocks.INCOMING_HTML_MAX_CHARS,
+    );
+    expect(body.toAddresses).toHaveLength(
+      queueMocks.INCOMING_ADDRESS_MAX_ITEMS,
+    );
+    expect(body.attachments).toHaveLength(
+      queueMocks.INCOMING_ATTACHMENT_MAX_ITEMS,
+    );
+    expect(body.contentTruncated).toBe(true);
+  });
+});
+
+describe("bounded attachment endpoint", () => {
+  it("returns a bounded 413 response when source retrieval is oversized", async () => {
+    queueMocks.getIncomingEmail.mockResolvedValue({
+      id: "freio-message",
+      smtpConfigId: BOUND_CONFIG_ID,
+      imapUid: 91,
+    });
+    queueMocks.getSmtpConfigById.mockResolvedValue({
+      id: BOUND_CONFIG_ID,
+      organizationId: ORGANIZATION_ID,
+    });
+    queueMocks.fetchAttachment.mockRejectedValue(
+      new queueMocks.IncomingEmailContentTooLargeError(),
+    );
+
+    const response = await inboxApp().request(
+      "/api/incoming-emails/freio-message/attachments/0",
+    );
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({
+      error: "Message exceeds the safe attachment download limit",
     });
   });
 });

@@ -72,8 +72,24 @@ export {
   backfillMailbox,
   fetchAttachment,
   testImapConnection,
+  IncomingEmailContentTooLargeError,
 } from "./imap.service";
 export type { SyncResult, FetchedAttachment } from "./imap.service";
+export {
+  INCOMING_SOURCE_MAX_BYTES,
+  INCOMING_PROTOCOL_MAX_LINE_BYTES,
+  INCOMING_TEXT_MAX_CHARS,
+  INCOMING_HTML_MAX_CHARS,
+  INCOMING_SUBJECT_MAX_CHARS,
+  INCOMING_HEADER_MAX_CHARS,
+  INCOMING_NAME_MAX_CHARS,
+  INCOMING_ADDRESS_MAX_CHARS,
+  INCOMING_CONTENT_TYPE_MAX_CHARS,
+  INCOMING_FILENAME_MAX_CHARS,
+  INCOMING_ADDRESS_MAX_ITEMS,
+  INCOMING_ATTACHMENT_MAX_ITEMS,
+  INCOMING_ATTACHMENT_MAX_BYTES,
+} from "./incoming-email-limits";
 export {
   listMailboxes,
   listIncomingEmails,
