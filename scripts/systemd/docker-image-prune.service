@@ -3,8 +3,10 @@ Description=Tydenni docker image + build-cache prune (disk hygiena, BEZ volumes)
 
 [Service]
 Type=oneshot
-# Nepouzite images starsi nez 7 dni.
-ExecStart=/usr/bin/docker image prune -af --filter until=168h
+# Nepouzite images starsi nez 7 dni. label!=farm.keep=1 chrani on-demand
+# worker/judge images agent-farmy (nemaji trvaly kontejner mezi spawny, takze
+# by je prune jinak smazal → orchestrator nemuze spawnout workera). NEODSTRANOVAT.
+ExecStart=/usr/bin/docker image prune -af --filter until=168h --filter label!=farm.keep=1
 # Build cache starsi nez 7 dni (nechava cerstvou cache kvuli rychlosti buildu).
 # BEZ tohoto build cache neomezene roste pri castych buildech (napr. rebuildy
 # agent-farm/freio) a spusti trendovy disk alert. Volumes se zamerne nepruneuji.
