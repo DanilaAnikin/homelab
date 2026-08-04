@@ -123,6 +123,10 @@ export const emailLogs = pgTable(
     // RFC 5322 Message-Id of the message this one replies to (set when sending
     // a reply from the inbox), enabling proper threading on the recipient side.
     inReplyTo: text("in_reply_to"),
+    // Caller-owned UUID echoed in terminal webhooks. It is intentionally
+    // opaque and contains no recipient data.
+    clientReference: text("client_reference"),
+    clientType: text("client_type"),
     providerMessageId: text("provider_message_id"),
     error: text("error"),
     opens: integer("opens").notNull().default(0),

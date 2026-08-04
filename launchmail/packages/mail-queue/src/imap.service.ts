@@ -250,7 +250,10 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
           for (const m of inserted) {
             const b = bounces.get(m.imapUid);
             if (b?.permanent) {
-              void processBounce(config.organizationId, b).catch(() => undefined);
+              // Await the transactional bounce/outbox commit. Fire-and-forget
+              // here could lose a terminal event if the worker exited after
+              // storing the IMAP row but before persisting its outbox intent.
+              await processBounce(config.organizationId, b);
             }
           }
 
@@ -272,14 +275,14 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
           // Fire the automation hook once per genuinely-new message (never for
           // re-ingests or backfill).
           for (const m of inserted) {
-            void dispatchEvent(config.organizationId, "incoming.received", {
+            await dispatchEvent(config.organizationId, "incoming.received", {
               id: m.id,
               smtpConfigId: config.id,
               from: m.fromAddress,
               fromName: m.fromName,
               subject: m.subject,
               receivedAt: m.receivedAt,
-            }).catch(() => undefined);
+            });
           }
         }
       }

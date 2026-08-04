@@ -1,6 +1,9 @@
 import {
   startWorker,
+  startWebhookWorker,
+  startWebhookOutboxRelay,
   startInboxIdle,
+  closeWebhookQueue,
   closeRedis,
 } from "@workspace/mail-queue";
 
@@ -8,6 +11,8 @@ console.log("LaunchMail — Mail Queue Worker (BullMQ + Redis)");
 console.log("=================================================");
 
 const worker = startWorker();
+const webhookWorker = startWebhookWorker();
+const webhookOutboxRelay = startWebhookOutboxRelay();
 // Real-time incoming mail (IMAP IDLE) + safety poll + history backfill.
 const inboxIdle = startInboxIdle();
 
@@ -21,7 +26,10 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`[worker] ${signal} received — shutting down...`);
   try {
     await inboxIdle.stop();
+    await webhookOutboxRelay.stop();
     await worker.close();
+    await webhookWorker.close();
+    await closeWebhookQueue();
     await closeRedis();
   } catch (err) {
     console.error(

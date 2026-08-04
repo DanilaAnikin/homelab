@@ -47,6 +47,8 @@ await lm.sendEmail({
   to: [{ email: "user@example.com", name: "User" }],
   subject: "Hello",
   html: "<p>Hi</p>",
+  // clientReference? — caller UUID echoed by every terminal webhook
+  // clientType? — one of the exported LAUNCHMAIL_CLIENT_TYPES registry values
   // from?    — falls back to the token's bound SMTP config
   // replyTo? — reply address
   // sendAt?  — UTC ISO ending in "Z" (e.g. "2026-07-20T10:00:00Z"); future = scheduled
@@ -77,7 +79,7 @@ const ok = await verifyWebhookSignature(
 );
 if (!ok) return new Response("invalid signature", { status: 401 });
 const { event, data } = JSON.parse(raw);
-// events: email.sent | email.failed | email.bounced | form.submission | incoming.received | ping
+// events: email.sent | email.failed | email.bounced | email.suppressed | form.submission | incoming.received | ping
 ```
 
 ## Auth

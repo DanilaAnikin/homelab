@@ -5,16 +5,28 @@ export const recipientSchema = z.object({
   name: z.string().optional(),
 });
 
+export const LAUNCHMAIL_CLIENT_TYPES = [
+  "freio_b2b_outreach",
+  "freio_partner_outreach",
+  "freio_transactional_outbox",
+  "freio_lifecycle",
+  "freio_inbox_reply",
+] as const;
+export const clientTypeSchema = z.enum(LAUNCHMAIL_CLIENT_TYPES);
+export type LaunchMailClientType = (typeof LAUNCHMAIL_CLIENT_TYPES)[number];
+
 const optionalRecipientArray = z
-  .array(z.object({
-    email: z.string(),
-    name: z.string().optional(),
-  }))
+  .array(
+    z.object({
+      email: z.string(),
+      name: z.string().optional(),
+    }),
+  )
   .optional()
   .transform((arr) =>
     arr
       ?.filter((r) => r.email && z.string().email().safeParse(r.email).success)
-      .map((r) => ({ email: r.email, name: r.name }))
+      .map((r) => ({ email: r.email, name: r.name })),
   );
 
 export const sendEmailSchema = z.object({
@@ -46,6 +58,24 @@ export const sendEmailSchema = z.object({
   // public send API (Lokwave email bot replying in-thread).
   inReplyTo: z.string().optional(),
   references: z.string().optional(),
+  // Opaque caller correlation carried into terminal webhooks. A UUID keeps
+  // the value bounded and lets durable caller ledgers correlate an event even
+  // when the worker outruns the HTTP response that returned the queue job id.
+  clientReference: z.string().uuid().optional(),
+  /** Non-PII caller namespace used to route shared-mailbox webhooks. */
+  clientType: clientTypeSchema.optional(),
+  // Deliberately allow only the two RFC 8058 marketing headers needed by
+  // trusted callers. A generic arbitrary-header bag would let API clients
+  // override routing/identity headers such as From, To or Subject.
+  headers: z
+    .object({
+      "List-Unsubscribe": z.string().min(1).max(2048).optional(),
+      "List-Unsubscribe-Post": z
+        .literal("List-Unsubscribe=One-Click")
+        .optional(),
+    })
+    .strict()
+    .optional(),
 });
 
 export type SendEmailInput = z.infer<typeof sendEmailSchema>;

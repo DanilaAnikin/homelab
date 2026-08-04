@@ -2,6 +2,7 @@ import { auth } from "@workspace/auth";
 import { Hono } from "hono";
 import { authMiddleware } from "./auth-middleware";
 import { apiTokenMiddleware } from "./api-token-middleware";
+import { smtpConfigBoundTokenScopeMiddleware } from "./smtp-config-token-scope";
 import helloRouter from "./hello";
 import mailRouter from "./mail";
 import smtpConfigsRouter from "./smtp-configs";
@@ -52,7 +53,15 @@ const app = new Hono<AppVariables>()
     cors({
       origin: webOrigins,
       allowHeaders: ["Content-Type", "Authorization"],
-      allowMethods: ["POST", "GET", "HEAD", "PATCH", "PUT", "DELETE", "OPTIONS"],
+      allowMethods: [
+        "POST",
+        "GET",
+        "HEAD",
+        "PATCH",
+        "PUT",
+        "DELETE",
+        "OPTIONS",
+      ],
       // set-auth-token carries the Bearer session token; the browser auth
       // client must be allowed to read it cross-origin.
       exposeHeaders: ["Content-Length", "set-auth-token"],
@@ -62,6 +71,11 @@ const app = new Hono<AppVariables>()
   )
   .use("*", authMiddleware)
   .use("*", apiTokenMiddleware)
+  // A token bound to one SMTP configuration is a mailbox capability, not an
+  // organization-wide writer session. Keep its surface deliberately small so
+  // it cannot mint new keys, alter domains/webhooks, inspect other configs or
+  // otherwise escape the sender identity it was created for.
+  .use("*", smtpConfigBoundTokenScopeMiddleware)
   .route("/hello", helloRouter)
   .route("/mail", mailRouter)
   .route("/smtp-configs", smtpConfigsRouter)
@@ -101,6 +115,9 @@ const app = new Hono<AppVariables>()
       organizationId,
       role,
       authKind: c.get("apiTokenName") ? "api_key" : "session",
+      // A mailbox bot can prove that this credential is config-bound without
+      // organization-wide API-key listing permission.
+      smtpConfigId: c.get("apiTokenSmtpConfigId"),
     });
   });
 
@@ -118,7 +135,10 @@ app.get(
         { name: "Health", description: "Health check endpoints" },
         { name: "Mail", description: "Send emails via the queue" },
         { name: "SMTP Configs", description: "Manage SMTP configurations" },
-        { name: "API Tokens", description: "Manage API tokens for SMTP configs" },
+        {
+          name: "API Tokens",
+          description: "Manage API tokens for SMTP configs",
+        },
         { name: "Queue", description: "Mail queue statistics" },
         { name: "Email Logs", description: "View email delivery logs" },
       ],
@@ -175,10 +195,55 @@ app.get(
               from: { type: "string" },
               to: { type: "string" },
               subject: { type: "string" },
-              status: { type: "string", enum: ["queued", "sent", "failed"] },
+              status: {
+                type: "string",
+                enum: [
+                  "queued",
+                  "deferred",
+                  "sent",
+                  "failed",
+                  "bounced",
+                  "suppressed",
+                ],
+              },
               error: { type: ["string", "null"] },
               createdAt: { type: "string", format: "date-time" },
             },
+          },
+          WebhookEvent: {
+            type: "string",
+            enum: [
+              "email.sent",
+              "email.failed",
+              "email.bounced",
+              "email.suppressed",
+              "form.submission",
+              "incoming.received",
+            ],
+          },
+          EmailSuppressedWebhookData: {
+            type: "object",
+            properties: {
+              jobId: { type: "string" },
+              logId: { type: "string", format: "uuid" },
+              smtpConfigId: { type: "string", format: "uuid" },
+              to: { type: "array", items: { type: "string", format: "email" } },
+              reason: {
+                type: "string",
+                enum: ["all_recipients_suppressed"],
+              },
+              clientReference: { type: ["string", "null"], format: "uuid" },
+              clientType: { type: ["string", "null"] },
+            },
+            required: [
+              "jobId",
+              "logId",
+              "smtpConfigId",
+              "to",
+              "reason",
+              "clientReference",
+              "clientType",
+            ],
           },
           Recipient: {
             type: "object",
@@ -191,13 +256,56 @@ app.get(
           SendEmailRequest: {
             type: "object",
             properties: {
-              from: { type: "string", description: "Sender address (defaults to SMTP config from address)" },
-              to: { type: "array", items: { $ref: "#/components/schemas/Recipient" }, minItems: 1 },
-              cc: { type: "array", items: { $ref: "#/components/schemas/Recipient" } },
-              bcc: { type: "array", items: { $ref: "#/components/schemas/Recipient" } },
+              from: {
+                type: "string",
+                description:
+                  "Sender address (defaults to SMTP config from address)",
+              },
+              to: {
+                type: "array",
+                items: { $ref: "#/components/schemas/Recipient" },
+                minItems: 1,
+              },
+              cc: {
+                type: "array",
+                items: { $ref: "#/components/schemas/Recipient" },
+              },
+              bcc: {
+                type: "array",
+                items: { $ref: "#/components/schemas/Recipient" },
+              },
               subject: { type: "string", minLength: 1 },
               html: { type: "string" },
               text: { type: "string" },
+              clientReference: {
+                type: "string",
+                format: "uuid",
+                description:
+                  "Opaque caller correlation echoed in terminal webhooks",
+              },
+              clientType: {
+                type: "string",
+                enum: [
+                  "freio_b2b_outreach",
+                  "freio_partner_outreach",
+                  "freio_transactional_outbox",
+                  "freio_lifecycle",
+                  "freio_inbox_reply",
+                ],
+                description:
+                  "Non-PII caller namespace echoed in terminal webhooks",
+              },
+              headers: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  "List-Unsubscribe": { type: "string", maxLength: 2048 },
+                  "List-Unsubscribe-Post": {
+                    type: "string",
+                    enum: ["List-Unsubscribe=One-Click"],
+                  },
+                },
+              },
             },
             required: ["to", "subject"],
           },

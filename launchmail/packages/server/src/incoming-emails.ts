@@ -23,6 +23,32 @@ import {
 import type { AppVariables } from ".";
 import { requirePerm } from "./org-context";
 
+type InboxContext = Parameters<typeof requirePerm>[0];
+
+async function authorizedIncomingEmail(c: InboxContext, id: string) {
+  const msg = await getIncomingEmail(id, c.get("organizationId")!);
+  const boundConfigId = c.get("apiTokenSmtpConfigId");
+  if (!msg || (boundConfigId && msg.smtpConfigId !== boundConfigId)) {
+    return null;
+  }
+  return msg;
+}
+
+function authorizedConfigId(
+  c: InboxContext,
+  requestedConfigId: string | undefined,
+): string | null {
+  const boundConfigId = c.get("apiTokenSmtpConfigId");
+  if (
+    boundConfigId &&
+    requestedConfigId &&
+    requestedConfigId !== boundConfigId
+  ) {
+    return null;
+  }
+  return boundConfigId ?? requestedConfigId ?? null;
+}
+
 function audit(
   c: Parameters<typeof requirePerm>[0],
   action: string,
@@ -61,7 +87,13 @@ const incomingEmailsRouter = new Hono<AppVariables>()
   .get("/mailboxes", async (c) => {
     const denied = requirePerm(c, "inbox", "read");
     if (denied) return denied;
-    return c.json(await listMailboxes(c.get("organizationId")!));
+    const boundConfigId = c.get("apiTokenSmtpConfigId");
+    const mailboxes = await listMailboxes(c.get("organizationId")!);
+    return c.json(
+      boundConfigId
+        ? mailboxes.filter((mailbox) => mailbox.id === boundConfigId)
+        : mailboxes,
+    );
   })
 
   // Inbox list. ?smtpConfigId, ?folder (inbox|archived|starred|all), ?q search,
@@ -74,9 +106,16 @@ const incomingEmailsRouter = new Hono<AppVariables>()
     const limit = Number(c.req.query("limit") ?? 50);
     const beforeRaw = c.req.query("before");
     const before = beforeRaw ? new Date(beforeRaw) : undefined;
+    const smtpConfigId = authorizedConfigId(
+      c,
+      c.req.query("smtpConfigId") || undefined,
+    );
+    if (!smtpConfigId && c.get("apiTokenSmtpConfigId")) {
+      return c.json({ error: "Not found" }, 404);
+    }
     return c.json(
       await listIncomingEmails(c.get("organizationId")!, {
-        smtpConfigId: c.req.query("smtpConfigId") || undefined,
+        smtpConfigId: smtpConfigId ?? undefined,
         folder,
         q: c.req.query("q") || undefined,
         limit: Number.isFinite(limit) ? limit : 50,
@@ -93,11 +132,18 @@ const incomingEmailsRouter = new Hono<AppVariables>()
       const denied = requirePerm(c, "inbox", "sync");
       if (denied) return denied;
       const orgId = c.get("organizationId")!;
-      const config = await getSmtpConfig(c.req.valid("json").smtpConfigId, orgId);
+      const smtpConfigId = authorizedConfigId(
+        c,
+        c.req.valid("json").smtpConfigId,
+      );
+      if (!smtpConfigId) return c.json({ error: "Not found" }, 404);
+      const config = await getSmtpConfig(smtpConfigId, orgId);
       if (!config) return c.json({ error: "Not found" }, 404);
       if (!config.imapHost) {
         return c.json(
-          { error: "This connection has no incoming (IMAP) mailbox configured" },
+          {
+            error: "This connection has no incoming (IMAP) mailbox configured",
+          },
           400,
         );
       }
@@ -117,7 +163,12 @@ const incomingEmailsRouter = new Hono<AppVariables>()
       const denied = requirePerm(c, "inbox", "sync");
       if (denied) return denied;
       const orgId = c.get("organizationId")!;
-      const config = await getSmtpConfig(c.req.valid("json").smtpConfigId, orgId);
+      const smtpConfigId = authorizedConfigId(
+        c,
+        c.req.valid("json").smtpConfigId,
+      );
+      if (!smtpConfigId) return c.json({ error: "Not found" }, 404);
+      const config = await getSmtpConfig(smtpConfigId, orgId);
       if (!config) return c.json({ error: "Not found" }, 404);
       if (!config.imapHost) {
         return c.json({ error: "No IMAP mailbox configured" }, 400);
@@ -137,7 +188,7 @@ const incomingEmailsRouter = new Hono<AppVariables>()
   .get("/:id", async (c) => {
     const denied = requirePerm(c, "inbox", "read");
     if (denied) return denied;
-    const msg = await getIncomingEmail(c.req.param("id"), c.get("organizationId")!);
+    const msg = await authorizedIncomingEmail(c, c.req.param("id"));
     if (!msg) return c.json({ error: "Not found" }, 404);
     return c.json(msg);
   })
@@ -149,8 +200,10 @@ const incomingEmailsRouter = new Hono<AppVariables>()
     async (c) => {
       const denied = requirePerm(c, "inbox", "read");
       if (denied) return denied;
+      const msg = await authorizedIncomingEmail(c, c.req.param("id"));
+      if (!msg) return c.json({ error: "Not found" }, 404);
       const ok = await setIncomingEmailSeen(
-        c.req.param("id"),
+        msg.id,
         c.get("organizationId")!,
         c.req.valid("json").seen ?? true,
       );
@@ -165,8 +218,10 @@ const incomingEmailsRouter = new Hono<AppVariables>()
     async (c) => {
       const denied = requirePerm(c, "inbox", "read");
       if (denied) return denied;
+      const msg = await authorizedIncomingEmail(c, c.req.param("id"));
+      if (!msg) return c.json({ error: "Not found" }, 404);
       const ok = await setIncomingEmailStarred(
-        c.req.param("id"),
+        msg.id,
         c.get("organizationId")!,
         c.req.valid("json").starred,
       );
@@ -181,8 +236,10 @@ const incomingEmailsRouter = new Hono<AppVariables>()
     async (c) => {
       const denied = requirePerm(c, "inbox", "read");
       if (denied) return denied;
+      const msg = await authorizedIncomingEmail(c, c.req.param("id"));
+      if (!msg) return c.json({ error: "Not found" }, 404);
       const ok = await setIncomingEmailArchived(
-        c.req.param("id"),
+        msg.id,
         c.get("organizationId")!,
         c.req.valid("json").archived,
       );
@@ -194,10 +251,9 @@ const incomingEmailsRouter = new Hono<AppVariables>()
   .delete("/:id", async (c) => {
     const denied = requirePerm(c, "inbox", "reply");
     if (denied) return denied;
-    const ok = await deleteIncomingEmail(
-      c.req.param("id"),
-      c.get("organizationId")!,
-    );
+    const msg = await authorizedIncomingEmail(c, c.req.param("id"));
+    if (!msg) return c.json({ error: "Not found" }, 404);
+    const ok = await deleteIncomingEmail(msg.id, c.get("organizationId")!);
     if (ok) audit(c, "inbox.delete", c.req.param("id"));
     return c.json({ success: ok }, ok ? 200 : 404);
   })
@@ -207,7 +263,7 @@ const incomingEmailsRouter = new Hono<AppVariables>()
     const denied = requirePerm(c, "inbox", "reply");
     if (denied) return denied;
     const orgId = c.get("organizationId")!;
-    const msg = await getIncomingEmail(c.req.param("id"), orgId);
+    const msg = await authorizedIncomingEmail(c, c.req.param("id"));
     if (!msg) return c.json({ error: "Not found" }, 404);
     await addSuppression(orgId, msg.fromAddress, "manual");
     await setIncomingEmailArchived(msg.id, orgId, true);
@@ -228,6 +284,10 @@ const incomingEmailsRouter = new Hono<AppVariables>()
           cc: recipients.optional(),
           bcc: recipients.optional(),
           attachments,
+          clientReference: z.string().uuid().optional(),
+          // Inbox replies are privileged automation paths. Keep routing
+          // namespaces explicit instead of accepting arbitrary caller labels.
+          clientType: z.enum(["freio_inbox_reply"]).optional(),
         })
         .refine((d) => (d.text && d.text.trim()) || (d.html && d.html.trim()), {
           message: "Reply body is required",
@@ -237,23 +297,26 @@ const incomingEmailsRouter = new Hono<AppVariables>()
       const denied = requirePerm(c, "inbox", "reply");
       if (denied) return denied;
       const orgId = c.get("organizationId")!;
-      const msg = await getIncomingEmail(c.req.param("id"), orgId);
+      const msg = await authorizedIncomingEmail(c, c.req.param("id"));
       if (!msg) return c.json({ error: "Not found" }, 404);
 
       const config = await getSmtpConfig(msg.smtpConfigId, orgId);
-      if (!config) return c.json({ error: "Mailbox connection not found" }, 400);
+      if (!config)
+        return c.json({ error: "Mailbox connection not found" }, 400);
 
       const body = c.req.valid("json");
       const from = config.fromName
         ? `${config.fromName} <${config.fromAddress}>`
         : config.fromAddress;
-      const baseSubject = (msg.subject ?? "").replace(/^\s*(re:\s*)+/i, "").trim();
+      const baseSubject = (msg.subject ?? "")
+        .replace(/^\s*(re:\s*)+/i, "")
+        .trim();
       const subject = baseSubject ? `Re: ${baseSubject}` : "Re:";
       const references =
         [msg.references, msg.messageId].filter(Boolean).join(" ").trim() ||
         undefined;
 
-      await enqueueEmail({
+      const job = await enqueueEmail({
         smtpConfigId: config.id,
         organizationId: orgId,
         userId: c.get("user")?.id ?? null,
@@ -271,11 +334,20 @@ const incomingEmailsRouter = new Hono<AppVariables>()
         inReplyTo: msg.messageId ?? undefined,
         references,
         attachments: body.attachments,
+        clientReference: body.clientReference,
+        clientType: body.clientType,
       });
 
       await markIncomingEmailReplied(msg.id, orgId);
       audit(c, "inbox.reply", msg.fromAddress);
-      return c.json({ success: true });
+      return c.json({
+        success: true,
+        id: String(job.id),
+        status: "queued",
+        smtpConfigId: config.id,
+        clientReference: body.clientReference ?? null,
+        clientType: body.clientType ?? null,
+      });
     },
   )
 
@@ -297,11 +369,12 @@ const incomingEmailsRouter = new Hono<AppVariables>()
       const denied = requirePerm(c, "inbox", "reply");
       if (denied) return denied;
       const orgId = c.get("organizationId")!;
-      const msg = await getIncomingEmail(c.req.param("id"), orgId);
+      const msg = await authorizedIncomingEmail(c, c.req.param("id"));
       if (!msg) return c.json({ error: "Not found" }, 404);
 
       const config = await getSmtpConfig(msg.smtpConfigId, orgId);
-      if (!config) return c.json({ error: "Mailbox connection not found" }, 400);
+      if (!config)
+        return c.json({ error: "Mailbox connection not found" }, 400);
 
       const body = c.req.valid("json");
       const from = config.fromName
@@ -334,7 +407,7 @@ const incomingEmailsRouter = new Hono<AppVariables>()
     const denied = requirePerm(c, "inbox", "read");
     if (denied) return denied;
     const orgId = c.get("organizationId")!;
-    const msg = await getIncomingEmail(c.req.param("id"), orgId);
+    const msg = await authorizedIncomingEmail(c, c.req.param("id"));
     if (!msg) return c.json({ error: "Not found" }, 404);
     const config = await getSmtpConfigById(msg.smtpConfigId);
     if (!config || config.organizationId !== orgId) {

@@ -171,6 +171,9 @@ const mailRouter = new Hono<AppVariables>()
           attachments: data.attachments,
           inReplyTo: data.inReplyTo,
           references: data.references,
+          clientReference: data.clientReference,
+          clientType: data.clientType,
+          headers: data.headers,
         },
         { sendAt: data.sendAt },
       );

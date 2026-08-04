@@ -281,11 +281,11 @@ export const formsPublicApp = new Hono()
         await recordSubmission(form.id, data, meta).catch(() => undefined);
       }
 
-      void dispatchEvent(form.organizationId, "form.submission", {
+      await dispatchEvent(form.organizationId, "form.submission", {
         formId: form.id,
         formName: form.name,
         data,
-      }).catch(() => undefined);
+      });
 
       const config = await (form.smtpConfigId
         ? getSmtpConfigById(form.smtpConfigId)

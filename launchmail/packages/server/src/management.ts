@@ -32,6 +32,8 @@ import {
   updateWebhook,
   deleteWebhook,
   pingWebhook,
+  listFailedWebhookOutbox,
+  replayFailedWebhookOutbox,
   getAnalytics,
   mailQueue,
   createAudience,
@@ -56,6 +58,8 @@ import {
 import { canGrantRole } from "@workspace/auth/permissions";
 import { renderBlocks, renderCustomHtml } from "@workspace/templates";
 import type { Context } from "hono";
+import { WEBHOOK_EVENTS } from "@workspace/db/schemas";
+import { describeRoute } from "hono-openapi";
 
 function buildAuditEntry(c: Context<AppVariables>, action: string, target?: string) {
   const user = c.get("user");
@@ -407,19 +411,62 @@ export const domainsRouter = new Hono<AppVariables>()
     return c.json({ success: ok }, ok ? 200 : 404);
   });
 
-const webhookEvent = z.enum([
-  "email.sent",
-  "email.failed",
-  "email.bounced",
-  "form.submission",
-  "incoming.received",
-]);
+const webhookEvent = z.enum(WEBHOOK_EVENTS);
 
 export const webhooksRouter = new Hono<AppVariables>()
+  .get(
+    "/events",
+    describeRoute({
+      summary: "List supported webhook events",
+      description:
+        "Canonical subscription registry for dashboard and integration preflight checks.",
+      tags: ["Webhooks"],
+      security: [{ BearerAuth: [] }, { CookieAuth: [] }],
+      responses: {
+        "200": {
+          description: "Supported subscription events",
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  events: {
+                    type: "array",
+                    items: { $ref: "#/components/schemas/WebhookEvent" },
+                  },
+                },
+                required: ["events"],
+              },
+            },
+          },
+        },
+      },
+    }),
+    async (c) => {
+      const denied = requirePerm(c, "webhook", "read");
+      if (denied) return denied;
+      return c.json({ events: WEBHOOK_EVENTS });
+    },
+  )
   .get("/", async (c) => {
     const denied = requirePerm(c, "webhook", "read");
     if (denied) return denied;
     return c.json(await listWebhooks(c.get("organizationId")!));
+  })
+  .get("/outbox/failed", async (c) => {
+    const denied = requirePerm(c, "webhook", "read");
+    if (denied) return denied;
+    return c.json(await listFailedWebhookOutbox(c.get("organizationId")!, 100));
+  })
+  .post("/outbox/:id/replay", async (c) => {
+    const denied = requirePerm(c, "webhook", "update");
+    if (denied) return denied;
+    const replayed = await replayFailedWebhookOutbox(
+      c.req.param("id"),
+      c.get("organizationId")!,
+    );
+    if (replayed) audit(c, "webhook.outbox.replay", c.req.param("id"));
+    return c.json({ success: replayed }, replayed ? 200 : 404);
   })
   .post(
     "/",

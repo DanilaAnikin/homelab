@@ -3,10 +3,20 @@ export interface LaunchMailClientOptions {
   apiKey: string;
 }
 
+export const LAUNCHMAIL_CLIENT_TYPES = [
+  "freio_b2b_outreach",
+  "freio_partner_outreach",
+  "freio_transactional_outbox",
+  "freio_lifecycle",
+  "freio_inbox_reply",
+] as const;
+export type LaunchMailClientType = (typeof LAUNCHMAIL_CLIENT_TYPES)[number];
+
 export interface Identity {
   organizationId: string;
   role: "admin" | "writer" | "reader";
   authKind: string;
+  smtpConfigId: string | null;
 }
 
 export interface SendEmailInput {
@@ -29,6 +39,15 @@ export interface SendEmailInput {
    * offsets like "+02:00" with HTTP 400. A future timestamp => scheduled delivery.
    */
   sendAt?: string;
+  /** UUID echoed by terminal webhooks for race-free caller reconciliation. */
+  clientReference?: string;
+  /** Non-PII namespace echoed by webhooks (for example freio_b2b_outreach). */
+  clientType?: LaunchMailClientType;
+  /** RFC 8058 headers; LaunchMail intentionally rejects every other header. */
+  headers?: {
+    "List-Unsubscribe"?: string;
+    "List-Unsubscribe-Post"?: "List-Unsubscribe=One-Click";
+  };
 }
 
 export interface SendEmailResult {
@@ -122,7 +141,8 @@ export class LaunchMailClient {
     // Some endpoints (e.g. SMTP test) use a non-2xx status to convey a
     // structured result rather than a transport/auth error. Callers can opt
     // those statuses in so the parsed body is returned instead of thrown.
-    const accepted = res.ok || (options?.okStatuses?.includes(res.status) ?? false);
+    const accepted =
+      res.ok || (options?.okStatuses?.includes(res.status) ?? false);
     if (!accepted) {
       const message =
         (data && typeof data === "object" && "error" in data
@@ -183,10 +203,7 @@ export class LaunchMailClient {
     );
   }
   deleteSmtpConfig(id: string) {
-    return this.request<{ success: boolean }>(
-      "DELETE",
-      `/smtp-configs/${id}`,
-    );
+    return this.request<{ success: boolean }>("DELETE", `/smtp-configs/${id}`);
   }
 
   // API keys
@@ -232,6 +249,7 @@ export type LaunchMailWebhookEvent =
   | "email.sent"
   | "email.failed"
   | "email.bounced"
+  | "email.suppressed"
   | "form.submission"
   | "incoming.received"
   | "ping";
@@ -243,14 +261,44 @@ export interface LaunchMailWebhookPayload<T = unknown> {
 }
 
 export interface EmailSentData {
+  jobId: string;
+  logId: string;
+  smtpConfigId: string;
   to: string[];
   subject: string;
   messageId: string;
+  clientReference: string | null;
+  clientType: string | null;
 }
 export interface EmailFailedData {
+  jobId: string;
+  logId: string;
+  smtpConfigId: string;
   to: string[];
   subject: string;
   error: string;
+  clientReference: string | null;
+  clientType: string | null;
+}
+export interface EmailBouncedData {
+  jobId: string | null;
+  logId: string | null;
+  smtpConfigId: string | null;
+  to: string[];
+  status: string | null;
+  diagnostic: string | null;
+  messageId: string | null;
+  clientReference: string | null;
+  clientType: string | null;
+}
+export interface EmailSuppressedData {
+  jobId: string;
+  logId: string;
+  smtpConfigId: string;
+  to: string[];
+  reason: "all_recipients_suppressed";
+  clientReference: string | null;
+  clientType: string | null;
 }
 export interface IncomingReceivedData {
   id: string;

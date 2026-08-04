@@ -162,6 +162,7 @@ function buildMessage(
     text: input.text,
     ...(input.inReplyTo ? { inReplyTo: input.inReplyTo } : {}),
     ...(references && references.length ? { references } : {}),
+    ...(input.headers ? { headers: input.headers } : {}),
     ...(attachments ? { attachments } : {}),
     dkim,
   };

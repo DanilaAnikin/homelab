@@ -14,6 +14,7 @@
     "bullmq": "^5.51.0",
     "drizzle-orm": "^0.45.2",
     "imapflow": "^1.4.3",
+    "ipaddr.js": "^1.9.1",
     "ioredis": "^5.8.2",
     "mailparser": "^3.9.12",
     "nodemailer": "^6.10.0",

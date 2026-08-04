@@ -1,10 +1,9 @@
 import { apiGet } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { WebhooksManager } from "./webhooks-manager";
+import type { WebhookEvent as Event } from "@workspace/db/schemas";
 
 export const dynamic = "force-dynamic";
-
-type Event = "email.sent" | "email.failed" | "form.submission" | "incoming.received";
 
 interface Hook {
   id: string;
@@ -17,13 +16,15 @@ interface Hook {
 
 export default async function WebhooksPage() {
   const hooks = (await apiGet<Hook[]>("/api/webhooks")) ?? [];
+  const registry =
+    (await apiGet<{ events: Event[] }>("/api/webhooks/events"))?.events ?? [];
   return (
     <div className="mx-auto max-w-4xl space-y-8">
       <PageHeader
         title="Webhooks"
         description="Receive signed event notifications at your own endpoints."
       />
-      <WebhooksManager hooks={hooks} />
+      <WebhooksManager hooks={hooks} availableEvents={registry} />
     </div>
   );
 }

@@ -3,10 +3,16 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
+import ipaddr from "ipaddr.js";
 import { db } from "@workspace/db";
 import { webhooks } from "@workspace/db/schemas";
 import type { Webhook, WebhookEvent } from "@workspace/db/schemas";
 import { and, desc, eq } from "drizzle-orm";
+import {
+  persistWebhookEvent,
+  relayWebhookOutboxRows,
+  type PersistWebhookEventOptions,
+} from "./webhook-outbox";
 
 export type { Webhook, WebhookEvent };
 
@@ -19,55 +25,29 @@ export type { Webhook, WebhookEvent };
 // cannot redirect us onto the internal network. SNI/Host/cert validation is
 // preserved because we keep the original hostname.
 
-class SsrfError extends Error {}
+export class SsrfError extends Error {}
 
-function ipv4ToParts(ip: string): number[] | null {
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-  const nums = parts.map((p) => Number(p));
-  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
-  return nums;
-}
-
-function isPrivateIp(ip: string): boolean {
-  const family = isIP(ip);
-
-  if (family === 4) {
-    const p = ipv4ToParts(ip);
-    if (!p) return true; // unparseable → treat as unsafe
-    const [a, b] = p as [number, number, number, number];
-    if (a === 0) return true; // 0.0.0.0/8
-    if (a === 10) return true; // 10.0.0.0/8
-    if (a === 127) return true; // 127.0.0.0/8 loopback
-    if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local + metadata
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    if (a === 192 && b === 168) return true; // 192.168.0.0/16
-    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
-    if (a >= 224) return true; // 224.0.0.0/4 multicast + 240/4 reserved
-    return false;
+export function isPrivateIp(ip: string): boolean {
+  try {
+    // process() converts every IPv4-mapped spelling (including hexadecimal
+    // ::ffff:7f00:1) to IPv4 before classification. range() covers complete
+    // CIDRs such as IPv6 fe80::/10 rather than fragile string prefixes.
+    return ipaddr.process(ip).range() !== "unicast";
+  } catch {
+    // Not a recognizable IP literal → unsafe.
+    return true;
   }
-
-  if (family === 6) {
-    const lower = ip.toLowerCase();
-    // IPv4-mapped (::ffff:a.b.c.d) → validate the embedded v4 address.
-    const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) return isPrivateIp(mapped[1]!);
-    if (lower === "::1" || lower === "::") return true; // loopback / unspecified
-    if (lower.startsWith("fe80")) return true; // link-local
-    if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // unique-local fc00::/7
-    if (lower.startsWith("ff")) return true; // multicast
-    // IPv4-compatible / NAT64 well-known prefix and similar embeddings.
-    if (lower.startsWith("64:ff9b:")) return true;
-    return false;
-  }
-
-  // Not a recognizable IP literal → unsafe.
-  return true;
 }
 
 interface PinnedTarget {
   parsed: URL;
   addresses: { address: string; family: number }[];
+}
+
+function hostnameWithoutIpv6Brackets(hostname: string): string {
+  return hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
 }
 
 // Resolve + validate. Throws SsrfError when the URL scheme is not http(s) or
@@ -84,12 +64,14 @@ async function resolveSafeTarget(rawUrl: string): Promise<PinnedTarget> {
     throw new SsrfError("Webhook URL must use http(s)");
   }
 
-  const host = parsed.hostname;
+  const host = hostnameWithoutIpv6Brackets(parsed.hostname);
 
   // A bare IP literal in the URL still has to pass the public-IP check.
   if (isIP(host)) {
     if (isPrivateIp(host)) {
-      throw new SsrfError(`Webhook host resolves to a blocked address: ${host}`);
+      throw new SsrfError(
+        `Webhook host resolves to a blocked address: ${host}`,
+      );
     }
     return { parsed, addresses: [{ address: host, family: isIP(host) }] };
   }
@@ -131,7 +113,7 @@ export async function ssrfSafePost(
     const req = requestFn(
       {
         protocol: parsed.protocol,
-        hostname: parsed.hostname,
+        hostname: hostnameWithoutIpv6Brackets(parsed.hostname),
         port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
         path: `${parsed.pathname}${parsed.search}`,
         method: "POST",
@@ -213,9 +195,7 @@ export async function createWebhook(
   return row!;
 }
 
-export async function listWebhooks(
-  organizationId: string,
-): Promise<Webhook[]> {
+export async function listWebhooks(organizationId: string): Promise<Webhook[]> {
   return db
     .select()
     .from(webhooks)
@@ -230,7 +210,9 @@ export async function getWebhook(
   const [row] = await db
     .select()
     .from(webhooks)
-    .where(and(eq(webhooks.id, id), eq(webhooks.organizationId, organizationId)));
+    .where(
+      and(eq(webhooks.id, id), eq(webhooks.organizationId, organizationId)),
+    );
   return row ?? null;
 }
 
@@ -250,7 +232,9 @@ export async function updateWebhook(
   const [row] = await db
     .update(webhooks)
     .set(updates)
-    .where(and(eq(webhooks.id, id), eq(webhooks.organizationId, organizationId)))
+    .where(
+      and(eq(webhooks.id, id), eq(webhooks.organizationId, organizationId)),
+    )
     .returning();
   return row ?? null;
 }
@@ -261,7 +245,9 @@ export async function deleteWebhook(
 ): Promise<boolean> {
   const rows = await db
     .delete(webhooks)
-    .where(and(eq(webhooks.id, id), eq(webhooks.organizationId, organizationId)))
+    .where(
+      and(eq(webhooks.id, id), eq(webhooks.organizationId, organizationId)),
+    )
     .returning();
   return rows.length > 0;
 }
@@ -309,18 +295,22 @@ export async function dispatchEvent(
   organizationId: string,
   event: WebhookEvent,
   data: unknown,
+  options: PersistWebhookEventOptions = {},
 ): Promise<void> {
-  const hooks = await db
-    .select()
-    .from(webhooks)
-    .where(
-      and(
-        eq(webhooks.organizationId, organizationId),
-        eq(webhooks.enabled, true),
-      ),
+  const rows = await persistWebhookEvent(
+    db,
+    organizationId,
+    event,
+    data,
+    options,
+  );
+  await relayWebhookOutboxRows(rows).catch((error) => {
+    console.error(
+      `[webhooks] Event persisted to outbox but immediate relay failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
     );
-  const matching = hooks.filter((h) => h.events.includes(event));
-  await Promise.allSettled(matching.map((h) => deliver(h, event, data)));
+  });
 }
 
 export async function pingWebhook(

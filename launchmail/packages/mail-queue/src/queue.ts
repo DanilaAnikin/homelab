@@ -1,6 +1,7 @@
 import { Queue } from "bullmq";
 import { REDIS_URL } from "./redis";
 import { MAIL_JOB_ATTEMPTS } from "./backoff";
+import type { LaunchMailClientType } from "./types";
 
 export interface EmailJobData {
   smtpConfigId: string;
@@ -18,6 +19,14 @@ export interface EmailJobData {
   // recipient's client groups it into the original conversation.
   inReplyTo?: string;
   references?: string;
+  /** Caller-owned durable correlation id, emitted unchanged in webhooks. */
+  clientReference?: string;
+  clientType?: LaunchMailClientType;
+  /** Restricted RFC 8058 headers validated by sendEmailSchema. */
+  headers?: {
+    "List-Unsubscribe"?: string;
+    "List-Unsubscribe-Post"?: "List-Unsubscribe=One-Click";
+  };
   // Outgoing attachments, base64-encoded (e.g. files added to a reply/forward).
   attachments?: { filename: string; content: string; contentType?: string }[];
 }

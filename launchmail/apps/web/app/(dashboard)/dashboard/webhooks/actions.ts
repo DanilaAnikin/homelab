@@ -2,8 +2,7 @@
 
 import { apiSend } from "@/lib/api";
 import { revalidatePath } from "next/cache";
-
-type Event = "email.sent" | "email.failed" | "form.submission" | "incoming.received";
+import type { WebhookEvent as Event } from "@workspace/db/schemas";
 
 export async function createWebhookAction(url: string, events: Event[]) {
   const res = await apiSend("POST", "/api/webhooks", { url, events });

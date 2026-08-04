@@ -4,6 +4,36 @@ export type { EmailJobData } from "./queue";
 
 // Worker
 export { startWorker } from "./worker";
+export { startWebhookWorker, processWebhookDelivery } from "./webhook-worker";
+export type {
+  WebhookDeliveryDependencies,
+  WebhookDeliveryResult,
+} from "./webhook-worker";
+export {
+  webhookQueue,
+  enqueueWebhook,
+  closeWebhookQueue,
+  WEBHOOK_QUEUE_NAME,
+  WEBHOOK_JOB_ATTEMPTS,
+} from "./webhook-queue";
+export type { WebhookJobData } from "./webhook-queue";
+export {
+  persistWebhookEvent,
+  relayWebhookOutboxRows,
+  relayPendingWebhookOutbox,
+  startWebhookOutboxRelay,
+  completeWebhookOutbox,
+  failWebhookOutbox,
+  listFailedWebhookOutbox,
+  replayFailedWebhookOutbox,
+  buildWebhookOutboxJob,
+} from "./webhook-outbox";
+export type {
+  PersistWebhookEventOptions,
+  PersistedWebhookOutboxRow,
+  WebhookOutboxExecutor,
+  WebhookOutboxRelay,
+} from "./webhook-outbox";
 
 // Real-time inbox via IMAP IDLE + safety poll + backfill (worker process)
 export { startInboxIdle } from "./inbox-idle";
@@ -216,5 +246,10 @@ export {
 export { getRedis, closeRedis } from "./redis";
 
 // Types
-export { sendEmailSchema, recipientSchema } from "./types";
-export type { SendEmailInput, Recipient } from "./types";
+export {
+  sendEmailSchema,
+  recipientSchema,
+  clientTypeSchema,
+  LAUNCHMAIL_CLIENT_TYPES,
+} from "./types";
+export type { SendEmailInput, Recipient, LaunchMailClientType } from "./types";

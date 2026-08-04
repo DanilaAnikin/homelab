@@ -28,15 +28,7 @@ import {
   updateWebhookAction,
   pingWebhookAction,
 } from "./actions";
-
-type Event = "email.sent" | "email.failed" | "form.submission" | "incoming.received";
-
-const EVENTS: { value: Event; label: string }[] = [
-  { value: "email.sent", label: "email.sent" },
-  { value: "email.failed", label: "email.failed" },
-  { value: "incoming.received", label: "incoming.received" },
-  { value: "form.submission", label: "form.submission" },
-];
+import type { WebhookEvent as Event } from "@workspace/db/schemas";
 
 interface Hook {
   id: string;
@@ -55,7 +47,13 @@ function hookRowStatus(h: Hook): RowStatus | undefined {
   return undefined;
 }
 
-export function WebhooksManager({ hooks }: { hooks: Hook[] }) {
+export function WebhooksManager({
+  hooks,
+  availableEvents,
+}: {
+  hooks: Hook[];
+  availableEvents: Event[];
+}) {
   const router = useRouter();
   const [url, setUrl] = useState("");
   const [selected, setSelected] = useState<Event[]>(["email.sent"]);
@@ -205,19 +203,19 @@ export function WebhooksManager({ hooks }: { hooks: Hook[] }) {
             <div className="space-y-1.5">
               <Label>Events</Label>
               <div className="flex flex-wrap gap-2">
-                {EVENTS.map((e) => (
+                {availableEvents.map((event) => (
                   <button
-                    key={e.value}
+                    key={event}
                     type="button"
-                    onClick={() => toggleEvent(e.value)}
+                    onClick={() => toggleEvent(event)}
                     className={
                       "rounded-badge border px-3 py-1 font-mono text-xs transition-colors " +
-                      (selected.includes(e.value)
+                      (selected.includes(event)
                         ? "border-brand-200 bg-brand-100 text-brand-800"
                         : "text-muted-foreground hover:bg-muted")
                     }
                   >
-                    {e.label}
+                    {event}
                   </button>
                 ))}
               </div>

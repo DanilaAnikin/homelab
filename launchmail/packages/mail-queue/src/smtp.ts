@@ -63,6 +63,10 @@ export interface SendMailInput {
   text?: string;
   inReplyTo?: string;
   references?: string;
+  headers?: {
+    "List-Unsubscribe"?: string;
+    "List-Unsubscribe-Post"?: "List-Unsubscribe=One-Click";
+  };
   attachments?: { filename: string; content: string; contentType?: string }[];
   smtpConfig: SmtpConfig;
   dkim?: { domainName: string; keySelector: string; privateKey: string };
@@ -128,6 +132,7 @@ export async function sendMail(input: SendMailInput) {
     // References). `references` is a space-separated list of Message-Ids.
     ...(input.inReplyTo ? { inReplyTo: input.inReplyTo } : {}),
     ...(references && references.length ? { references } : {}),
+    ...(input.headers ? { headers: input.headers } : {}),
     ...(attachments ? { attachments } : {}),
     ...(useEnvelope
       ? { envelope: { from: login, to: envelopeTo } }
