@@ -1,0 +1,8 @@
+[Unit]
+Description=Kontrola agent-farm image kazdych 15 min
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+Persistent=true
+[Install]
+WantedBy=timers.target

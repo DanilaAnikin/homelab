@@ -1,0 +1,5 @@
+[Unit]
+Description=Zajisti, ze agent-farm worker/judge image existuji (self-heal)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agent-farm-ensure-images.sh
