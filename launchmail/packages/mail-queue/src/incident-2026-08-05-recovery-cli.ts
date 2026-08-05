@@ -24,12 +24,14 @@ function usage(): string {
   return [
     "LaunchMail Freio incident recovery — 2026-08-05",
     "",
+    "Run from /app/apps/api in the production API container.",
+    "",
     "Dry-run (default; no writes):",
-    "  pnpm exec tsx src/incident-2026-08-05-recovery-cli.ts",
-    "  pnpm exec tsx src/incident-2026-08-05-recovery-cli.ts --dry-run",
+    "  pnpm exec tsx ../../packages/mail-queue/src/incident-2026-08-05-recovery-cli.ts",
+    "  pnpm exec tsx ../../packages/mail-queue/src/incident-2026-08-05-recovery-cli.ts --dry-run",
     "",
     "Apply (terminal log + signed webhook outbox only; never SMTP):",
-    "  pnpm exec tsx src/incident-2026-08-05-recovery-cli.ts --apply --ack " +
+    "  pnpm exec tsx ../../packages/mail-queue/src/incident-2026-08-05-recovery-cli.ts --apply --ack " +
       INCIDENT_2026_08_05_APPLY_ACK,
   ].join("\n")
 }
