@@ -3,6 +3,7 @@ import { emailLogs } from "@workspace/db/schemas"
 import type { WebhookEvent } from "@workspace/db/schemas"
 import { eq, sql } from "drizzle-orm"
 import type { EmailJobData } from "./queue"
+import { assertExpectedEmailTerminalOutboxRows } from "./email-terminal-outbox-contract"
 import {
   persistWebhookEvent,
   relayWebhookOutboxRows,
@@ -26,6 +27,12 @@ export interface FinalizeEmailTerminalInput {
   providerMessageId?: string | null
   dkimSigned?: boolean
   occurredAt?: Date
+  /**
+   * Optional fail-closed contract for incident repair tooling. The assertion is
+   * evaluated inside the same transaction as the email log and outbox writes,
+   * so a hook race cannot leave a terminal log without its expected intent.
+   */
+  expectedOutboxRows?: number
 }
 
 export interface FinalizeEmailTerminalResult {
@@ -127,6 +134,12 @@ async function commitEmailTerminal(
           }
         )
       : []
+    // Deliberately inside the transaction: throwing here rolls back both the
+    // terminal email log and every outbox row created above.
+    assertExpectedEmailTerminalOutboxRows(
+      input.expectedOutboxRows,
+      outboxRows.length
+    )
     return { deduplicated: false, outboxRows }
   })
 }
