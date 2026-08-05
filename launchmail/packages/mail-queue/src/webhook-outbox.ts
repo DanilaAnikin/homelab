@@ -2,8 +2,20 @@ import { randomUUID } from "node:crypto"
 import { db } from "@workspace/db"
 import { webhookOutbox, webhooks } from "@workspace/db/schemas"
 import type { WebhookEvent } from "@workspace/db/schemas"
-import { and, asc, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm"
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  or,
+} from "drizzle-orm"
 import { enqueueWebhook, webhookQueue } from "./webhook-queue"
+
+export const WEBHOOK_OUTBOX_RELAY_STALE_MS = 5 * 60 * 1000
 
 type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
 export type WebhookOutboxExecutor = typeof db | DbTransaction
@@ -21,6 +33,23 @@ export interface PersistedWebhookOutboxRow {
   event: WebhookEvent
   data: unknown
   occurredAt: Date
+}
+
+export interface WebhookOutboxRelayState {
+  queuedAt: Date | null
+  completedAt: Date | null
+  failedAt: Date | null
+}
+
+export function shouldRelayWebhookOutboxRow(
+  row: WebhookOutboxRelayState,
+  now = new Date()
+): boolean {
+  if (row.completedAt || row.failedAt) return false
+  return (
+    row.queuedAt === null ||
+    row.queuedAt.getTime() < now.getTime() - WEBHOOK_OUTBOX_RELAY_STALE_MS
+  )
 }
 
 export function buildWebhookOutboxJob(row: PersistedWebhookOutboxRow) {
@@ -122,7 +151,14 @@ export async function relayWebhookOutboxRows(
   }
 }
 
-export async function relayPendingWebhookOutbox(limit = 100): Promise<number> {
+export async function relayPendingWebhookOutbox(
+  limit = 100,
+  now = new Date()
+): Promise<number> {
+  // queued_at is a renewable relay lease, not proof that Redis still owns the
+  // job. Re-adding the deterministic outbox id after the lease expires is safe:
+  // BullMQ keeps an existing live job singular and recreates a missing one.
+  const staleBefore = new Date(now.getTime() - WEBHOOK_OUTBOX_RELAY_STALE_MS)
   const rows = await db
     .select({
       id: webhookOutbox.id,
@@ -135,7 +171,10 @@ export async function relayPendingWebhookOutbox(limit = 100): Promise<number> {
     .from(webhookOutbox)
     .where(
       and(
-        isNull(webhookOutbox.queuedAt),
+        or(
+          isNull(webhookOutbox.queuedAt),
+          lt(webhookOutbox.queuedAt, staleBefore)
+        ),
         isNull(webhookOutbox.completedAt),
         isNull(webhookOutbox.failedAt)
       )

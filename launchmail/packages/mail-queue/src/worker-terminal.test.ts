@@ -24,6 +24,7 @@ import {
 import {
   finalizeSuppressedEmail,
   handleEmailProcessingFailure,
+  requireEmailJobId,
   type FailureHandlingDependencies,
 } from "./worker"
 
@@ -57,6 +58,16 @@ function dependencies(): FailureHandlingDependencies {
 }
 
 describe("accepted mail terminal finalization", () => {
+  it("fails closed when BullMQ did not provide a durable job id", () => {
+    expect(() => requireEmailJobId(undefined)).toThrow(
+      "Mail job is missing its durable BullMQ id; refusing SMTP delivery"
+    )
+    expect(() => requireEmailJobId(" ")).toThrow(
+      "Mail job is missing its durable BullMQ id; refusing SMTP delivery"
+    )
+    expect(requireEmailJobId("mail-job-1")).toBe("mail-job-1")
+  })
+
   it("emits email.suppressed with complete correlation and no SMTP send", async () => {
     const finalize = vi.fn().mockResolvedValue(undefined)
 

@@ -2,6 +2,10 @@ import { Queue } from "bullmq";
 import { REDIS_URL } from "./redis";
 import { MAIL_JOB_ATTEMPTS } from "./backoff";
 import type { LaunchMailClientType } from "./types";
+import {
+  buildEmailQueueJobOptions,
+  type EmailQueueOptionsInput,
+} from "./email-job-identity";
 
 export interface EmailJobData {
   smtpConfigId: string;
@@ -46,12 +50,7 @@ export const mailQueue = new Queue<EmailJobData>("mail-queue", {
 
 export async function enqueueEmail(
   data: EmailJobData,
-  opts?: { sendAt?: string | null },
+  opts?: EmailQueueOptionsInput,
 ) {
-  let delay: number | undefined;
-  if (opts?.sendAt) {
-    const ts = new Date(opts.sendAt).getTime();
-    if (!Number.isNaN(ts)) delay = Math.max(0, ts - Date.now());
-  }
-  return mailQueue.add("send-email", data, delay ? { delay } : undefined);
+  return mailQueue.add("send-email", data, buildEmailQueueJobOptions(opts));
 }

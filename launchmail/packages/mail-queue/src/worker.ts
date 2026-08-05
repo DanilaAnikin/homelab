@@ -1,4 +1,3 @@
-import { createHash, randomUUID } from "node:crypto";
 import { Worker, DelayedError, type Job } from "bullmq";
 import { REDIS_URL } from "./redis";
 import { sendMail } from "./smtp";
@@ -22,21 +21,20 @@ import {
   finalizeEmailTerminal,
   type FinalizeEmailTerminalInput,
 } from "./email-terminal";
+import { emailLogIdForJob } from "./email-job-identity";
 
-// Derive a stable email-log id (UUIDv5-shaped) from the BullMQ job id so every
-// retry of the same job reuses the same primary key. The 'sent' row is written
-// with this id; a later attempt that finds a 'sent' row with this id skips the
-// send entirely. This makes the send handler idempotent across retries.
-export function dedupeLogId(jobId: string): string {
-  const h = createHash("sha256").update(jobId).digest("hex");
-  return [
-    h.slice(0, 8),
-    h.slice(8, 12),
-    `5${h.slice(13, 16)}`,
-    ((parseInt(h.slice(16, 17), 16) & 0x3) | 0x8).toString(16) +
-      h.slice(17, 20),
-    h.slice(20, 32),
-  ].join("-");
+// Kept as a named export for focused worker tests and compatibility with the
+// original helper name. New jobs receive globally unique UUID BullMQ ids in
+// enqueueEmail; retries retain that id and therefore retain this log id.
+export { emailLogIdForJob as dedupeLogId } from "./email-job-identity";
+
+export function requireEmailJobId(jobId: string | undefined): string {
+  if (!jobId || jobId.trim().length === 0) {
+    throw new Error(
+      "Mail job is missing its durable BullMQ id; refusing SMTP delivery",
+    );
+  }
+  return jobId;
 }
 
 // Only a genuine *recipient* failure (the mailbox doesn't exist) should suppress
@@ -247,9 +245,7 @@ export function startWorker() {
 
       // Deterministic log id for this job: lets us detect a prior successful
       // send and skip a duplicate on retry.
-      const trackingId = dedupeLogId(
-        String(job.id ?? job.token ?? randomUUID()),
-      );
+      const trackingId = emailLogIdForJob(requireEmailJobId(job.id));
       let recipients = to;
 
       try {
