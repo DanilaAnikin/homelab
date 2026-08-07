@@ -23,10 +23,30 @@ const trustedOrigins = (process.env.WEB_ORIGIN ?? appUrl)
   .map((o) => o.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
+// The API is reachable only through Cloudflare Tunnel → Traefik → Next.js.
+// Trust an explicit proxy-owned header, never the client-controlled left-most
+// X-Forwarded-For value. Deployments outside Cloudflare can override this with
+// a comma-separated list of headers their private ingress overwrites.
+const ipAddressHeaders = (
+  process.env.BETTER_AUTH_IP_ADDRESS_HEADERS ?? "cf-connecting-ip"
+)
+  .split(",")
+  .map((header) => header.trim().toLowerCase())
+  .filter((header) => /^[a-z0-9-]+$/.test(header));
+
+if (ipAddressHeaders.length === 0) {
+  throw new Error("BETTER_AUTH_IP_ADDRESS_HEADERS has no valid header names");
+}
+
 export const auth = betterAuth({
   secret: process.env.BETTER_AUTH_SECRET!,
   url: process.env.BETTER_AUTH_URL!,
   trustedOrigins,
+  advanced: {
+    ipAddress: {
+      ipAddressHeaders,
+    },
+  },
   database: drizzleAdapter(db, { provider: "pg" }),
   emailAndPassword: {
     enabled: true,

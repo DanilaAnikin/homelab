@@ -1,0 +1,41 @@
+# Public GitHub App webhook edge for Dokploy auto-deploys.
+#
+# The Dokploy dashboard stays Tailscale-only. Cloudflare Tunnel exposes only the
+# exact signed webhook endpoint; every other method/path on this host receives
+# a Traefik 403 before it can reach Dokploy.
+http:
+  middlewares:
+    dokploy-github-webhook-rate-limit:
+      rateLimit:
+        average: 10
+        burst: 30
+        period: 1s
+    dokploy-github-webhook-default-deny:
+      ipAllowList:
+        sourceRange:
+          # RFC 5737 documentation range: no production request can match.
+          - 192.0.2.0/32
+
+  routers:
+    dokploy-github-webhook:
+      rule: >-
+        Host(`deploy-hook.freio.cz`) &&
+        Method(`POST`) &&
+        Path(`/api/deploy/github`)
+      priority: 20000
+      service: dokploy-github-webhook
+      entryPoints: [web]
+      middlewares: [dokploy-github-webhook-rate-limit]
+    dokploy-github-webhook-deny:
+      rule: Host(`deploy-hook.freio.cz`)
+      priority: 10000
+      service: dokploy-github-webhook
+      entryPoints: [web]
+      middlewares: [dokploy-github-webhook-default-deny]
+
+  services:
+    dokploy-github-webhook:
+      loadBalancer:
+        servers:
+          - url: http://dokploy:3000
+        passHostHeader: true

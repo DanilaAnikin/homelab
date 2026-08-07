@@ -81,6 +81,9 @@ services:
       # Number of trusted reverse proxies in front of the API (PaaS proxy = 1)
       # so the per-IP form rate-limit reads a trustworthy client address.
       TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-1}
+      # Better Auth must use a header overwritten by the private ingress, not a
+      # spoofable X-Forwarded-For token. Cloudflare Tunnel always supplies this.
+      BETTER_AUTH_IP_ADDRESS_HEADERS: ${BETTER_AUTH_IP_ADDRESS_HEADERS:-cf-connecting-ip}
     # Optional local convenience file — absent on a fresh git clone / PaaS, so it
     # must not be required (vars above come from the platform environment).
     env_file:
