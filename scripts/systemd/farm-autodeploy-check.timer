@@ -1,0 +1,7 @@
+[Unit]
+Description=Spousti farm-autodeploy-check kazdych 15 min
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=15min
+[Install]
+WantedBy=timers.target

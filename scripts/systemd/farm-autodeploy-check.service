@@ -1,0 +1,6 @@
+[Unit]
+Description=agent-farm auto-deploy on idle (zaradi deploy_request pro idle projekty)
+[Service]
+Type=oneshot
+User=anakin
+ExecStart=/usr/local/bin/farm-autodeploy-check.sh

@@ -1,0 +1,6 @@
+[Unit]
+Description=agent-farm Push-to-Production watcher (vyzvedava deploy_requests)
+[Service]
+Type=oneshot
+User=anakin
+ExecStart=/usr/local/bin/farm-deploy-watcher.sh

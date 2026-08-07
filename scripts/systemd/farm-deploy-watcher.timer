@@ -1,0 +1,8 @@
+[Unit]
+Description=Spousti farm-deploy-watcher kazdych 30s
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+[Install]
+WantedBy=timers.target
