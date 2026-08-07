@@ -38,7 +38,7 @@ sleep 3   # doběhnutí supabase init (role/extenze)
 
 # ── per-DB: stáhni → dešifruj → restore → ověř ──────────────────────────────
 for db in $DBS; do
-  f=$(rclone --config "$R2CONF" lsf "$NIGHTLY/" 2>/dev/null | grep "^db_${db}_" | sort | tail -1)
+  f=$(rclone --config "$R2CONF" lsf "$NIGHTLY/" 2>/dev/null | grep -E "^db_([A-Za-z0-9.-]+_)?${db}_[0-9]{8}T[0-9]{6}Z\.dump\.enc$" | sort | tail -1)
   if [[ -z "$f" ]]; then RESULTS+="❌ ${db}: žádná záloha na R2\n"; FAIL=1; continue; fi
 
   if ! rclone --config "$R2CONF" copyto "$NIGHTLY/$f" "$WORK/$db.enc" -q; then
