@@ -1,5 +1,5 @@
 import "server-only";
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 
 const API_URL = process.env.API_URL ?? "http://localhost:5000";
@@ -18,6 +18,11 @@ export async function apiFetch(
   init?: RequestInit,
 ): Promise<Response> {
   const token = await bearerToken();
+  // Server components call the API over the private Docker network, bypassing
+  // the public reverse proxy. Preserve the client-IP header that Cloudflare
+  // overwrote at ingress so Better Auth can apply its per-IP rate limit to
+  // these requests too. Never derive this value from X-Forwarded-For.
+  const cloudflareClientIp = (await headers()).get("cf-connecting-ip");
   return fetch(`${API_URL}${path}`, {
     ...init,
     cache: "no-store",
@@ -25,6 +30,9 @@ export async function apiFetch(
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...((init?.headers as Record<string, string>) ?? {}),
+      ...(cloudflareClientIp
+        ? { "cf-connecting-ip": cloudflareClientIp }
+        : {}),
     },
   });
 }
