@@ -98,7 +98,7 @@ for n in $PR_NUMS; do
   done
   if [[ "$mstate" == "False" ]]; then log "PR #$n není mergeable (konflikt) → přeskakuji"; SKIPPED=$((SKIPPED+1)); continue; fi
   res="$(gh_api PUT "/repos/$REPO_SLUG/pulls/$n/merge" '{"merge_method":"squash"}')"
-  if printf '%s' "$res" | grep -q '"merged":true'; then log "PR #$n zmergován ✓"; MERGED=$((MERGED+1))
+  if printf '%s' "$res" | grep -qE '"merged":[[:space:]]*true'; then log "PR #$n zmergován ✓"; MERGED=$((MERGED+1))
   else log "PR #$n merge selhal: $(printf '%s' "$res" | head -c 160)"; SKIPPED=$((SKIPPED+1)); fi
 done
 log "merge hotovo: $MERGED zmergováno, $SKIPPED přeskočeno"
@@ -126,14 +126,18 @@ fi
 # --- 2) Aktualizace prod checkoutu na origin/main (COMPOSE mode) --------------
 [[ -d "$PROD_DIR" ]] || die "prod dir $PROD_DIR neexistuje"
 REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO_SLUG}.git"
+# git odmítá operovat na adresáři vlastněném jiným uid ("dubious ownership") — povol ho.
+git config --global --add safe.directory "$PROD_DIR" 2>/dev/null || true
 
 # git-ifikace (poprvé): init + remote + fetch, BEZ mazání untracked (.env, volumes).
 if [[ ! -d "$PROD_DIR/.git" ]]; then
   log "prod není git checkout → git-ifikuji (zachovám untracked soubory)"
-  if [[ "$DRY_RUN" != "1" ]]; then
-    sudo git -C "$PROD_DIR" init -q
-    sudo git -C "$PROD_DIR" remote add origin "$REMOTE_URL" 2>/dev/null || sudo git -C "$PROD_DIR" remote set-url origin "$REMOTE_URL"
-  fi
+  [[ "$DRY_RUN" != "1" ]] && sudo git -C "$PROD_DIR" init -q
+fi
+# Origin remote zajisti VŽDY idempotentně — .git mohl vzniknout z dřívějšího (padlého)
+# běhu bez remote, pak by `git fetch origin` selhal na "origin does not exist".
+if [[ "$DRY_RUN" != "1" ]]; then
+  sudo git -C "$PROD_DIR" remote add origin "$REMOTE_URL" 2>/dev/null || sudo git -C "$PROD_DIR" remote set-url origin "$REMOTE_URL"
 fi
 
 # záloha prod dir (tar, bez node_modules/volumes) PŘED jakoukoliv změnou
@@ -162,10 +166,23 @@ fi
 
 # --- 3) Build + up ------------------------------------------------------------
 deploy_compose(){ sudo docker compose -p "$COMPOSE_PROJECT" -f "$PROD_DIR/$COMPOSE_FILE" up -d --build 2>&1 | tail -8; }
+# Rollback: obnov prod adresář ze zálohy (spolehlivější než git u čerstvé git-ifikace)
+# a nahoď PŮVODNÍ kontejnery — produkce zpět do funkčního stavu.
+rollback_tar(){
+  log "ROLLBACK: obnovuji prod ze zálohy $BACKUP_TAR"
+  sudo tar -xzf "$BACKUP_TAR" -C "$(dirname "$PROD_DIR")" 2>/dev/null || true
+  sudo docker compose -p "$COMPOSE_PROJECT" -f "$PROD_DIR/$COMPOSE_FILE" up -d 2>&1 | tail -4 || true
+}
 if [[ "$DRY_RUN" == "1" ]]; then
   log "DRY: docker compose -p $COMPOSE_PROJECT -f $COMPOSE_FILE up -d --build"
 else
-  log "compose up --build…"; deploy_compose || die "compose up selhal"
+  # PRE-FLIGHT: ověř env/interpolaci PŘED buildem+recreací (chytne chybějící env BEZ
+  # dotyku běžících kontejnerů). Chyba → rollback adresáře na funkční stav.
+  if ! sudo docker compose -p "$COMPOSE_PROJECT" -f "$PROD_DIR/$COMPOSE_FILE" config >/tmp/cfg.err 2>&1; then
+    rollback_tar
+    die "compose config selhal (nový kód chce env/secret navíc): $(tail -1 /tmp/cfg.err | head -c 160). Prod vrácen ze zálohy."
+  fi
+  log "compose up --build…"; deploy_compose || { rollback_tar; die "compose up selhal — prod vrácen ze zálohy"; }
 fi
 
 # --- 4) Health check + rollback ----------------------------------------------
@@ -187,11 +204,8 @@ if health_ok; then
   report "done" "Nasazeno ✓ up-to-date na produkci ($MERGED PR zmergováno, commit $DEPLOYED_SHA). Health OK."
   log "HOTOVO: up-to-date na produkci ($DEPLOYED_SHA)"
 else
-  log "✗ health FAIL → ROLLBACK na ${PREV_SHA:0:7}"
-  if [[ -n "$PREV_SHA" ]]; then
-    sudo git -C "$PROD_DIR" reset --hard "$PREV_SHA" -q
-    deploy_compose || true
-    if health_ok; then die "deploy selhal (health), rollback na ${PREV_SHA:0:7} obnovil provoz"; fi
-  fi
-  die "deploy selhal (health) a rollback nezabral — nutný zásah (záloha: $BACKUP_TAR)"
+  log "✗ health FAIL → ROLLBACK ze zálohy"
+  rollback_tar
+  if health_ok; then die "deploy selhal (health) — rollback ze zálohy obnovil provoz ✓"; fi
+  die "deploy selhal (health) I rollback — NUTNÝ ZÁSAH (záloha: $BACKUP_TAR)"
 fi
