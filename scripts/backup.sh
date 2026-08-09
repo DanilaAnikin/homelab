@@ -4,8 +4,8 @@
 #
 # Zálohuje ŠIFROVANĚ (openssl AES-256, klíč mimo git) na Cloudflare R2:
 #   1) pg globals (role+hesla) pro každý Postgres kontejner
-#   2) každou PROD databázi zvlášť: freio, lokwave, inngest, ripieno,
-#      launchmail, dokploy(metadata). Rehearsal/system DB se VYNECHÁVAJÍ.
+#   2) každou explicitně povolenou PROD databázi zvlášť.
+#      Rehearsal/system DB se VYNECHÁVAJÍ.
 #   3) config bundle: /etc/dokploy + /srv/homelab/{compose,self-healing,email-bot}
 #      + relevantní systemd unity (reprodukovatelnost celého serveru)
 #   4) secrets bundle: /srv/homelab/secrets (nejcitlivější, šifrované)
@@ -25,13 +25,21 @@ BACKUP_TARGETS=(
   "supabase-db|postgres|freio"
   "gorillatype-supabase-db|supabase_admin|postgres"
   "classio-supabase-db|supabase_admin|postgres"
+  "natetrader-supabase-db|supabase_admin|postgres"
+  "loot-supabase-db|supabase_admin|postgres"
+  "contentgen-postgres|contentgen|contentgen"
+  "lifeadmin-supabase-db|supabase_admin|postgres"
+  "hummy-supabase-db|supabase_admin|postgres"
+  "explainact-supabase-db|supabase_admin|postgres"
   "dokploy-postgres|dokploy|dokploy"
 )
 BACKUP_KEY="/srv/homelab/secrets/freio-backup-key.txt"   # AES-256 pass (mimo git; kopie off-box!)
 R2_REMOTE="r2:homelab-backups"
+R2_DR_REMOTE="r2dr:homelab-backups-dr"
 R2_CONF="/srv/homelab/secrets/rclone.conf"
 NIGHTLY_PREFIX="nightly/$(date +%Y-%m)"      # scoped prefix — retence maže JEN zde (ne freio-migration/ripieno)
 KEEP_R2_DAYS=30
+KEEP_R2_DR_DAYS=90
 KUMA_PUSH_FILE="/srv/homelab/secrets/kuma-backup-push-url.txt"  # obsahuje jen URL (volitelné)
 
 TS=$(date +%Y%m%dT%H%M%SZ)
@@ -55,7 +63,10 @@ log "── Homelab šifrovaná záloha $TS ──"
 for target in "${BACKUP_TARGETS[@]}"; do
   IFS='|' read -r prefix user dbs <<< "$target"
   cname=$(resolve "$prefix")
-  if [[ -z "$cname" ]]; then echo "!! kontejner '$prefix' neběží — přeskakuji"; FAIL=1; continue; fi
+  if [[ -z "$cname" ]]; then
+    echo "-- kontejner '$prefix' neběží — přeskakuji (pauznutá appka, nezálohuje se)"
+    continue
+  fi
 
   # globals (role+hesla) pro tento cluster
   if docker exec "$cname" pg_dumpall -U "$user" --globals-only > "$WORK/globals_${prefix}_$TS.sql" 2>/dev/null; then
@@ -82,12 +93,12 @@ tar --exclude='*/data' --exclude='*.log' --exclude='*/node_modules' \
     -czf "$CFG_TAR" \
     -C / etc/dokploy \
     -C / srv/homelab/compose srv/homelab/self-healing srv/homelab/email-bot \
+    -C / usr/local/bin/homelab-backup.sh \
+    -C / etc/systemd/system/backup.service etc/systemd/system/backup.timer \
+         etc/systemd/system/self-healing.service etc/systemd/system/email-bot.service \
+         etc/systemd/system/freio-email-outbox.service \
+         etc/systemd/system/freio-email-outbox.timer \
     2>/dev/null || echo "!! config tar částečně selhal (pokračuji)"
-# systemd unity homelabu
-tar -rf "${CFG_TAR%.gz}" -C /usr/local/bin homelab-backup.sh 2>/dev/null || true
-tar -rf "${CFG_TAR%.gz}" -C /etc/systemd/system \
-  backup.service backup.timer self-healing.service email-bot.service \
-  freio-email-outbox.service freio-email-outbox.timer 2>/dev/null || true
 if [[ -s "$CFG_TAR" ]]; then
   enc "$CFG_TAR" "$CFG_TAR.enc" && rm -f "$CFG_TAR"
 else
@@ -135,10 +146,31 @@ if [[ "$ENC_COUNT" -eq 0 ]]; then echo "!! žádné .enc k odvozu"; FAIL=1; fi
 if $RC copy "$WORK" "$R2_REMOTE/$NIGHTLY_PREFIX/" --include '*.enc' --transfers 4 -q; then
   log "✔ upload OK ($ENC_COUNT souborů → $R2_REMOTE/$NIGHTLY_PREFIX/)"
   # retence: maž JEN uvnitř nightly/ (ne migration/ripieno point-in-time!)
-  $RC delete "$R2_REMOTE/nightly" --min-age "${KEEP_R2_DAYS}d" -q || true
-  # 2. off-site (DR bucket, delší 90d retence — chrání proti retenci/smazání primárního)
-  $RC copy "$WORK" "r2:homelab-backups-dr/$NIGHTLY_PREFIX/" --include '*.enc' --transfers 4 -q || echo "!! DR copy selhalo (nefatální)"
-  $RC delete "r2:homelab-backups-dr" --min-age 90d -q || true
+  if ! $RC delete "$R2_REMOTE/nightly" --min-age "${KEEP_R2_DAYS}d" -q; then
+    echo "!! retence primárního R2 selhala"
+    FAIL=1
+  fi
+
+  # Sekundární DR bucket používá samostatný rclone remote. Chyba DR kopie
+  # je chyba celé zálohy: primární objekt zůstane bezpečně uložený, ale
+  # systemd/Kuma musí stav označit jako DOWN a poslat OnFailure upozornění.
+  if $RC copy "$WORK" "$R2_DR_REMOTE/$NIGHTLY_PREFIX/" --include '*.enc' --transfers 4 -q; then
+    if $RC check "$WORK" "$R2_DR_REMOTE/$NIGHTLY_PREFIX/" \
+        --include '*.enc' --one-way --size-only -q; then
+      log "✔ DR kopie ověřena ($ENC_COUNT souborů → $R2_DR_REMOTE/$NIGHTLY_PREFIX/)"
+    else
+      echo "!! DR kontrola integrity selhala"
+      FAIL=1
+    fi
+  else
+    echo "!! DR copy selhalo"
+    FAIL=1
+  fi
+
+  if ! $RC delete "$R2_DR_REMOTE" --min-age "${KEEP_R2_DR_DAYS}d" -q; then
+    echo "!! retence DR bucketu selhala"
+    FAIL=1
+  fi
 else
   echo "!! upload do R2 selhal"; FAIL=1
 fi

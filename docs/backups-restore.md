@@ -19,11 +19,13 @@ mountpoint /mnt/backup                   # "is a mountpoint" ✅
 
 ### B) Cloudflare R2 (offsite)
 
-✅ Hotovo předem (2026-07-11): bucket `homelab-backups` vytvořen, API token (Object R&W)
-vydán a ověřen proti S3 API. Hotový config je v `secrets/rclone.conf`. Na serveru stačí:
+✅ Hotovo: primární bucket `homelab-backups` a sekundární DR bucket
+`homelab-backups-dr` jsou dostupné přes oddělené rclone remotes `r2` a `r2dr`.
+Hotový config je v `secrets/rclone.conf`. Na serveru stačí:
 ```bash
 sudo install -m 600 -D /srv/homelab/secrets/rclone.conf /root/.config/rclone/rclone.conf
-sudo rclone lsd r2:        # vypíše homelab-backups → funguje
+sudo rclone lsf r2:homelab-backups --max-depth 1
+sudo rclone lsf r2dr:homelab-backups-dr --max-depth 1
 ```
 
 ### C) Hlídání záloh (Uptime Kuma)

@@ -16,8 +16,11 @@ Encrypted (OpenSSL AES-256) to Cloudflare R2 under `nightly/YYYY-MM/`:
   same-named DBs (e.g. two `postgres`) never collide.
 - **Config bundle** — `/etc/dokploy` + `compose/` + `self-healing/` + systemd units.
 - **Secrets bundle** — `/srv/homelab/secrets`, encrypted.
-- **Second off-site** — mirrored to a separate `homelab-backups-dr` bucket (90-day
-  retention) to survive accidental deletion / retention-nuke of the primary.
+- **Secondary DR copy** — mirrored through the independent `r2dr` remote to the
+  separate `homelab-backups-dr` bucket (90-day retention). The copy is followed by
+  a one-way size verification. Copy, verification, or retention failure makes the
+  whole unit fail, pushes Kuma DOWN, and triggers Telegram via `OnFailure=`; the
+  successfully uploaded primary copy is never removed.
 
 ### Frequent DB snapshots — `scripts/frequent-db-backup.sh` (`frequent-db-backup.timer`, every 10 min)
 All production DBs, encrypted → R2 `frequent/` (48 h retention). Brings **RPO down to ~10 min**
