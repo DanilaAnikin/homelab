@@ -1,0 +1,80 @@
+http:
+  middlewares:
+    freio-tailscale-only:
+      ipAllowList:
+        sourceRange:
+          - 100.64.0.0/10
+          - "fd7a:115c:a1e0::/48"
+    freio-private-force-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+  routers:
+    freio-outreach-private-http:
+      rule: Host(`outreach.freio.cz`)
+      priority: 10000
+      service: freio-outreach-private
+      entryPoints: [web]
+      middlewares:
+        - freio-tailscale-only
+        - freio-private-force-https
+    freio-outreach-private-https:
+      rule: Host(`outreach.freio.cz`)
+      priority: 10000
+      service: freio-outreach-private
+      entryPoints: [websecure]
+      middlewares: [freio-tailscale-only]
+      tls: {}
+    freio-posty-private-http:
+      rule: Host(`posty.freio.cz`)
+      priority: 10000
+      service: freio-posty-private
+      entryPoints: [web]
+      middlewares:
+        - freio-tailscale-only
+        - freio-private-force-https
+    freio-posty-private-https:
+      rule: Host(`posty.freio.cz`)
+      priority: 10000
+      service: freio-posty-private
+      entryPoints: [websecure]
+      middlewares: [freio-tailscale-only]
+      tls: {}
+    freio-postiz-admin-private-http:
+      rule: Host(`postiz-admin.freio.cz`)
+      priority: 10000
+      service: freio-postiz-admin-private
+      entryPoints: [web]
+      middlewares:
+        - freio-tailscale-only
+        - freio-private-force-https
+    freio-postiz-admin-private-https:
+      rule: Host(`postiz-admin.freio.cz`)
+      priority: 10000
+      service: freio-postiz-admin-private
+      entryPoints: [websecure]
+      middlewares: [freio-tailscale-only]
+      tls: {}
+
+  services:
+    freio-outreach-private:
+      loadBalancer:
+        servers:
+          - url: http://freio-xkgrrq:3000
+        passHostHeader: true
+    freio-posty-private:
+      loadBalancer:
+        servers:
+          - url: http://freio-obsah:8080
+        passHostHeader: true
+    freio-postiz-admin-private:
+      loadBalancer:
+        servers:
+          - url: http://postiz:5000
+        passHostHeader: true
+
+tls:
+  certificates:
+    - certFile: /etc/dokploy/traefik/dynamic/freio-private-certs/certificates/outreach.freio.cz.crt
+      keyFile: /etc/dokploy/traefik/dynamic/freio-private-certs/certificates/outreach.freio.cz.key

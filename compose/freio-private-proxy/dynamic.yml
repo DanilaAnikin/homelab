@@ -1,0 +1,47 @@
+http:
+  routers:
+    outreach:
+      rule: Host(`outreach.freio.cz`)
+      service: outreach
+      entryPoints: [websecure]
+      tls: {}
+    posty:
+      rule: Host(`posty.freio.cz`)
+      service: posty
+      entryPoints: [websecure]
+      tls: {}
+    postiz:
+      rule: Host(`postiz.freio.cz`)
+      service: postiz
+      entryPoints: [websecure]
+      tls: {}
+    postiz-admin:
+      rule: Host(`postiz-admin.freio.cz`)
+      service: postiz
+      entryPoints: [websecure]
+      tls: {}
+
+  services:
+    outreach:
+      loadBalancer:
+        servers:
+          - url: http://freio-xkgrrq:3000
+        passHostHeader: true
+    posty:
+      loadBalancer:
+        servers:
+          - url: http://freio-obsah:8080
+        passHostHeader: true
+    postiz:
+      loadBalancer:
+        servers:
+          - url: http://postiz:5000
+        passHostHeader: true
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+  certificates:
+    - certFile: /certs/outreach.freio.cz.crt
+      keyFile: /certs/outreach.freio.cz.key

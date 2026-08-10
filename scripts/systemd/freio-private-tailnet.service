@@ -1,0 +1,22 @@
+[Unit]
+Description=Tailscale-only ingress for Freio operator hosts
+Requires=docker.service tailscaled.service
+After=network-online.target docker.service tailscaled.service
+Wants=network-online.target
+OnFailure=notify-failure@freio-private-tailnet.service
+StartLimitIntervalSec=10min
+StartLimitBurst=10
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/local/sbin/freio-private-tailnet up
+ExecStop=/usr/local/sbin/freio-private-tailnet down
+TimeoutStartSec=5min
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=15s
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=multi-user.target

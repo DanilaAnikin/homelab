@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly renewal check for Tailscale-only Freio hosts
+
+[Timer]
+OnCalendar=Sun *-*-* 04:15:00 Europe/Prague
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
