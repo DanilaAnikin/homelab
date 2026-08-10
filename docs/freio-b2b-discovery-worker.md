@@ -23,6 +23,12 @@ nasazeno nebo aktivováno.
 
 Obě identity sdílejí pouze `ready` adresář přes skupinu
 `freio-b2b-discovery`. Privátní discovery a submit spooly mají režim `0700`.
+Hotový ready manifest je před atomickým rename nastaven přesně na `0640`:
+discovery identita jej vlastní a submit identita jej může pouze číst. Submit
+service dostává celý spool jako jedinou writable mount hranici, protože přesun
+`ready -> processing -> processed|quarantine/claimed` musí zůstat atomický;
+Unix ownership a režimy nadále blokují submit identitě discovery-only privátní
+podadresáře.
 Inbound classifier `scripts/freio_b2b_agent`, influencer prospecting i Telegram
 dispatcher mají jiné Unix identity, spooly a credentials.
 

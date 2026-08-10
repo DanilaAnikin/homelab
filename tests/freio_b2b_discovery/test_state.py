@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -63,6 +65,17 @@ class StateTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(queued.stat().st_mode), 0o640)
         self.assertEqual(queued.stat().st_gid, self.spool.ready.stat().st_gid)
         self.spool._load_manifest(queued)
+
+    def test_cross_mount_claim_fails_closed_without_copying_manifest(self) -> None:
+        queued = self.spool.enqueue(candidate())
+        with mock.patch(
+            "freio_b2b_discovery.state.os.rename",
+            side_effect=OSError(errno.EXDEV, "cross-device link"),
+        ):
+            with self.assertRaisesRegex(ValidationError, "atomic rename"):
+                self.spool.claim_next()
+        self.assertTrue(queued.exists())
+        self.assertFalse(tuple(self.spool.processing.iterdir()))
 
     def test_identity_index_blocks_a_new_receipt_without_storing_pii(self) -> None:
         first = self.spool.claim_next()

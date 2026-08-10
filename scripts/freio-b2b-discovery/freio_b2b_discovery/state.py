@@ -300,6 +300,10 @@ class Spool:
                 os.rename(source, destination)
             except FileNotFoundError:
                 continue
+            except OSError as exc:
+                raise ValidationError(
+                    "ready and processing spool must support atomic rename"
+                ) from exc
             self._fsync(self.ready, self.processing)
             return Claimed(destination, document, candidate, None)
         return None

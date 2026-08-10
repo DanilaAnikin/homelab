@@ -51,6 +51,10 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 ReadOnlyPaths=/srv/homelab/scripts/freio-b2b-discovery /srv/homelab/scripts/freio-prospecting
-ReadWritePaths=/var/lib/freio-b2b-discovery/ready /var/lib/freio-b2b-discovery/processing /var/lib/freio-b2b-discovery/processed /var/lib/freio-b2b-discovery/state /var/lib/freio-b2b-discovery/quarantine/claimed /run/freio-b2b-intake
+# A single writable bind mount is required for crash-safe atomic renames between
+# ready, processing, processed and quarantine/claimed. Per-directory bind mounts
+# make rename(2) fail with EXDEV even when the directories share a filesystem.
+# Ownership/modes still deny this user access to discovery-only private paths.
+ReadWritePaths=/var/lib/freio-b2b-discovery /run/freio-b2b-intake
 TasksMax=32
 MemoryMax=256M
