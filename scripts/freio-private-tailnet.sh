@@ -62,20 +62,20 @@ check_postiz_access_edge() {
   probe=$(curl --silent --show-error \
     --resolve "postiz.freio.cz:443:${public_ip}" \
     --connect-timeout 5 --max-time 15 \
-    --output /dev/null --write-out $'%{http_code}\n%{redirect_url}' \
+    --output /dev/null --write-out '%{http_code}|%{redirect_url}' \
     https://postiz.freio.cz/)
-  status=${probe%%$'\n'*}
-  redirect_url=${probe#*$'\n'}
+  status=${probe%%|*}
+  redirect_url=${probe#*|}
   [[ "$status" == 302 && "$redirect_url" == "$POSTIZ_ACCESS_LOGIN_PREFIX"* ]] \
     || return 1
 
   probe=$(curl --silent --show-error \
     --resolve "postiz.freio.cz:443:${public_ip}" \
     --connect-timeout 5 --max-time 15 \
-    --output /dev/null --write-out $'%{http_code}\n%{redirect_url}' \
+    --output /dev/null --write-out '%{http_code}|%{redirect_url}' \
     https://postiz.freio.cz/uploads/1970/01/01/0000000000000000000000000000000000000000000000000000000000000000.png)
-  status=${probe%%$'\n'*}
-  redirect_url=${probe#*$'\n'}
+  status=${probe%%|*}
+  redirect_url=${probe#*|}
   [[ "$status" == 404 && -z "$redirect_url" ]]
 }
 
@@ -170,7 +170,7 @@ check_runtime() {
     done
   done
   check_postiz_access_edge || {
-    printf 'Public Postiz root is not gated by the expected Cloudflare Access login.\n' >&2
+    printf 'Public Postiz Access login or /uploads bypass contract failed.\n' >&2
     return 1
   }
 }
