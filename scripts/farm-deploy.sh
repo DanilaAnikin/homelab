@@ -21,6 +21,16 @@ FARM_ENV="/srv/homelab/compose/agent-farm/app/.env"
 LOG_TAG="[farm-deploy:$PROJECT]"
 BACKUP_ROOT="/srv/homelab/backups/deploy"
 
+# Privátní dočasný soubor pro výstup `compose config`. NIKDY pevná cesta typu
+# /tmp/cfg.err: watcher běží jako `anakin`, ruční spuštění jako root → root
+# vlastněný zbytek v /tmp způsobí, že přesměrování `>` selže na "Permission
+# denied". Pre-flight to vyhodnotí jako chybu compose a `tail` navíc přečte
+# CIZÍ starý obsah → zavádějící hláška + zbytečný rollback. (Rozbité 9.–10. 8.)
+CFG_ERR="$(mktemp -t farm-deploy-cfg.XXXXXX)"
+trap 'rm -f "$CFG_ERR"' EXIT
+# poslední neprázdný řádek výstupu (compose při chybě YAML netiskne)
+cfg_err_tail(){ grep -vE '^[[:space:]]*$' "$CFG_ERR" 2>/dev/null | tail -1 | head -c 200; }
+
 log(){ echo "$LOG_TAG $*"; }
 die(){ echo "$LOG_TAG ✗ $*" >&2; report "failed" "$*"; exit 1; }
 
@@ -165,22 +175,25 @@ fi
 [[ "$DRY_RUN" == "1" ]] || [[ -f "$PROD_DIR/$COMPOSE_FILE" ]] || die "compose soubor $COMPOSE_FILE po resetu chybí — NEnasazuji (rollback: tar $BACKUP_TAR)"
 
 # --- 3) Build + up ------------------------------------------------------------
-deploy_compose(){ sudo docker compose -p "$COMPOSE_PROJECT" -f "$PROD_DIR/$COMPOSE_FILE" up -d --build 2>&1 | tail -8; }
+# KRITICKÉ: .env je v app rootu, ne v adresáři compose souboru (docker/). Bez
+# explicitního --env-file by compose .env nenašel → "required variable missing".
+ENVOPT=""; [[ -f "$PROD_DIR/.env" ]] && ENVOPT="--env-file $PROD_DIR/.env"
+deploy_compose(){ sudo docker compose -p "$COMPOSE_PROJECT" $ENVOPT -f "$PROD_DIR/$COMPOSE_FILE" up -d --build 2>&1 | tail -8; }
 # Rollback: obnov prod adresář ze zálohy (spolehlivější než git u čerstvé git-ifikace)
 # a nahoď PŮVODNÍ kontejnery — produkce zpět do funkčního stavu.
 rollback_tar(){
   log "ROLLBACK: obnovuji prod ze zálohy $BACKUP_TAR"
   sudo tar -xzf "$BACKUP_TAR" -C "$(dirname "$PROD_DIR")" 2>/dev/null || true
-  sudo docker compose -p "$COMPOSE_PROJECT" -f "$PROD_DIR/$COMPOSE_FILE" up -d 2>&1 | tail -4 || true
+  sudo docker compose -p "$COMPOSE_PROJECT" $ENVOPT -f "$PROD_DIR/$COMPOSE_FILE" up -d 2>&1 | tail -4 || true
 }
 if [[ "$DRY_RUN" == "1" ]]; then
   log "DRY: docker compose -p $COMPOSE_PROJECT -f $COMPOSE_FILE up -d --build"
 else
   # PRE-FLIGHT: ověř env/interpolaci PŘED buildem+recreací (chytne chybějící env BEZ
   # dotyku běžících kontejnerů). Chyba → rollback adresáře na funkční stav.
-  if ! sudo docker compose -p "$COMPOSE_PROJECT" -f "$PROD_DIR/$COMPOSE_FILE" config >/tmp/cfg.err 2>&1; then
+  if ! sudo docker compose -p "$COMPOSE_PROJECT" $ENVOPT -f "$PROD_DIR/$COMPOSE_FILE" config >"$CFG_ERR" 2>&1; then
     rollback_tar
-    die "compose config selhal (nový kód chce env/secret navíc): $(tail -1 /tmp/cfg.err | head -c 160). Prod vrácen ze zálohy."
+    die "compose config selhal (nový kód chce env/secret navíc): $(cfg_err_tail). Prod vrácen ze zálohy."
   fi
   log "compose up --build…"; deploy_compose || { rollback_tar; die "compose up selhal — prod vrácen ze zálohy"; }
 fi
