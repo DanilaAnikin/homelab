@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.freio_b2b_agent.contract import ValidationError, parse_classification
 from scripts.freio_b2b_agent.credentials import load_private_credential
@@ -99,6 +101,25 @@ class HttpAndCredentialTests(unittest.TestCase):
             path.chmod(0o644)
             with self.assertRaises(ValidationError):
                 load_private_credential(path, label="test")
+
+    def test_accepts_systemd_0440_only_from_exact_credentials_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            credentials = Path(temporary) / "credentials"
+            credentials.mkdir(mode=0o700)
+            path = credentials / "secret"
+            path.write_text("x" * 64)
+            path.chmod(0o440)
+
+            with self.assertRaises(ValidationError):
+                load_private_credential(path, label="test")
+            with patch.dict(
+                os.environ,
+                {"CREDENTIALS_DIRECTORY": str(credentials)},
+            ):
+                self.assertEqual(
+                    load_private_credential(path, label="test"),
+                    "x" * 64,
+                )
 
 
 if __name__ == "__main__":

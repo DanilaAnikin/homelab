@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -18,10 +19,18 @@ def load_private_credential(
         metadata = path.lstat()
     except OSError as exc:
         raise ValidationError(f"cannot inspect {label} credential") from exc
+    permissions = stat.S_IMODE(metadata.st_mode)
+    credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    systemd_delivered = (
+        permissions == 0o440
+        and credential_directory is not None
+        and Path(credential_directory).is_absolute()
+        and path.parent == Path(credential_directory)
+    )
     if (
         path.is_symlink()
         or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_mode & 0o077
+        or (permissions not in (0o400, 0o600) and not systemd_delivered)
         or not minimum <= metadata.st_size <= maximum + 1
     ):
         raise ValidationError(f"{label} credential is not a private regular file")

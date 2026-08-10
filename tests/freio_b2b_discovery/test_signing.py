@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from helpers import ENDPOINT, TRANSPORT_SECRET
 
@@ -63,6 +64,25 @@ class SigningTests(unittest.TestCase):
             os.chmod(path, 0o640)
             with self.assertRaises(ValidationError):
                 load_private_secret(path, "test")
+
+    def test_accepts_systemd_0440_only_from_exact_credentials_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            credentials = Path(directory) / "credentials"
+            credentials.mkdir(mode=0o700)
+            path = credentials / "secret"
+            path.write_bytes(TRANSPORT_SECRET + b"\n")
+            os.chmod(path, 0o440)
+
+            with self.assertRaises(ValidationError):
+                load_private_secret(path, "test")
+            with patch.dict(
+                os.environ,
+                {"CREDENTIALS_DIRECTORY": str(credentials)},
+            ):
+                self.assertEqual(
+                    load_private_secret(path, "test"),
+                    TRANSPORT_SECRET,
+                )
 
 
 if __name__ == "__main__":
