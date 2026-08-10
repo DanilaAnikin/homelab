@@ -194,7 +194,7 @@ def system_resolver(hostname: str, port: int) -> tuple[str, ...]:
             raise FetchError(
                 "dns_invalid", "resolver returned an invalid address"
             ) from exc
-        if not parsed.is_global:
+        if not _is_public_unicast(parsed):
             raise FetchError(
                 "non_public_ip", "source hostname resolves to a non-public address"
             )
@@ -217,7 +217,7 @@ def validate_resolved_addresses(addresses: Sequence[str]) -> tuple[str, ...]:
             raise FetchError(
                 "dns_invalid", "resolver returned an invalid address"
             ) from exc
-        if not parsed.is_global:
+        if not _is_public_unicast(parsed):
             raise FetchError(
                 "non_public_ip", "source hostname resolves to a non-public address"
             )
@@ -225,6 +225,20 @@ def validate_resolved_addresses(addresses: Sequence[str]) -> tuple[str, ...]:
     return tuple(
         str(item)
         for item in sorted(normalized, key=lambda item: (item.version, int(item)))
+    )
+
+
+def _is_public_unicast(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    return (
+        address.is_global
+        and not address.is_multicast
+        and not address.is_unspecified
+        and not address.is_loopback
+        and not address.is_link_local
+        and not address.is_private
+        and not address.is_reserved
     )
 
 

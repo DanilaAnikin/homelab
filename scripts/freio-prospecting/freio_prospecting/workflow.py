@@ -16,6 +16,9 @@ from .common import (
     ValidationError,
     atomic_write_bytes,
     canonical_json_bytes,
+    parse_utc_timestamp,
+    require_exact_keys,
+    require_object,
     sha256_hex,
     utc_now_iso,
 )
@@ -104,6 +107,15 @@ class Spool:
         if stat.st_mode & 0o002:
             raise ValidationError(f"spool directory must not be world-writable: {path}")
 
+    @staticmethod
+    def _fsync_directories(*directories: Path) -> None:
+        for directory in directories:
+            descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
     @contextmanager
     def submit_lock(self) -> Iterator[None]:
         self.ensure()
@@ -173,6 +185,7 @@ class Spool:
                 continue
             try:
                 os.rename(source, destination)
+                self._fsync_directories(self.ready, self.processing)
             except FileNotFoundError:
                 continue
             try:
@@ -204,6 +217,11 @@ class Spool:
                 claimed = ClaimedManifest(path, document, candidates)
                 request_path = self.request_path(claimed)
                 if not request_path.exists():
+                    atomic_write_bytes(
+                        path,
+                        canonical_json_bytes(document) + b"\n",
+                        mode=0o600,
+                    )
                     return ProcessingWork(claimed, None)
                 signed_request = self._load_signed_request(request_path)
                 if signed_request["receipt"]["researchManifestSha256"] != path.stem:
@@ -327,6 +345,7 @@ class Spool:
             os.rename(request_source, request_destination)
         if success_source.exists() and not result_destination.exists():
             os.rename(success_source, result_destination)
+        self._fsync_directories(self.processing, self.processed)
         if (
             not destination.exists()
             or not request_destination.exists()
@@ -345,6 +364,17 @@ class Spool:
                 continue
             processing_manifest = self.processing / f"{stem}.json"
             processed_manifest = self.processed / f"{stem}.json"
+            try:
+                self._validate_success_marker(success, stem)
+            except ValidationError as exc:
+                if processing_manifest.exists():
+                    self.quarantine_claimed(
+                        processing_manifest,
+                        "invalid_success_marker",
+                        str(exc),
+                    )
+                    continue
+                raise
             if processing_manifest.exists():
                 try:
                     document, candidates = self._load_and_verify(processing_manifest)
@@ -362,6 +392,58 @@ class Spool:
                 # object solely to finish request/result sidecar renames.
                 placeholder = ClaimedManifest(processing_manifest, {}, ())
                 self._complete_processed(placeholder)
+
+    def _validate_success_marker(self, path: Path, research_hash: str) -> None:
+        if path.is_symlink() or not path.is_file():
+            raise ValidationError("success marker is not a regular file")
+        raw = path.read_bytes()
+        if len(raw) > 256 * 1024:
+            raise ValidationError("success marker is too large")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValidationError("success marker is not UTF-8 JSON") from exc
+        marker = require_object(value, "success marker")
+        require_exact_keys(
+            marker,
+            required={
+                "processedAt",
+                "researchSha256",
+                "receiptId",
+                "signedBodySha256",
+                "resultSha256",
+                "result",
+            },
+            field="success marker",
+        )
+        parse_utc_timestamp(marker["processedAt"], "success marker.processedAt")
+        if marker["researchSha256"] != research_hash:
+            raise ValidationError("success marker is bound to another manifest")
+        if (
+            not isinstance(marker["signedBodySha256"], str)
+            or SHA256_HEX.fullmatch(marker["signedBodySha256"]) is None
+            or not isinstance(marker["resultSha256"], str)
+            or SHA256_HEX.fullmatch(marker["resultSha256"]) is None
+            or marker["resultSha256"]
+            != sha256_hex(canonical_json_bytes(marker["result"]))
+        ):
+            raise ValidationError("success marker hashes are invalid")
+        request_candidates = (
+            self.processing / f"{research_hash}.request.json",
+            self.processed / f"{research_hash}.request.json",
+        )
+        request_path = next(
+            (candidate for candidate in request_candidates if candidate.exists()), None
+        )
+        if request_path is None:
+            raise ValidationError("success marker has no persisted request")
+        persisted_request = self._load_signed_request(request_path)
+        request_bytes = canonical_json_bytes(persisted_request)
+        if (
+            sha256_hex(request_bytes) != marker["signedBodySha256"]
+            or marker["receiptId"] != persisted_request["receipt"]["receiptId"]
+        ):
+            raise ValidationError("success marker does not match persisted request")
 
     def quarantine_claimed(self, path: Path, code: str, detail: str) -> Path:
         request_source = path.with_name(f"{path.stem}.request.json")
@@ -391,6 +473,7 @@ class Spool:
             )
             if not success_destination.exists():
                 os.rename(success_source, success_destination)
+        self._fsync_directories(self.processing, self.claimed_quarantine)
         self._write_sidecar(
             destination,
             "error",

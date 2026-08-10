@@ -48,6 +48,8 @@ class URLValidationTests(unittest.TestCase):
             ["::1"],
             ["fc00::1"],
             ["2001:db8::1"],
+            ["224.0.0.1"],
+            ["ff02::1"],
             ["93.184.216.34", "10.0.0.1"],
         ):
             with self.subTest(addresses=addresses), self.assertRaises(
