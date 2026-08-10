@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freio.cz/schemas/prospecting/signed-intake-request-v1.json",
+  "title": "Freio HMAC-signed prospect intake request V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "receipt", "items"],
+  "properties": {
+    "schemaVersion": {"const": "1"},
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "researchManifestSha256", "intakePayloadSha256", "evidenceSha256", "signedItemsSha256", "receiptId"],
+      "properties": {
+        "algorithm": {"const": "sha256"},
+        "researchManifestSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "intakePayloadSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "evidenceSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "signedItemsSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "receiptId": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["idempotencyKey", "prospect", "fetchReceipt"],
+        "properties": {
+          "idempotencyKey": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,119}$"},
+          "prospect": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["partnerType", "name", "researchContext"],
+            "properties": {
+              "partnerType": {"enum": ["influencer", "ambassador"]},
+              "name": {"type": "string", "minLength": 2, "maxLength": 120},
+              "platform": {"type": "string", "minLength": 2, "maxLength": 40},
+              "handle": {"type": "string", "pattern": "^@?[A-Za-z0-9._]{2,99}$"},
+              "socialChannel": {"enum": ["instagram", "tiktok"]},
+              "researchContext": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["disposition", "sourceKey", "priority", "category", "riskFlags"],
+                "properties": {
+                  "disposition": {"const": "ready_for_manual_review"},
+                  "sourceKey": {"type": "string", "minLength": 3, "maxLength": 120},
+                  "priority": {"enum": ["A", "B", "C"]},
+                  "category": {"type": "string", "minLength": 2, "maxLength": 80},
+                  "personalizationNote": {"type": "string", "minLength": 2, "maxLength": 500},
+                  "riskFlags": {
+                    "type": "array",
+                    "maxItems": 7,
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": ["identity_unconfirmed", "audience_fit_unconfirmed", "reach_unconfirmed", "contact_unconfirmed", "paid_deal_likely", "competitor_overlap", "minor_or_representative_unknown"]
+                    }
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {"if": {"required": ["handle"]}, "then": {"required": ["socialChannel"]}},
+              {"if": {"required": ["socialChannel"]}, "then": {"required": ["handle"]}}
+            ]
+          },
+          "emailCandidate": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["email", "sourceUrl", "observedAt"],
+            "properties": {
+              "email": {"type": "string", "format": "email", "maxLength": 320},
+              "sourceUrl": {"type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2000},
+              "observedAt": {"type": "string", "format": "date-time", "maxLength": 64}
+            }
+          },
+          "fetchReceipt": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["requestedUrl", "finalUrl", "fetchedAt", "observedAt", "status", "redirectCount", "mediaType", "charset", "byteLength", "bodySha256", "matchedEmailSha256", "matchMethod", "fetcherVersion", "networkPolicyVersion", "evidenceSha256"],
+            "properties": {
+              "requestedUrl": {"type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2000},
+              "finalUrl": {"type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2000},
+              "fetchedAt": {"type": "string", "format": "date-time", "maxLength": 64},
+              "observedAt": {"type": "string", "format": "date-time", "maxLength": 64},
+              "status": {"const": 200},
+              "redirectCount": {"type": "integer", "minimum": 0, "maximum": 3},
+              "mediaType": {"enum": ["text/html", "text/plain"]},
+              "charset": {"type": "string", "minLength": 1, "maxLength": 64},
+              "byteLength": {"type": "integer", "minimum": 0, "maximum": 1048576},
+              "bodySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "matchedEmailSha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+              "matchMethod": {"enum": ["visible_text_exact", "mailto_exact", null]},
+              "fetcherVersion": {"const": "1.1.0"},
+              "networkPolicyVersion": {"const": "public-https-pinned-v1"},
+              "evidenceSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

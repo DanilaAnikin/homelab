@@ -1,0 +1,47 @@
+[Unit]
+Description=Freio prospect research and deterministic public-evidence validation
+Documentation=file:/srv/homelab/docs/freio-prospecting-worker.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/freio-prospecting/enabled/discovery
+ConditionPathIsDirectory=/var/lib/freio-prospecting/ready
+ConditionPathIsDirectory=/var/lib/freio-prospecting/quarantine/untrusted
+
+[Service]
+Type=oneshot
+User=freio-discovery
+Group=freio-prospecting
+WorkingDirectory=/var/lib/freio-prospecting/claude-home
+LoadCredential=claude-token:/etc/freio-prospecting/claude-token
+ExecStart=/usr/bin/python3 /srv/homelab/scripts/freio-prospecting/discover.py --spool /var/lib/freio-prospecting --claude --claude-bin /usr/local/bin/claude --claude-token-file /run/credentials/freio-prospect-discovery.service/claude-token --claude-home /var/lib/freio-prospecting/claude-home
+TimeoutStartSec=10min
+UMask=0007
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/srv/homelab/scripts/freio-prospecting
+ReadWritePaths=/var/lib/freio-prospecting
+TasksMax=128
+MemoryMax=1G

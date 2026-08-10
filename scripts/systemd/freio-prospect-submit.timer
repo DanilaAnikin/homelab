@@ -1,0 +1,13 @@
+[Unit]
+Description=Disabled-by-default Freio prospect intake submission schedule
+Documentation=file:/srv/homelab/docs/freio-prospecting-worker.md
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=freio-prospect-submit.service
+
+[Install]
+WantedBy=timers.target

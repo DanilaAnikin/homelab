@@ -1,0 +1,52 @@
+# Active since 2026-08-07 after the Tailscale split-DNS and owner-device E2E
+# gates passed. This is the source for the atomically deployed
+# /etc/dokploy/traefik/dynamic/postiz.yml public-edge policy.
+http:
+  middlewares:
+    postiz-public-default-deny:
+      ipAllowList:
+        sourceRange:
+          - 100.64.0.0/10
+          - "fd7a:115c:a1e0::/48"
+
+  routers:
+    postiz-public-media:
+      rule: >-
+        Host(`postiz.freio.cz`) &&
+        (Method(`GET`) || Method(`HEAD`)) &&
+        PathRegexp(`(?i)^/uploads/[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9a-f]{32,64}\.(png|mp4)$`)
+      priority: 20000
+      service: postiz-public
+      entryPoints: [web]
+    postiz-public-deny:
+      rule: Host(`postiz.freio.cz`)
+      priority: 10000
+      service: postiz-public
+      entryPoints: [web]
+      middlewares: [postiz-public-default-deny]
+
+    postiz-secure-media:
+      rule: >-
+        Host(`postiz.freio.cz`) &&
+        (Method(`GET`) || Method(`HEAD`)) &&
+        PathRegexp(`(?i)^/uploads/[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9a-f]{32,64}\.(png|mp4)$`)
+      priority: 20000
+      service: postiz-public
+      entryPoints: [websecure]
+      tls:
+        certResolver: letsencrypt
+    postiz-secure-deny:
+      rule: Host(`postiz.freio.cz`)
+      priority: 10000
+      service: postiz-public
+      entryPoints: [websecure]
+      middlewares: [postiz-public-default-deny]
+      tls:
+        certResolver: letsencrypt
+
+  services:
+    postiz-public:
+      loadBalancer:
+        servers:
+          - url: http://postiz:5000
+        passHostHeader: true

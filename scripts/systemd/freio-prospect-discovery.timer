@@ -1,0 +1,12 @@
+[Unit]
+Description=Disabled-by-default daily Freio prospect discovery schedule
+Documentation=file:/srv/homelab/docs/freio-prospecting-worker.md
+
+[Timer]
+OnCalendar=*-*-* 09:17:00 Europe/Prague
+RandomizedDelaySec=20min
+Persistent=true
+Unit=freio-prospect-discovery.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freio.cz/schemas/prospecting/candidate-research-v1.json",
+  "title": "Freio untrusted prospect research output V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "candidates"],
+  "properties": {
+    "schemaVersion": {
+      "const": "1"
+    },
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["partnerType", "name", "sourceUrl", "researchContext"],
+        "properties": {
+          "partnerType": {
+            "enum": ["influencer", "ambassador"]
+          },
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120
+          },
+          "platform": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 40
+          },
+          "handle": {
+            "type": "string",
+            "pattern": "^@?[A-Za-z0-9._]{2,99}$"
+          },
+          "socialChannel": {
+            "enum": ["instagram", "tiktok"]
+          },
+          "sourceUrl": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://",
+            "minLength": 12,
+            "maxLength": 2000
+          },
+          "claimedEmail": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 320
+          },
+          "researchContext": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["disposition", "sourceKey", "priority", "category", "riskFlags"],
+            "properties": {
+              "disposition": {
+                "const": "ready_for_manual_review"
+              },
+              "sourceKey": {
+                "type": "string",
+                "minLength": 3,
+                "maxLength": 120
+              },
+              "priority": {
+                "enum": ["A", "B", "C"]
+              },
+              "category": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 80
+              },
+              "personalizationNote": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 500
+              },
+              "riskFlags": {
+                "type": "array",
+                "maxItems": 7,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "identity_unconfirmed",
+                    "audience_fit_unconfirmed",
+                    "reach_unconfirmed",
+                    "contact_unconfirmed",
+                    "paid_deal_likely",
+                    "competitor_overlap",
+                    "minor_or_representative_unknown"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["handle"]
+            },
+            "then": {
+              "required": ["socialChannel"]
+            }
+          },
+          {
+            "if": {
+              "required": ["socialChannel"]
+            },
+            "then": {
+              "required": ["handle"]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
