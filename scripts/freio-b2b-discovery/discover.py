@@ -16,6 +16,7 @@ sys.path.insert(0, str(SCRIPT_ROOT))
 sys.path.insert(0, str(LEGACY_ROOT))
 
 from freio_b2b_discovery.discovery import (  # noqa: E402
+    CLAUDE_TIMEOUT_SECONDS,
     OVERALL_BUDGET_SECONDS,
     DiscoveryEngine,
     run_claude_discovery,
@@ -79,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
             if arguments.anthropic_api_key_file is None:
                 raise ValidationError("--claude requires --anthropic-api-key-file")
             remaining = deadline - time.monotonic()
-            timeout = min(240, int(remaining - 30))
+            timeout = min(CLAUDE_TIMEOUT_SECONDS, int(remaining - 30))
             if timeout < 1:
                 raise ValidationError("discovery budget was exhausted before Claude")
             raw = run_claude_discovery(

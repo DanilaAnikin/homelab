@@ -36,7 +36,7 @@ from freio_prospecting.fetcher import (  # noqa: E402
 
 OVERALL_BUDGET_SECONDS = 540.0
 MINIMUM_FETCH_BUDGET_SECONDS = (2 * FETCH_TIMEOUT_SECONDS) + 1
-CLAUDE_TIMEOUT_SECONDS = 240
+CLAUDE_TIMEOUT_SECONDS = 360
 MAX_STDERR_BYTES = 32 * 1024
 MAX_PROMPT_BYTES = 32 * 1024
 MAX_SCHEMA_BYTES = 32 * 1024
@@ -232,7 +232,9 @@ def run_claude_discovery(
     timeout_seconds: int = CLAUDE_TIMEOUT_SECONDS,
 ) -> bytes:
     if not 1 <= timeout_seconds <= CLAUDE_TIMEOUT_SECONDS:
-        raise ValidationError("Claude timeout must be between 1 and 240 seconds")
+        raise ValidationError(
+            f"Claude timeout must be between 1 and {CLAUDE_TIMEOUT_SECONDS} seconds"
+        )
     try:
         resolved_claude = claude_binary.resolve(strict=True)
     except OSError as exc:

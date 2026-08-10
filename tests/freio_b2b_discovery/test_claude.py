@@ -11,6 +11,7 @@ from unittest.mock import patch
 from helpers import research_bytes
 
 from freio_b2b_discovery.discovery import (
+    CLAUDE_TIMEOUT_SECONDS,
     MAX_PROMPT_BYTES,
     _load_anthropic_api_key,
     run_claude_discovery,
@@ -70,7 +71,7 @@ class ClaudeDiscoveryTests(unittest.TestCase):
                 schema_path=schema,
                 anthropic_api_key_path=credential,
                 state_home=state_home,
-                timeout_seconds=10,
+                timeout_seconds=CLAUDE_TIMEOUT_SECONDS,
             )
             self.assertEqual(output, research_bytes())
             record = json.loads((state_home / "record.json").read_text())
