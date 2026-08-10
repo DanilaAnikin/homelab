@@ -7,9 +7,13 @@ nikdy neposílá e-mail, nevyplňuje formulář, nedomlouvá cenu, nevytváří 
 autorizaci kontaktu ani outreach zprávu. Nový lead na straně Freio zůstává
 `stage=new`, `outreach_status=not_enrolled`.
 
-Repozitář obsahuje jen **default-off šablony**. V tomto kroku nebyl vytvořen
-žádný uživatel, credential, marker ani systemd symlink a nic nebylo spuštěno,
-nasazeno nebo aktivováno.
+Repozitářové systemd šablony jsou **default-off** a bez markeru samy nic
+nespustí. Produkční instalace byla 10. 8. 2026 po bounded acceptance explicitně
+aktivována: discovery přijala 5/5 ověřených právnických osob, submit vytvořil 5
+inertních leadů `new/not_enrolled` a idempotentní opakování zpracovalo 0. Od
+discovery nevznikla žádná initial-outreach authorization ani zpráva; outbound
+gate zůstává `false`/cap `0`. Discover, submit i oba housekeeping timery jsou
+enabled/active. Telegram je samostatná větev a zůstává vypnutý do rotace tokenu.
 
 ## Dvě oddělené bezpečnostní identity
 
@@ -145,9 +149,10 @@ Neaktivovat, dokud současně neplatí:
    `discovery_enabled` + `intake_enabled`. Outbound gate zůstává oddělený.
 7. Oba housekeeping běhy jsou funkční dříve než discovery/submit timery.
 
-## Budoucí instalace bez zapnutí
+## Instalační runbook pro nový host bez zapnutí
 
-Tyto příkazy jsou runbook, v tomto kroku se nespouštěly:
+Tyto příkazy připraví nový host; samy nevytvoří aktivační marker ani nezapnou
+timer:
 
 ```bash
 sudo groupadd --system freio-b2b-discovery
@@ -166,7 +171,7 @@ sudo install -o root -g root -m 0644 scripts/systemd/freio-b2b-discovery-*.servi
 sudo systemctl daemon-reload
 ```
 
-V tomto bodě se nevytváří žádný `enabled/*` marker a nevolá se
+Na novém hostu se v tomto bodě nevytváří žádný `enabled/*` marker a nevolá se
 `systemctl enable` ani `systemctl start`.
 
 ## Credentials
