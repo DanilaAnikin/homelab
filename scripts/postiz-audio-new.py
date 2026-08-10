@@ -60,7 +60,7 @@ for pid, iid, pdate in missing:
     if not chosen: chosen = tracks[0]
     recent_by_acct.setdefault(iid, []).append((chosen["id"], dt))
     audio = {"id": chosen["id"], "title": chosen["title"], "artist": chosen["artist"],
-             "audio_volume": 100, "video_volume": 0}
+             "audio_volume": 100, "video_volume": 55}
     aj = json.dumps(audio, ensure_ascii=False).replace("'", "''")
     psql(f"""update "Post" set settings=(settings::jsonb || '{{"audio": {aj}}}'::jsonb)::text where id='{pid}';""", tuples=False)
     count += 1
