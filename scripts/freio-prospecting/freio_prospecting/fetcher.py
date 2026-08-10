@@ -12,9 +12,15 @@ from dataclasses import dataclass
 from email.message import Message
 from html.parser import HTMLParser
 from typing import Callable, Mapping, Protocol, Sequence
-from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
-from .common import CONTROL_CHARACTERS, sha256_hex, utc_now_iso
+from .common import (
+    CONTROL_CHARACTERS,
+    ValidationError,
+    sha256_hex,
+    utc_now_iso,
+    utf16_length,
+)
 
 
 MAX_BODY_BYTES = 1024 * 1024
@@ -108,17 +114,51 @@ class Transport(Protocol):
     ) -> RawResponse: ...
 
 
+_WHATWG_SINGLE_DOT_SEGMENTS = frozenset({".", "%2e"})
+_WHATWG_DOUBLE_DOT_SEGMENTS = frozenset({"..", ".%2e", "%2e.", "%2e%2e"})
+_PATH_SAFE = "/!$&'()*+,;=:@[]|%~-._"
+_QUERY_SAFE = "!$&()*+,-./:;=?@_~%[]|^`"
+
+
+def _remove_whatwg_dot_segments(path: str) -> str:
+    """Apply the special-URL dot-segment rules used by WHATWG URL."""
+    segments = path.split("/")
+    output: list[str] = []
+    for index, segment in enumerate(segments):
+        lowered = segment.lower()
+        is_last = index == len(segments) - 1
+        if lowered in _WHATWG_SINGLE_DOT_SEGMENTS:
+            if is_last:
+                output.append("")
+            continue
+        if lowered in _WHATWG_DOUBLE_DOT_SEGMENTS:
+            if output and not (len(output) == 1 and output[0] == ""):
+                output.pop()
+            if is_last:
+                output.append("")
+            continue
+        output.append(segment)
+    normalized = "/".join(output)
+    return normalized if normalized.startswith("/") else f"/{normalized}"
+
+
 def normalize_public_https_url(value: str) -> NormalizedURL:
+    trimmed = value.strip() if isinstance(value, str) else ""
     if (
         not isinstance(value, str)
-        or len(value) < 12
-        or len(value) > 2000
-        or CONTROL_CHARACTERS.search(value)
-        or "\\" in value
+        or CONTROL_CHARACTERS.search(trimmed)
+        or "\\" in trimmed
+        or any(0xD800 <= ord(character) <= 0xDFFF for character in trimmed)
     ):
         raise FetchError("invalid_url", "source URL is malformed")
     try:
-        parsed = urlsplit(value.strip())
+        length = utf16_length(trimmed)
+    except ValidationError as exc:
+        raise FetchError("invalid_url", "source URL is malformed") from exc
+    if length < 12 or length > 2000:
+        raise FetchError("invalid_url", "source URL is malformed")
+    try:
+        parsed = urlsplit(trimmed)
         hostname_unicode = parsed.hostname
         port = parsed.port
     except ValueError as exc:
@@ -135,10 +175,15 @@ def normalize_public_https_url(value: str) -> NormalizedURL:
             "invalid_url", "only credential-free HTTPS URLs on port 443 are allowed"
         )
     try:
-        hostname = hostname_unicode.rstrip(".").encode("idna").decode("ascii").lower()
+        hostname = hostname_unicode.rstrip(".").encode("ascii").decode("ascii").lower()
     except UnicodeError as exc:
+        # Python's stdlib codec implements IDNA2003 while the TypeScript
+        # receiver follows WHATWG/UTS #46.  Accepting a Unicode hostname here
+        # could therefore sign a different domain than the receiver stores.
+        # Require an already-canonical ASCII (punycode where needed) host so
+        # both sides validate exactly the same bytes.
         raise FetchError(
-            "invalid_host", "hostname cannot be represented safely"
+            "invalid_host", "hostname must already be canonical ASCII/punycode"
         ) from exc
     if (
         not hostname
@@ -166,9 +211,21 @@ def normalize_public_https_url(value: str) -> NormalizedURL:
         for label in labels
     ):
         raise FetchError("invalid_host", "hostname labels are invalid")
-    path = parsed.path or "/"
-    target = path + (f"?{parsed.query}" if parsed.query else "")
-    normalized = urlunsplit(("https", hostname, path, parsed.query, ""))
+    # urllib/http.client requires an ASCII request target. Percent-encode valid
+    # Unicode and spaces, preserve existing escapes, and match WHATWG's
+    # special-URL dot-segment removal used by the TypeScript receiver.
+    path = quote(_remove_whatwg_dot_segments(parsed.path or "/"), safe=_PATH_SAFE)
+    query = quote(parsed.query, safe=_QUERY_SAFE)
+    target = path + (f"?{query}" if query else "")
+    normalized = urlunsplit(("https", hostname, path, query, ""))
+    try:
+        normalized_length = utf16_length(normalized)
+    except ValidationError as exc:
+        raise FetchError("invalid_url", "source URL is malformed") from exc
+    if normalized_length > 2000:
+        raise FetchError(
+            "invalid_url", "normalized source URL exceeds 2000 UTF-16 units"
+        )
     return NormalizedURL(normalized, hostname, 443, target)
 
 
@@ -381,7 +438,7 @@ class _EvidenceHTMLParser(HTMLParser):
         lowered = tag.lower()
         if lowered in self._HIDDEN_TEXT_ELEMENTS:
             self.hidden_depth += 1
-        if lowered != "a":
+        if lowered != "a" or self.hidden_depth > 0:
             return
         href = next((value for key, value in attrs if key.lower() == "href"), None)
         if not href or not href.lower().startswith("mailto:"):

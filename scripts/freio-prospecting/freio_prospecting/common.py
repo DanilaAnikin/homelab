@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AbstractSet, Any
@@ -20,13 +21,39 @@ class ValidationError(ValueError):
 
 def canonical_json_bytes(value: Any) -> bytes:
     """Return the one canonical JSON encoding used for hashes and signatures."""
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    _validate_unicode_scalars(value)
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValidationError("value cannot be represented as canonical JSON") from exc
+
+
+def _validate_unicode_scalars(value: Any) -> None:
+    """Reject lone UTF-16 surrogates before they can crash UTF-8 encoding."""
+    if isinstance(value, str):
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise ValidationError("text contains an invalid Unicode scalar value")
+        return
+    if isinstance(value, list):
+        for entry in value:
+            _validate_unicode_scalars(entry)
+        return
+    if isinstance(value, dict):
+        for key, entry in value.items():
+            _validate_unicode_scalars(key)
+            _validate_unicode_scalars(entry)
+
+
+def utf16_length(value: str) -> int:
+    """Match JavaScript/Zod string length, which counts UTF-16 code units."""
+    _validate_unicode_scalars(value)
+    return len(value.encode("utf-16-le")) // 2
 
 
 def sha256_hex(value: bytes) -> str:
@@ -54,6 +81,8 @@ def parse_utc_timestamp(value: object, field: str) -> datetime:
 def require_object(value: object, field: str) -> dict[str, Any]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise ValidationError(f"{field} must be an object")
+    for key in value:
+        _validate_unicode_scalars(key)
     return value
 
 
@@ -70,16 +99,19 @@ def require_exact_keys(
     if missing:
         raise ValidationError(f"{field} is missing: {', '.join(sorted(missing))}")
     if unexpected:
-        raise ValidationError(
-            f"{field} has unexpected fields: {', '.join(sorted(unexpected))}"
-        )
+        # Keys originate in untrusted JSON and may contain PII, newlines or
+        # terminal escape sequences.  This message is persisted in quarantine
+        # metadata and may reach the systemd journal, so expose only a count.
+        noun = "field" if len(unexpected) == 1 else "fields"
+        raise ValidationError(f"{field} has {len(unexpected)} unexpected {noun}")
 
 
 def require_text(value: object, field: str, minimum: int, maximum: int) -> str:
     if not isinstance(value, str):
         raise ValidationError(f"{field} must be text")
+    _validate_unicode_scalars(value)
     normalized = value.strip()
-    if not minimum <= len(normalized) <= maximum or CONTROL_CHARACTERS.search(
+    if not minimum <= utf16_length(normalized) <= maximum or CONTROL_CHARACTERS.search(
         normalized
     ):
         raise ValidationError(f"{field} has an invalid length or control character")
@@ -110,7 +142,7 @@ def read_bounded_json(path: Path, maximum: int = MAX_JSON_BYTES) -> Any:
 def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o640) -> None:
     """Durably replace a file without ever exposing a partial artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    temporary = path.parent / (f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     descriptor: int | None = None
     try:
         descriptor = os.open(

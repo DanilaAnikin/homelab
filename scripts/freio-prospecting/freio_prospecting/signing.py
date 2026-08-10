@@ -14,7 +14,7 @@ from .common import CONTROL_CHARACTERS, ValidationError, sha256_hex
 
 
 NONCE = re.compile(r"^[0-9a-f]{32}$")
-MAX_SECRET_BYTES = 4096
+SUBMIT_SECRET = re.compile(rb"^[0-9a-f]{64}$")
 SUBMIT_HOSTNAME = "outreach.freio.cz"
 SUBMIT_PATH = "/api/internal/growth-partners/prospect-intake"
 
@@ -74,14 +74,19 @@ def load_secret(path: Path) -> bytes:
         raise ValidationError(
             "submit credential must not be accessible by group or others"
         )
-    if metadata.st_size < 32 or metadata.st_size > MAX_SECRET_BYTES:
-        raise ValidationError("submit credential has an unsafe length")
+    if metadata.st_size not in (64, 65):
+        raise ValidationError(
+            "submit credential must be 64 lowercase hex characters with optional LF"
+        )
     try:
-        secret = path.read_bytes().strip()
+        raw = path.read_bytes()
     except OSError as exc:
         raise ValidationError(f"cannot read submit credential: {exc}") from exc
-    if len(secret) < 32 or len(secret) > MAX_SECRET_BYTES or b"\x00" in secret:
-        raise ValidationError("submit credential has an unsafe value")
+    secret = raw[:-1] if raw.endswith(b"\n") else raw
+    if SUBMIT_SECRET.fullmatch(secret) is None:
+        raise ValidationError(
+            "submit credential must be the literal lowercase hex output of openssl rand -hex 32"
+        )
     return secret
 
 

@@ -17,6 +17,23 @@ from freio_prospecting.schema import (
 
 
 class ResearchSchemaTests(unittest.TestCase):
+    def test_text_lengths_match_javascript_utf16_and_surrogates_fail_closed(
+        self,
+    ) -> None:
+        accepted = research_candidate(name="🚀" * 60)
+        self.assertEqual(
+            parse_research_document(research_document(accepted))[0].name,
+            "🚀" * 60,
+        )
+        with self.assertRaises(ValidationError):
+            parse_research_document(
+                research_document(research_candidate(name="🚀" * 61))
+            )
+        with self.assertRaisesRegex(ValidationError, "Unicode scalar"):
+            parse_research_document(
+                research_document(research_candidate(name="bad\ud800text"))
+            )
+
     def test_parses_strict_valid_candidate(self) -> None:
         parsed = parse_research_document(research_document())
         self.assertEqual(len(parsed), 1)
@@ -37,6 +54,17 @@ class ResearchSchemaTests(unittest.TestCase):
         for document in documents:
             with self.subTest(document=document), self.assertRaises(ValidationError):
                 parse_research_document(document)
+
+    def test_unexpected_key_value_is_never_echoed_in_validation_error(self) -> None:
+        attacker_key = "leak@example.cz\nFORGED=1\x1b[31m"
+        document = research_document()
+        document[attacker_key] = True
+        with self.assertRaises(ValidationError) as raised:
+            parse_research_document(document)
+        self.assertEqual(str(raised.exception), "document has 1 unexpected field")
+        self.assertNotIn("leak@example.cz", str(raised.exception))
+        self.assertNotIn("\n", str(raised.exception))
+        self.assertNotIn("\x1b", str(raised.exception))
 
     def test_rejects_more_than_wave_size(self) -> None:
         document = research_document(
@@ -143,9 +171,10 @@ class BatchSchemaTests(unittest.TestCase):
         stale = batch_envelope(created_at="2026-07-01T00:00:00Z")
         future = batch_envelope(created_at="2026-08-09T10:06:00Z")
         for value in (stale, future):
-            with self.subTest(
-                created=value["items"][0]["fetchReceipt"]["fetchedAt"]
-            ), self.assertRaises(ValidationError):
+            with (
+                self.subTest(created=value["items"][0]["fetchReceipt"]["fetchedAt"]),
+                self.assertRaises(ValidationError),
+            ):
                 validate_signed_intake_request(
                     value, now=NOW_DT, maximum_age=timedelta(days=30)
                 )

@@ -24,7 +24,7 @@ def parse_arguments() -> argparse.Namespace:
         description="Validate or submit ready Freio prospect batches.",
     )
     parser.add_argument("--spool", type=Path, required=True)
-    parser.add_argument("--endpoint", required=True)
+    parser.add_argument("--endpoint")
     parser.add_argument("--max-batches", type=int, default=10)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
@@ -37,7 +37,16 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Explicitly allow HTTPS submission and ready/processed state transitions.",
     )
+    mode.add_argument("--reconcile-accepted", metavar="RECEIPT_ID")
+    mode.add_argument("--reconcile-not-accepted", metavar="RECEIPT_ID")
+    mode.add_argument("--clear-global-error", action="store_true")
+    mode.add_argument("--housekeeping", action="store_true")
     parser.add_argument("--secret-file", type=Path)
+    parser.add_argument(
+        "--identity-secret-file",
+        type=Path,
+        help="Stable identity-index HMAC credential, distinct from the transport secret.",
+    )
     return parser.parse_args()
 
 
@@ -66,19 +75,57 @@ def validate_only(spool: Spool) -> dict[str, int]:
 def main() -> int:
     arguments = parse_arguments()
     try:
-        endpoint = normalize_submit_endpoint(arguments.endpoint)
         spool = Spool(arguments.spool)
         if arguments.validate_only:
+            if not arguments.endpoint:
+                raise ValidationError("--validate-only requires --endpoint")
+            normalize_submit_endpoint(arguments.endpoint)
             counters = validate_only(spool)
-        else:
-            if not arguments.secret_file:
-                raise ValidationError("--send requires --secret-file")
+        elif arguments.send:
+            if not arguments.endpoint:
+                raise ValidationError("--send requires --endpoint")
+            endpoint = normalize_submit_endpoint(arguments.endpoint)
+            if not arguments.secret_file or not arguments.identity_secret_file:
+                raise ValidationError(
+                    "--send requires --secret-file and --identity-secret-file"
+                )
             secret = load_secret(arguments.secret_file)
+            identity_secret = load_secret(arguments.identity_secret_file)
+            if secret == identity_secret:
+                raise ValidationError(
+                    "transport and identity credentials must be distinct"
+                )
             counters = SubmissionWorker(
                 spool=spool,
                 endpoint=endpoint,
                 secret=secret,
+                identity_secret=identity_secret,
             ).run(arguments.max_batches)
+        else:
+            if not arguments.identity_secret_file:
+                raise ValidationError(
+                    "offline state maintenance requires --identity-secret-file"
+                )
+            identity_secret = load_secret(arguments.identity_secret_file)
+            spool.ensure()
+            spool.bind_identity_key(identity_secret)
+            with spool.submit_lock():
+                if arguments.clear_global_error:
+                    counters = {
+                        "clearedGlobalCircuit": int(spool.clear_global_circuit())
+                    }
+                elif arguments.housekeeping:
+                    counters = spool.housekeeping()
+                else:
+                    receipt_id = (
+                        arguments.reconcile_accepted
+                        if arguments.reconcile_accepted
+                        else arguments.reconcile_not_accepted
+                    )
+                    counters = spool.reconcile_uncertain_receipt(
+                        receipt_id,
+                        accepted=bool(arguments.reconcile_accepted),
+                    )
     except ValidationError as exc:
         print(
             json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False),

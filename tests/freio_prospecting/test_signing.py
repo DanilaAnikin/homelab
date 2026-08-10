@@ -70,9 +70,9 @@ class SigningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             valid = root / "valid"
-            valid.write_bytes(b"x" * 32)
+            valid.write_bytes(b"a" * 64)
             valid.chmod(0o600)
-            self.assertEqual(load_secret(valid), b"x" * 32)
+            self.assertEqual(load_secret(valid), b"a" * 64)
             valid.chmod(0o640)
             with self.assertRaisesRegex(ValidationError, "group or others"):
                 load_secret(valid)

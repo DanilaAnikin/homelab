@@ -1,0 +1,38 @@
+[
+  {
+    "input": "https://EXAMPLE.cz:443/contact?q=1",
+    "expected": "https://example.cz/contact?q=1"
+  },
+  {
+    "input": "https://xn--mnich-kva.example.cz/žlutý kůň?q=český test",
+    "expected": "https://xn--mnich-kva.example.cz/%C5%BElut%C3%BD%20k%C5%AF%C5%88?q=%C4%8Desk%C3%BD%20test"
+  },
+  {
+    "input": "https://example.cz/a/../b/./c",
+    "expected": "https://example.cz/b/c"
+  },
+  {
+    "input": "https://example.cz/a/%2e%2e/b/%2E/c",
+    "expected": "https://example.cz/b/c"
+  },
+  {
+    "input": "https://example.cz/a/%2E./b",
+    "expected": "https://example.cz/b"
+  },
+  {
+    "input": "https://example.cz/a//b/..//c",
+    "expected": "https://example.cz/a///c"
+  },
+  {
+    "input": "https://example.cz/%7euser/%2fkeep?x=%2f",
+    "expected": "https://example.cz/%7euser/%2fkeep?x=%2f"
+  },
+  {
+    "input": "https://example.cz/space here?x=a b&y=ž",
+    "expected": "https://example.cz/space%20here?x=a%20b&y=%C5%BE"
+  },
+  {
+    "input": "https://example.cz/path?q=a'b",
+    "expected": "https://example.cz/path?q=a%27b"
+  }
+]

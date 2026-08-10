@@ -1,0 +1,13 @@
+[Unit]
+Description=Disabled-by-default Freio discovery retention schedule
+Documentation=file:/srv/homelab/docs/freio-prospecting-worker.md
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+Persistent=true
+Unit=freio-prospect-discovery-housekeeping.service
+
+[Install]
+WantedBy=timers.target

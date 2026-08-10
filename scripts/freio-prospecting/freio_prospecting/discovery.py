@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -15,25 +18,70 @@ from .common import (
     sha256_hex,
     utc_now_iso,
 )
-from .fetcher import FetchError, FetchedDocument, PublicHTTPSFetcher
+from .fetcher import (
+    FETCH_TIMEOUT_SECONDS,
+    FetchError,
+    FetchedDocument,
+    PublicHTTPSFetcher,
+)
 from .schema import (
     ResearchCandidate,
     build_research_document,
     parse_research_document,
 )
-from .signing import load_secret
 from .workflow import Spool
 
 
-CLAUDE_TIMEOUT_SECONDS = 300
+CLAUDE_TIMEOUT_SECONDS = 240
+DISCOVERY_OVERALL_BUDGET_SECONDS = 540
+MINIMUM_FETCH_BUDGET_SECONDS = FETCH_TIMEOUT_SECONDS + 1
+TRANSIENT_FETCH_CODES = frozenset(
+    {"dns_failure", "dns_empty", "network_failure", "timeout"}
+)
+
+
+def _load_claude_credential(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValidationError("cannot inspect Claude credential") from exc
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_mode & 0o077
+    ):
+        raise ValidationError("Claude credential must be a private regular file")
+    if not 32 <= metadata.st_size <= 4096:
+        raise ValidationError("Claude credential has an unsafe length")
+    try:
+        raw = path.read_bytes()
+        token = raw[:-1] if raw.endswith(b"\n") else raw
+        value = token.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValidationError("Claude credential must be UTF-8 text") from exc
+    if not 32 <= len(token) <= 4096 or b"\x00" in token or value != value.strip():
+        raise ValidationError("Claude credential has an unsafe value")
+    return value
 
 
 @dataclass(frozen=True)
 class DiscoveryResult:
-    queued_path: Path | None
+    queued_paths: tuple[Path, ...]
     accepted: int
     rejected: int
+    deferred: int
     input_sha256: str
+
+    @property
+    def queued_path(self) -> Path | None:
+        return self.queued_paths[0] if self.queued_paths else None
+
+
+@dataclass(frozen=True)
+class DeferredRetryResult:
+    accepted: int
+    rejected: int
+    deferred: int
 
 
 @dataclass(frozen=True)
@@ -145,10 +193,7 @@ def run_claude_discovery(
         or len(schema.encode("utf-8")) > 32 * 1024
     ):
         raise ValidationError("Claude prompt or schema is unexpectedly large")
-    try:
-        token = load_secret(claude_token_path).decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValidationError("Claude credential must be UTF-8 text") from exc
+    token = _load_claude_credential(claude_token_path)
     state_home.mkdir(parents=True, exist_ok=True)
     combined_prompt = (
         f"{prompt}\n\nThe exact JSON Schema is below. Return one JSON object and nothing else.\n"
@@ -204,12 +249,16 @@ class DiscoveryEngine:
         spool: Spool,
         fetcher: PublicHTTPSFetcher | None = None,
         now_iso: Callable[[], str] = utc_now_iso,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.spool = spool
         self.fetcher = fetcher or PublicHTTPSFetcher()
         self.now_iso = now_iso
+        self.monotonic = monotonic
 
-    def process(self, raw: bytes) -> DiscoveryResult:
+    def process(
+        self, raw: bytes, *, deadline_monotonic: float | None = None
+    ) -> DiscoveryResult:
         input_hash = sha256_hex(raw)
         try:
             research = parse_untrusted_json(raw)
@@ -217,62 +266,140 @@ class DiscoveryEngine:
         except ValidationError as exc:
             self.spool.quarantine_untrusted(raw, "invalid_research_schema", str(exc))
             raise
-        accepted_candidates: list[ResearchCandidate] = []
-        rejected: list[dict[str, str]] = []
+        queued_paths: list[Path] = []
+        rejected = 0
+        deferred = 0
         identities: set[tuple[str, str]] = set()
         for index, candidate in enumerate(candidates):
+            candidate_document = build_research_document([candidate])
             try:
+                identity_set = self._preview_identities(candidate, candidate.source_url)
+                if identities.intersection(identity_set):
+                    raise ValidationError("duplicate normalized prospect identity")
+                identities.update(identity_set)
+                if (
+                    deadline_monotonic is not None
+                    and deadline_monotonic - self.monotonic()
+                    < MINIMUM_FETCH_BUDGET_SECONDS
+                ):
+                    if self.spool.defer_untrusted(candidate_document, "overall_budget"):
+                        deferred += 1
+                    else:
+                        rejected += 1
+                    continue
                 document = self.fetcher.fetch(candidate.source_url)
                 self._preview_candidate(candidate, document)
-                identity = (
-                    candidate.social_channel or "source",
-                    (
-                        candidate.handle.lstrip("@").lower()
-                        if candidate.handle
-                        else document.final_url
-                    ),
-                )
-                if identity in identities:
-                    raise ValidationError("duplicate normalized prospect identity")
-                identities.add(identity)
-                accepted_candidates.append(candidate)
-            except (FetchError, ValidationError) as exc:
-                rejected.append(
-                    {
-                        "index": str(index),
-                        "sourceKey": candidate.source_key,
-                        "code": getattr(exc, "code", "candidate_rejected"),
-                        "detail": str(exc)[:300],
-                    }
-                )
-        queued_path: Path | None = None
-        if accepted_candidates:
-            # This remains an untrusted candidate manifest. The submit identity
-            # independently refetches every source and creates the only trusted
-            # evidence receipt immediately before signing.
-            manifest = build_research_document(accepted_candidates)
-            queued_path = self.spool.enqueue_research(manifest)
-        if rejected:
-            rejection_report = canonical_json_bytes(
-                {
-                    "schemaVersion": "1",
-                    "inputSha256": input_hash,
-                    "rejectedAt": self.now_iso(),
-                    "rejections": rejected,
-                }
-            )
-            self.spool.quarantine_untrusted(
-                rejection_report,
-                "candidate_rejections",
-                "one or more candidates failed closed",
-            )
-        if not accepted_candidates:
+                queued_paths.append(self.spool.enqueue_research(candidate_document))
+            except FetchError as exc:
+                if self._is_transient_fetch(exc):
+                    if self.spool.defer_untrusted(candidate_document, exc.code):
+                        deferred += 1
+                    else:
+                        rejected += 1
+                else:
+                    self._quarantine_candidate(
+                        candidate_document, input_hash, index, exc
+                    )
+                    rejected += 1
+            except ValidationError as exc:
+                self._quarantine_candidate(candidate_document, input_hash, index, exc)
+                rejected += 1
+        if not queued_paths and deferred == 0:
             raise ValidationError(
                 "no candidate survived deterministic evidence validation"
             )
         return DiscoveryResult(
-            queued_path, len(accepted_candidates), len(rejected), input_hash
+            tuple(queued_paths), len(queued_paths), rejected, deferred, input_hash
         )
+
+    def retry_deferred(
+        self,
+        *,
+        deadline_monotonic: float | None = None,
+        maximum_candidates: int = 30,
+    ) -> DeferredRetryResult:
+        if not 1 <= maximum_candidates <= 100:
+            raise ValidationError("maximum deferred candidates must be 1 to 100")
+        accepted = rejected = deferred = 0
+        for path, document, candidates in self.spool.iter_due_untrusted():
+            if accepted + rejected + deferred >= maximum_candidates:
+                break
+            if (
+                deadline_monotonic is not None
+                and deadline_monotonic - self.monotonic() < MINIMUM_FETCH_BUDGET_SECONDS
+            ):
+                break
+            candidate = candidates[0]
+            try:
+                fetched = self.fetcher.fetch(candidate.source_url)
+                self._preview_candidate(candidate, fetched)
+                self.spool.enqueue_research(document)
+                self.spool.release_untrusted(path)
+                accepted += 1
+            except FetchError as exc:
+                if self._is_transient_fetch(exc):
+                    if self.spool.retry_untrusted(path, exc.code):
+                        deferred += 1
+                    else:
+                        rejected += 1
+                else:
+                    self.spool._quarantine_deferred_untrusted(
+                        path, "candidate_rejected", exc.code
+                    )
+                    rejected += 1
+            except ValidationError as exc:
+                self.spool._quarantine_deferred_untrusted(
+                    path, "candidate_rejected", str(exc)[:300]
+                )
+                rejected += 1
+        return DeferredRetryResult(accepted, rejected, deferred)
+
+    def _quarantine_candidate(
+        self,
+        document: dict[str, object],
+        input_hash: str,
+        index: int,
+        error: Exception,
+    ) -> None:
+        raw = canonical_json_bytes(document)
+        code = getattr(error, "code", "candidate_rejected")
+        # Each artifact contains only one candidate, so a permanent evidence
+        # failure can never quarantine or block a valid neighbour.
+        self.spool.quarantine_untrusted(
+            raw,
+            code,
+            f"candidate {index}; input_sha256={input_hash}; {str(error)[:200]}",
+        )
+
+    @staticmethod
+    def _is_transient_fetch(error: FetchError) -> bool:
+        if error.code in TRANSIENT_FETCH_CODES:
+            return True
+        if error.code != "http_status":
+            return False
+        match = re.search(r"HTTP ([0-9]{3})", str(error))
+        if not match:
+            return False
+        status = int(match.group(1))
+        return status in {408, 425, 429} or status >= 500
+
+    @staticmethod
+    def _preview_identities(
+        candidate: ResearchCandidate, final_url: str
+    ) -> set[tuple[str, str]]:
+        identities: set[tuple[str, str]] = set()
+        if candidate.handle and candidate.social_channel:
+            identities.add(
+                (
+                    "social",
+                    f"{candidate.social_channel}:{candidate.handle.lstrip('@').lower()}",
+                )
+            )
+        if candidate.claimed_email:
+            identities.add(("email", candidate.claimed_email))
+        if not identities:
+            identities.add(("source", final_url))
+        return identities
 
     @staticmethod
     def _preview_candidate(

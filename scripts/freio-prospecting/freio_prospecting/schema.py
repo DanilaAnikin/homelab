@@ -278,9 +278,9 @@ def make_intake_item(
     if candidate.social_channel:
         prospect["socialChannel"] = candidate.social_channel
     if candidate.personalization_note:
-        prospect["researchContext"][
-            "personalizationNote"
-        ] = candidate.personalization_note
+        prospect["researchContext"]["personalizationNote"] = (
+            candidate.personalization_note
+        )
     item: dict[str, Any] = {"idempotencyKey": idempotency_key, "prospect": prospect}
     if include_email and candidate.claimed_email:
         item["emailCandidate"] = {

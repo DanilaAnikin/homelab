@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,11 +13,14 @@ from helpers import NOW, fetched_document, research_candidate, research_document
 
 from freio_prospecting.common import ValidationError, canonical_json_bytes
 from freio_prospecting.discovery import (
+    CLAUDE_TIMEOUT_SECONDS,
+    DISCOVERY_OVERALL_BUDGET_SECONDS,
     DiscoveryEngine,
     ProcessOutput,
     _run_bounded_command,
     run_claude_discovery,
 )
+from freio_prospecting.fetcher import FETCH_TIMEOUT_SECONDS, FetchError
 from freio_prospecting.workflow import Spool
 
 
@@ -36,6 +40,68 @@ class FakeFetcher:
 
 
 class DiscoveryEngineTests(unittest.TestCase):
+    def test_each_accepted_candidate_gets_an_independent_manifest(self) -> None:
+        second = research_candidate(
+            name="Druhý tvůrce",
+            handle="@druhy",
+            sourceUrl="https://second.example.cz/contact",
+            claimedEmail="hello@second.example.cz",
+        )
+        fetcher = FakeFetcher(
+            documents={
+                second["sourceUrl"]: fetched_document(
+                    requested_url=second["sourceUrl"],
+                    final_url=second["sourceUrl"],
+                    email=second["claimedEmail"],
+                )
+            }
+        )
+        result = self.process(research_document(research_candidate(), second), fetcher)
+        self.assertEqual(result.accepted, 2)
+        self.assertEqual(len(result.queued_paths), 2)
+        for path in result.queued_paths:
+            self.assertEqual(len(json.loads(path.read_text())["candidates"]), 1)
+
+    def test_transient_source_is_deferred_without_blocking_valid_neighbour(
+        self,
+    ) -> None:
+        first = research_candidate()
+        second = research_candidate(
+            name="Druhý tvůrce",
+            handle="@druhy",
+            sourceUrl="https://second.example.cz/contact",
+            claimedEmail="hello@second.example.cz",
+        )
+        fetcher = FakeFetcher(
+            documents={
+                second["sourceUrl"]: fetched_document(
+                    requested_url=second["sourceUrl"],
+                    final_url=second["sourceUrl"],
+                    email=second["claimedEmail"],
+                )
+            },
+            failures={first["sourceUrl"]: FetchError("timeout", "deadline")},
+        )
+        result = self.process(research_document(first, second), fetcher)
+        self.assertEqual((result.accepted, result.deferred, result.rejected), (1, 1, 0))
+        self.assertEqual(
+            len(
+                [
+                    path
+                    for path in self.spool.untrusted_deferred.glob("[0-9a-f]*.json")
+                    if ".retry." not in path.name
+                ]
+            ),
+            1,
+        )
+
+    def test_discovery_budget_fits_unit_even_at_candidate_limit(self) -> None:
+        self.assertLessEqual(
+            CLAUDE_TIMEOUT_SECONDS + 30 * FETCH_TIMEOUT_SECONDS,
+            DISCOVERY_OVERALL_BUDGET_SECONDS,
+        )
+        self.assertLess(DISCOVERY_OVERALL_BUDGET_SECONDS, 600)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.spool = Spool(Path(self.temporary.name) / "spool")
@@ -130,6 +196,58 @@ class DiscoveryEngineTests(unittest.TestCase):
 
 
 class ClaudeBoundaryTests(unittest.TestCase):
+    def test_discovery_cli_does_not_log_untrusted_json_keys(self) -> None:
+        attacker_key = "leak@example.cz\nFORGED=1\x1b[31m"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "research.json"
+            spool = root / "spool"
+            document = research_document()
+            document[attacker_key] = True
+            input_path.write_text(json.dumps(document), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        Path(__file__).resolve().parents[2]
+                        / "scripts/freio-prospecting/discover.py"
+                    ),
+                    "--spool",
+                    str(spool),
+                    "--input-json",
+                    str(input_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(
+                json.loads(completed.stderr),
+                {"ok": False, "error": "document has 1 unexpected field"},
+            )
+            sidecar = next((spool / "quarantine/untrusted").glob("*.error.json"))
+            logged = (
+                completed.stdout
+                + completed.stderr
+                + sidecar.read_text(encoding="utf-8")
+            )
+            self.assertNotIn("leak@example.cz", logged)
+            self.assertNotIn("FORGED=1", logged)
+            self.assertNotIn("\x1b", logged)
+
+    def test_discovery_unit_uses_ephemeral_private_claude_home(self) -> None:
+        unit = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/systemd/freio-prospect-discovery.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("RuntimeDirectory=freio-prospect-discovery\n", unit)
+        self.assertIn("RuntimeDirectoryMode=0700\n", unit)
+        self.assertIn("RuntimeDirectoryPreserve=no\n", unit)
+        self.assertIn("--claude-home /run/freio-prospect-discovery/claude-home", unit)
+        self.assertNotIn("/var/lib/freio-prospecting/claude-home", unit)
+
     def test_claude_process_receives_only_minimal_environment_and_web_tools(
         self,
     ) -> None:

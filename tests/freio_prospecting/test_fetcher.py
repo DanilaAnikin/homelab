@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import unittest
 import time
+from pathlib import Path
 from unittest import mock
 
 from helpers import PACKAGE_ROOT  # noqa: F401
@@ -18,6 +20,36 @@ from freio_prospecting.fetcher import (
 
 
 class URLValidationTests(unittest.TestCase):
+    def test_matches_versioned_whatwg_parity_fixtures_and_is_idempotent(self) -> None:
+        fixtures = json.loads(
+            (Path(__file__).with_name("url_whatwg_parity.json")).read_text(
+                encoding="utf-8"
+            )
+        )
+        for fixture in fixtures:
+            with self.subTest(value=fixture["input"]):
+                normalized = normalize_public_https_url(fixture["input"])
+                self.assertEqual(normalized.url, fixture["expected"])
+                self.assertEqual(
+                    normalize_public_https_url(normalized.url).url,
+                    fixture["expected"],
+                )
+                normalized.target.encode("ascii")
+
+    def test_unicode_expansion_cannot_exceed_receiver_url_limit(self) -> None:
+        with self.assertRaises(FetchError):
+            normalize_public_https_url("https://example.cz/" + "🚀" * 900)
+
+    def test_rejects_unicode_hosts_instead_of_idna2003_remapping(self) -> None:
+        for value in (
+            "https://faß.de/contact",
+            "https://ς.gr/contact",
+            "https://a\u200cb.example.cz/contact",
+        ):
+            with self.subTest(value=value), self.assertRaises(FetchError) as raised:
+                normalize_public_https_url(value)
+            self.assertEqual(raised.exception.code, "invalid_host")
+
     def test_normalizes_host_port_path_and_fragment_policy(self) -> None:
         value = normalize_public_https_url("https://EXAMPLE.cz:443/contact?q=1")
         self.assertEqual(value.url, "https://example.cz/contact?q=1")
@@ -52,9 +84,10 @@ class URLValidationTests(unittest.TestCase):
             ["ff02::1"],
             ["93.184.216.34", "10.0.0.1"],
         ):
-            with self.subTest(addresses=addresses), self.assertRaises(
-                FetchError
-            ) as raised:
+            with (
+                self.subTest(addresses=addresses),
+                self.assertRaises(FetchError) as raised,
+            ):
                 validate_resolved_addresses(addresses)
             self.assertEqual(raised.exception.code, "non_public_ip")
 
@@ -295,12 +328,15 @@ class FetchFlowTests(unittest.TestCase):
                 return None
 
         normalized = normalize_public_https_url("https://creator.example.cz/contact")
-        with mock.patch(
-            "freio_prospecting.fetcher.http.client.HTTPSConnection", Connection
-        ), mock.patch(
-            "freio_prospecting.fetcher.socket.create_connection",
-            return_value=mock.Mock(),
-        ) as create_connection:
+        with (
+            mock.patch(
+                "freio_prospecting.fetcher.http.client.HTTPSConnection", Connection
+            ),
+            mock.patch(
+                "freio_prospecting.fetcher.socket.create_connection",
+                return_value=mock.Mock(),
+            ) as create_connection,
+        ):
             response = _pinned_https_request(normalized, ("1.1.1.1",), 2.0, 1024)
         self.assertEqual(response.body, b"ok")
         self.assertEqual(Connection.hosts, ["creator.example.cz"])
