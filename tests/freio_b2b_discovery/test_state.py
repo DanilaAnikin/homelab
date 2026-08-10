@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,16 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("kontakt@", receipt.read_text())
         self.assertFalse(claimed.path.exists())
         self.assertFalse(self.spool.request_path(claimed.path).exists())
+
+    def test_ready_handoff_is_group_readable_under_private_process_umask(self) -> None:
+        previous_umask = os.umask(0o077)
+        try:
+            queued = self.spool.enqueue(candidate())
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(stat.S_IMODE(queued.stat().st_mode), 0o640)
+        self.assertEqual(queued.stat().st_gid, self.spool.ready.stat().st_gid)
+        self.spool._load_manifest(queued)
 
     def test_identity_index_blocks_a_new_receipt_without_storing_pii(self) -> None:
         first = self.spool.claim_next()

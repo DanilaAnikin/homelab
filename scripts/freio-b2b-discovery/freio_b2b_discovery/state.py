@@ -203,7 +203,15 @@ class Spool:
             if destination.is_symlink() or destination.read_bytes() != serialized:
                 raise ValidationError("ready manifest content-address collision")
             return destination
-        atomic_write_bytes(destination, serialized, mode=0o660)
+        # The discovery and intake workers intentionally run as separate users.
+        # Keep the global umask strict, but expose the completed immutable handoff
+        # to their shared group before the atomic rename into the ready queue.
+        atomic_write_bytes(
+            destination,
+            serialized,
+            mode=0o640,
+            exact_mode=True,
+        )
         return destination
 
     @staticmethod
@@ -217,8 +225,11 @@ class Spool:
             raise ValidationError("manifest file is unsafe")
         try:
             raw = path.read_bytes()
+        except OSError as exc:
+            raise ValidationError("manifest cannot be read") from exc
+        try:
             value = json.loads(raw.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValidationError("manifest is not UTF-8 JSON") from exc
         candidates = parse_research_document(value)
         if len(candidates) != 1:

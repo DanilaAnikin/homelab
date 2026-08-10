@@ -139,8 +139,19 @@ def read_bounded_json(path: Path, maximum: int = MAX_JSON_BYTES) -> Any:
         raise ValidationError("input is not valid UTF-8 JSON") from exc
 
 
-def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o640) -> None:
-    """Durably replace a file without ever exposing a partial artifact."""
+def atomic_write_bytes(
+    path: Path,
+    data: bytes,
+    mode: int = 0o640,
+    *,
+    exact_mode: bool = False,
+) -> None:
+    """Durably replace a file without ever exposing a partial artifact.
+
+    ``exact_mode`` is reserved for deliberate cross-user handoffs. It applies the
+    requested permissions to the completed temporary file before the atomic
+    rename, without weakening the process-wide umask for any other artifact.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / (f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     descriptor: int | None = None
@@ -154,6 +165,8 @@ def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o640) -> None:
             descriptor = None
             handle.write(data)
             handle.flush()
+            if exact_mode:
+                os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
