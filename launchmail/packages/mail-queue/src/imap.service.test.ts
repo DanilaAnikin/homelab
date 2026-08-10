@@ -103,6 +103,7 @@ import {
   syncMailbox,
 } from "./imap.service";
 import {
+  INCOMING_AUTOMATION_HEADER_MAX_CHARS,
   INCOMING_HTML_MAX_CHARS,
   INCOMING_SOURCE_MAX_BYTES,
   INCOMING_TEXT_MAX_CHARS,
@@ -124,13 +125,18 @@ const config = {
   imapBackfillComplete: false,
 } as unknown as SmtpConfig;
 
-function messageSource(body: string, contentType = "text/plain"): Buffer {
+function messageSource(
+  body: string,
+  contentType = "text/plain",
+  extraHeaders: string[] = [],
+): Buffer {
   return Buffer.from(
     [
       "From: Sender <sender@example.test>",
       "To: Receiver <receiver@example.test>",
       "Subject: Bounded message",
       "Message-ID: <bounded@example.test>",
+      ...extraHeaders,
       `Content-Type: ${contentType}; charset=utf-8`,
       "",
       body,
@@ -176,6 +182,9 @@ describe("bounded IMAP ingestion", () => {
     });
     expect(state.insertedRows[0]).toMatchObject({
       text: "A normal reply.",
+      autoSubmitted: null,
+      precedence: null,
+      xAutoResponseSuppress: null,
       sourceSizeBytes: source.length,
       sourceTruncated: false,
       contentTruncated: false,
@@ -188,6 +197,63 @@ describe("bounded IMAP ingestion", () => {
         contentTruncated: false,
       }),
     );
+  });
+
+  it("case-folds and stores only the three allowlisted automation headers", async () => {
+    const source = messageSource("Automated reply.", "text/plain", [
+      "aUtO-sUbMiTtEd: AuTo-GeNeRaTeD",
+      "pReCeDeNcE: BuLk",
+      "X-aUtO-rEsPoNsE-sUpPrEsS: OOF, AutoReply",
+      "X-Loop: must-not-be-stored",
+    ]);
+    state.messages.push({
+      uid: 71,
+      source,
+      size: source.length,
+      internalDate: new Date("2026-08-04T12:00:30.000Z"),
+    });
+
+    await expect(syncMailbox(config)).resolves.toMatchObject({ fetched: 1 });
+
+    const row = state.insertedRows[0];
+    expect(row).toMatchObject({
+      autoSubmitted: "auto-generated",
+      precedence: "bulk",
+      xAutoResponseSuppress: "oof, autoreply",
+      contentTruncated: false,
+    });
+    expect(row).not.toHaveProperty("headers");
+    expect(row).not.toHaveProperty("headerLines");
+    expect(row).not.toHaveProperty("xLoop");
+  });
+
+  it("bounds automation header values and marks the stored content truncated", async () => {
+    const oversized = "A".repeat(INCOMING_AUTOMATION_HEADER_MAX_CHARS + 17);
+    const source = messageSource("Oversized safety header.", "text/plain", [
+      `Auto-Submitted: ${oversized}`,
+      `Precedence: ${oversized}`,
+      `X-Auto-Response-Suppress: ${oversized}`,
+    ]);
+    state.messages.push({
+      uid: 72,
+      source,
+      size: source.length,
+      internalDate: new Date("2026-08-04T12:00:45.000Z"),
+    });
+
+    await expect(syncMailbox(config)).resolves.toMatchObject({ fetched: 1 });
+
+    const row = state.insertedRows[0];
+    expect((row?.autoSubmitted as string).length).toBe(
+      INCOMING_AUTOMATION_HEADER_MAX_CHARS,
+    );
+    expect((row?.precedence as string).length).toBe(
+      INCOMING_AUTOMATION_HEADER_MAX_CHARS,
+    );
+    expect((row?.xAutoResponseSuppress as string).length).toBe(
+      INCOMING_AUTOMATION_HEADER_MAX_CHARS,
+    );
+    expect(row).toMatchObject({ contentTruncated: true });
   });
 
   it("stores only bounded bodies and marks an oversized forward-sync source", async () => {

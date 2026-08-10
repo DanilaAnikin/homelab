@@ -7,6 +7,7 @@ import {
   timestamp,
   uuid,
   boolean,
+  varchar,
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
@@ -159,6 +160,12 @@ export const incomingEmails = pgTable(
     messageId: text("message_id"),
     inReplyTo: text("in_reply_to"),
     references: text("references"),
+    // Deliberately allowlisted automation-safety headers. Do not store a raw
+    // header map: these bounded values are sufficient for loop prevention while
+    // avoiding unnecessary retention of arbitrary message metadata.
+    autoSubmitted: varchar("auto_submitted", { length: 512 }),
+    precedence: varchar("precedence", { length: 512 }),
+    xAutoResponseSuppress: varchar("x_auto_response_suppress", { length: 512 }),
     fromAddress: text("from_address").notNull(),
     fromName: text("from_name"),
     toAddresses: jsonb("to_addresses")

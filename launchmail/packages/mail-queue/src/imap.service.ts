@@ -17,6 +17,7 @@ import {
   INCOMING_ADDRESS_MAX_ITEMS,
   INCOMING_ATTACHMENT_MAX_BYTES,
   INCOMING_ATTACHMENT_MAX_ITEMS,
+  INCOMING_AUTOMATION_HEADER_MAX_CHARS,
   INCOMING_CONTENT_TYPE_MAX_CHARS,
   INCOMING_FILENAME_MAX_CHARS,
   INCOMING_HEADER_MAX_CHARS,
@@ -49,6 +50,47 @@ function boundString(value: string, max: number): Bounded<string> {
   return value.length > max
     ? { value: value.slice(0, max), truncated: true }
     : { value, truncated: false };
+}
+
+type AutomationHeaderName =
+  | "auto-submitted"
+  | "precedence"
+  | "x-auto-response-suppress";
+
+/**
+ * Read one explicitly allowlisted automation-safety header from mailparser's
+ * case-folded header map. Values are unfolded, whitespace-normalized and
+ * lower-cased so downstream guards cannot accidentally compare them
+ * case-sensitively. Unexpected structured values fail closed by marking the
+ * message content truncated instead of serializing arbitrary header objects.
+ */
+function automationHeader(
+  parsed: ParsedMail | null,
+  name: AutomationHeaderName,
+): Bounded<string | null> {
+  if (!parsed) return { value: null, truncated: false };
+  const raw = parsed.headers.get(name);
+  if (raw == null) return { value: null, truncated: false };
+
+  let value: string;
+  if (typeof raw === "string") {
+    value = raw;
+  } else if (
+    Array.isArray(raw) &&
+    raw.every((item): item is string => typeof item === "string")
+  ) {
+    value = raw.join(", ");
+  } else {
+    return { value: null, truncated: true };
+  }
+
+  const normalized = value
+    .replace(/[\t\r\n ]+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return { value: null, truncated: false };
+  const bounded = boundString(normalized, INCOMING_AUTOMATION_HEADER_MAX_CHARS);
+  return { value: bounded.value, truncated: bounded.truncated };
 }
 
 function toAddrs(obj?: AddressObject | AddressObject[]): Bounded<Addr[]> {
@@ -215,6 +257,12 @@ async function parseMessageToRow(
     ? parsed.references.join(" ")
     : (parsed?.references ?? "");
   const references = boundString(rawReferences, INCOMING_HEADER_MAX_CHARS);
+  const autoSubmitted = automationHeader(parsed, "auto-submitted");
+  const precedence = automationHeader(parsed, "precedence");
+  const xAutoResponseSuppress = automationHeader(
+    parsed,
+    "x-auto-response-suppress",
+  );
 
   const rawText = parsed?.text ?? null;
   const text = rawText
@@ -272,6 +320,9 @@ async function parseMessageToRow(
     messageId.truncated ||
     inReplyTo.truncated ||
     references.truncated ||
+    autoSubmitted.truncated ||
+    precedence.truncated ||
+    xAutoResponseSuppress.truncated ||
     text.truncated ||
     html.truncated ||
     attachmentsTruncated ||
@@ -285,6 +336,9 @@ async function parseMessageToRow(
     messageId: messageId.value || null,
     inReplyTo: inReplyTo.value || null,
     references: references.value || null,
+    autoSubmitted: autoSubmitted.value,
+    precedence: precedence.value,
+    xAutoResponseSuppress: xAutoResponseSuppress.value,
     fromAddress: fromEmail.value,
     fromName: fromName?.value ?? null,
     toAddresses: to.value,

@@ -5,6 +5,7 @@ import {
   INCOMING_ADDRESS_MAX_CHARS,
   INCOMING_ADDRESS_MAX_ITEMS,
   INCOMING_ATTACHMENT_MAX_ITEMS,
+  INCOMING_AUTOMATION_HEADER_MAX_CHARS,
   INCOMING_CONTENT_TYPE_MAX_CHARS,
   INCOMING_FILENAME_MAX_CHARS,
   INCOMING_HEADER_MAX_CHARS,
@@ -162,6 +163,15 @@ export async function getIncomingEmail(id: string, organizationId: string) {
       references: sql<
         string | null
       >`left(${incomingEmails.references}, ${INCOMING_HEADER_MAX_CHARS})`,
+      autoSubmitted: sql<
+        string | null
+      >`left(${incomingEmails.autoSubmitted}, ${INCOMING_AUTOMATION_HEADER_MAX_CHARS})`,
+      precedence: sql<
+        string | null
+      >`left(${incomingEmails.precedence}, ${INCOMING_AUTOMATION_HEADER_MAX_CHARS})`,
+      xAutoResponseSuppress: sql<
+        string | null
+      >`left(${incomingEmails.xAutoResponseSuppress}, ${INCOMING_AUTOMATION_HEADER_MAX_CHARS})`,
       fromAddress: sql<string>`left(${incomingEmails.fromAddress}, ${INCOMING_ADDRESS_MAX_CHARS})`,
       fromName: sql<
         string | null
@@ -208,6 +218,9 @@ export async function getIncomingEmail(id: string, organizationId: string) {
         or coalesce(char_length(${incomingEmails.messageId}) > ${INCOMING_HEADER_MAX_CHARS}, false)
         or coalesce(char_length(${incomingEmails.inReplyTo}) > ${INCOMING_HEADER_MAX_CHARS}, false)
         or coalesce(char_length(${incomingEmails.references}) > ${INCOMING_HEADER_MAX_CHARS}, false)
+        or coalesce(char_length(${incomingEmails.autoSubmitted}) > ${INCOMING_AUTOMATION_HEADER_MAX_CHARS}, false)
+        or coalesce(char_length(${incomingEmails.precedence}) > ${INCOMING_AUTOMATION_HEADER_MAX_CHARS}, false)
+        or coalesce(char_length(${incomingEmails.xAutoResponseSuppress}) > ${INCOMING_AUTOMATION_HEADER_MAX_CHARS}, false)
         or char_length(${incomingEmails.fromAddress}) > ${INCOMING_ADDRESS_MAX_CHARS}
         or coalesce(char_length(${incomingEmails.fromName}) > ${INCOMING_NAME_MAX_CHARS}, false)
         or jsonb_array_length(coalesce(${incomingEmails.toAddresses}, '[]'::jsonb)) > ${INCOMING_ADDRESS_MAX_ITEMS}

@@ -11,6 +11,9 @@ export interface IncomingEmailFull {
   toAddresses: { email: string; name?: string }[];
   ccAddresses: { email: string; name?: string }[] | null;
   subject: string | null;
+  autoSubmitted: string | null;
+  precedence: string | null;
+  xAutoResponseSuppress: string | null;
   text: string | null;
   html: string | null;
   sourceSizeBytes: number | null;

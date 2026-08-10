@@ -9,6 +9,10 @@ export const INCOMING_TEXT_MAX_CHARS = 256 * 1024;
 export const INCOMING_HTML_MAX_CHARS = 512 * 1024;
 export const INCOMING_SUBJECT_MAX_CHARS = 2 * 1024;
 export const INCOMING_HEADER_MAX_CHARS = 8 * 1024;
+// These three allowlisted RFC/X-header values are safety signals for downstream
+// automation, not a general raw-header archive. Their useful values are short;
+// the explicit cap is mirrored by varchar(512) columns in the DB schema.
+export const INCOMING_AUTOMATION_HEADER_MAX_CHARS = 512;
 export const INCOMING_NAME_MAX_CHARS = 512;
 export const INCOMING_ADDRESS_MAX_CHARS = 320;
 export const INCOMING_CONTENT_TYPE_MAX_CHARS = 255;

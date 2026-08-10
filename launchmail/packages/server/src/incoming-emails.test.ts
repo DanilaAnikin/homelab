@@ -18,6 +18,7 @@ const queueMocks = vi.hoisted(() => ({
   INCOMING_ADDRESS_MAX_CHARS: 320,
   INCOMING_ADDRESS_MAX_ITEMS: 100,
   INCOMING_ATTACHMENT_MAX_ITEMS: 100,
+  INCOMING_AUTOMATION_HEADER_MAX_CHARS: 512,
   INCOMING_CONTENT_TYPE_MAX_CHARS: 255,
   INCOMING_FILENAME_MAX_CHARS: 255,
   INCOMING_HEADER_MAX_CHARS: 8 * 1024,
@@ -174,11 +175,43 @@ describe("SMTP-config-bound message access", () => {
     });
   });
 
+  it("returns the bounded allowlisted automation headers in canonical detail", async () => {
+    queueMocks.getIncomingEmail.mockResolvedValue({
+      id: "freio-message",
+      smtpConfigId: BOUND_CONFIG_ID,
+      autoSubmitted: "auto-generated",
+      precedence: "bulk",
+      xAutoResponseSuppress: "oof, autoreply",
+      contentTruncated: false,
+    });
+
+    const response = await inboxApp().request(
+      "/api/incoming-emails/freio-message",
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      autoSubmitted: "auto-generated",
+      precedence: "bulk",
+      xAutoResponseSuppress: "oof, autoreply",
+      contentTruncated: false,
+    });
+  });
+
   it("bounds every large detail collection/body before JSON serialization", async () => {
     queueMocks.getIncomingEmail.mockResolvedValue({
       id: "freio-message",
       smtpConfigId: BOUND_CONFIG_ID,
       subject: "s".repeat(queueMocks.INCOMING_SUBJECT_MAX_CHARS + 1),
+      autoSubmitted: "a".repeat(
+        queueMocks.INCOMING_AUTOMATION_HEADER_MAX_CHARS + 1,
+      ),
+      precedence: "p".repeat(
+        queueMocks.INCOMING_AUTOMATION_HEADER_MAX_CHARS + 1,
+      ),
+      xAutoResponseSuppress: "x".repeat(
+        queueMocks.INCOMING_AUTOMATION_HEADER_MAX_CHARS + 1,
+      ),
       text: "t".repeat(queueMocks.INCOMING_TEXT_MAX_CHARS + 1),
       html: "h".repeat(queueMocks.INCOMING_HTML_MAX_CHARS + 1),
       toAddresses: Array.from(
@@ -209,6 +242,15 @@ describe("SMTP-config-bound message access", () => {
     expect(response.status).toBe(200);
     expect((body.subject as string).length).toBe(
       queueMocks.INCOMING_SUBJECT_MAX_CHARS,
+    );
+    expect((body.autoSubmitted as string).length).toBe(
+      queueMocks.INCOMING_AUTOMATION_HEADER_MAX_CHARS,
+    );
+    expect((body.precedence as string).length).toBe(
+      queueMocks.INCOMING_AUTOMATION_HEADER_MAX_CHARS,
+    );
+    expect((body.xAutoResponseSuppress as string).length).toBe(
+      queueMocks.INCOMING_AUTOMATION_HEADER_MAX_CHARS,
     );
     expect((body.text as string).length).toBe(
       queueMocks.INCOMING_TEXT_MAX_CHARS,
