@@ -45,6 +45,26 @@ MAX_CLAUDE_STDIN_BYTES = 96 * 1024
 TRANSIENT_FETCH_CODES = frozenset(
     {"dns_failure", "dns_empty", "network_failure", "timeout"}
 )
+STRUCTURED_OUTPUT_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+    {
+        "$id",
+        "$schema",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "format",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "minimum",
+        "multipleOf",
+        "pattern",
+        "uniqueItems",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -236,6 +256,41 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"unsupported JSON constant: {value}")
 
 
+def _transform_structured_schema(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_transform_structured_schema(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _transform_structured_schema(item)
+            for key, item in value.items()
+            if key not in STRUCTURED_OUTPUT_UNSUPPORTED_SCHEMA_KEYS
+        }
+    return value
+
+
+def _prepare_structured_schema(raw: str) -> str:
+    try:
+        schema = json.loads(
+            raw,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValidationError("Claude output schema is invalid JSON") from exc
+    if not isinstance(schema, dict):
+        raise ValidationError("Claude output schema must be an object")
+    transformed = _transform_structured_schema(schema)
+    try:
+        return json.dumps(
+            transformed,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("Claude output schema cannot be transformed") from exc
+
+
 def _extract_structured_output(raw: bytes) -> bytes:
     try:
         envelope = json.loads(
@@ -294,6 +349,7 @@ def run_claude_discovery(
 
     prompt = _read_bounded_text(prompt_path, "prompt", MAX_PROMPT_BYTES)
     schema = _read_bounded_text(schema_path, "schema", MAX_SCHEMA_BYTES)
+    structured_schema = _prepare_structured_schema(schema)
     api_key = _load_anthropic_api_key(anthropic_api_key_path)
     state_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -309,8 +365,9 @@ def run_claude_discovery(
 
     combined_prompt = (
         f"{prompt}\n\n"
-        "The Claude CLI enforces the authoritative output JSON Schema. "
-        "Return the structured object and no prose.\n"
+        "The Claude CLI enforces a structural output schema; the local receiver "
+        "enforces every hard constraint above. Return the structured object and "
+        "no prose.\n"
     ).encode("utf-8")
     if len(combined_prompt) > MAX_CLAUDE_STDIN_BYTES:
         raise ValidationError("Claude discovery input exceeds 96 KiB")
@@ -343,7 +400,7 @@ def run_claude_discovery(
         "--allowedTools",
         "WebSearch,WebFetch",
         "--json-schema",
-        schema,
+        structured_schema,
     ]
     completed = _run_bounded_command(
         command,

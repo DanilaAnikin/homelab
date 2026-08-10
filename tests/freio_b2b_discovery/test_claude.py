@@ -15,6 +15,7 @@ from freio_b2b_discovery.discovery import (
     MAX_PROMPT_BYTES,
     _extract_structured_output,
     _load_anthropic_api_key,
+    _prepare_structured_schema,
     run_claude_discovery,
 )
 from freio_prospecting.common import ValidationError
@@ -142,6 +143,38 @@ class ClaudeDiscoveryTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 with self.assertRaises(ValidationError):
                     _extract_structured_output(raw)
+
+    def test_transforms_only_unsupported_structured_output_constraints(self) -> None:
+        transformed = json.loads(
+            _prepare_structured_schema(
+                json.dumps(
+                    {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["email"],
+                        "properties": {
+                            "email": {
+                                "type": "string",
+                                "format": "email",
+                                "pattern": "^[^@]+@[^@]+$",
+                                "minLength": 3,
+                                "maxLength": 320,
+                            }
+                        },
+                    }
+                )
+            )
+        )
+        self.assertEqual(
+            transformed,
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["email"],
+                "properties": {"email": {"type": "string"}},
+            },
+        )
 
     def test_rejects_oversized_prompt_and_nonprivate_or_unsafe_key_before_spawn(
         self,
