@@ -182,6 +182,7 @@ describe("SMTP-config-bound message access", () => {
       autoSubmitted: "auto-generated",
       precedence: "bulk",
       xAutoResponseSuppress: "oof, autoreply",
+      automationHeadersComplete: true,
       contentTruncated: false,
     });
 
@@ -194,6 +195,7 @@ describe("SMTP-config-bound message access", () => {
       autoSubmitted: "auto-generated",
       precedence: "bulk",
       xAutoResponseSuppress: "oof, autoreply",
+      automationHeadersComplete: true,
       contentTruncated: false,
     });
   });

@@ -172,6 +172,7 @@ export async function getIncomingEmail(id: string, organizationId: string) {
       xAutoResponseSuppress: sql<
         string | null
       >`left(${incomingEmails.xAutoResponseSuppress}, ${INCOMING_AUTOMATION_HEADER_MAX_CHARS})`,
+      automationHeadersComplete: incomingEmails.automationHeadersComplete,
       fromAddress: sql<string>`left(${incomingEmails.fromAddress}, ${INCOMING_ADDRESS_MAX_CHARS})`,
       fromName: sql<
         string | null

@@ -14,6 +14,7 @@ export interface IncomingEmailFull {
   autoSubmitted: string | null;
   precedence: string | null;
   xAutoResponseSuppress: string | null;
+  automationHeadersComplete: boolean | null;
   text: string | null;
   html: string | null;
   sourceSizeBytes: number | null;

@@ -339,6 +339,9 @@ async function parseMessageToRow(
     autoSubmitted: autoSubmitted.value,
     precedence: precedence.value,
     xAutoResponseSuppress: xAutoResponseSuppress.value,
+    // This bit distinguishes a parsed message with no automation headers from
+    // a legacy row whose source was never projected through this parser.
+    automationHeadersComplete: parsed !== null,
     fromAddress: fromEmail.value,
     fromName: fromName?.value ?? null,
     toAddresses: to.value,

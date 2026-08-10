@@ -166,6 +166,7 @@ export const incomingEmails = pgTable(
     autoSubmitted: varchar("auto_submitted", { length: 512 }),
     precedence: varchar("precedence", { length: 512 }),
     xAutoResponseSuppress: varchar("x_auto_response_suppress", { length: 512 }),
+    automationHeadersComplete: boolean("automation_headers_complete"),
     fromAddress: text("from_address").notNull(),
     fromName: text("from_name"),
     toAddresses: jsonb("to_addresses")

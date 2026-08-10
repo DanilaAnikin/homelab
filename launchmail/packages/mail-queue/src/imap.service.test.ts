@@ -185,6 +185,7 @@ describe("bounded IMAP ingestion", () => {
       autoSubmitted: null,
       precedence: null,
       xAutoResponseSuppress: null,
+      automationHeadersComplete: true,
       sourceSizeBytes: source.length,
       sourceTruncated: false,
       contentTruncated: false,
@@ -220,6 +221,7 @@ describe("bounded IMAP ingestion", () => {
       autoSubmitted: "auto-generated",
       precedence: "bulk",
       xAutoResponseSuppress: "oof, autoreply",
+      automationHeadersComplete: true,
       contentTruncated: false,
     });
     expect(row).not.toHaveProperty("headers");
@@ -253,7 +255,10 @@ describe("bounded IMAP ingestion", () => {
     expect((row?.xAutoResponseSuppress as string).length).toBe(
       INCOMING_AUTOMATION_HEADER_MAX_CHARS,
     );
-    expect(row).toMatchObject({ contentTruncated: true });
+    expect(row).toMatchObject({
+      automationHeadersComplete: true,
+      contentTruncated: true,
+    });
   });
 
   it("stores only bounded bodies and marks an oversized forward-sync source", async () => {
