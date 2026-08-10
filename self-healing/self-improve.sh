@@ -45,5 +45,5 @@ fi
 
 DIGEST=$(awk '/=== SELF-IMPROVE DIGEST ===/{f=1;next} f' "$OUT" | head -c 3500)
 [[ -z "$DIGEST" ]] && DIGEST=$(tail -c 1200 "$OUT")
-/srv/homelab/self-healing/notify.sh "🧠 Týdenní self-improvement homelabu:
-$DIGEST" || true
+printf '%s\n' "🧠 Týdenní self-improvement homelabu:
+$DIGEST" | /srv/homelab/self-healing/notify.sh || true

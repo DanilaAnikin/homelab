@@ -3,4 +3,6 @@ Description=Telegram alert pri selhani %i
 
 [Service]
 Type=oneshot
-ExecStart=/srv/homelab/self-healing/notify.sh "❌ systemd sluzba SELHALA: %i — journalctl -u %i -n 50"
+StandardInput=data
+StandardInputText=❌ systemd sluzba SELHALA: %i. Zkontroluj journalctl -u %i -n 50
+ExecStart=/srv/homelab/self-healing/notify.sh

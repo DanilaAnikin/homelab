@@ -1,0 +1,56 @@
+[Unit]
+Description=Freio B2B HMAC intake-only submission
+Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
+After=network-online.target tailscaled.service
+Wants=network-online.target
+ConditionPathExists=/etc/freio-b2b-discovery/enabled/submit
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/ready
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/processing
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/processed
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/state
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/quarantine/claimed
+
+[Service]
+Type=oneshot
+User=freio-b2b-intake
+Group=freio-b2b-discovery
+RuntimeDirectory=freio-b2b-intake
+RuntimeDirectoryMode=0700
+WorkingDirectory=/run/freio-b2b-intake
+EnvironmentFile=/etc/freio-b2b-discovery/submit.env
+LoadCredential=intake-hmac:/etc/freio-b2b-discovery/intake-hmac
+LoadCredential=identity-index-hmac:/etc/freio-b2b-discovery/identity-index-hmac
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /srv/homelab/scripts/freio-b2b-discovery/submit.py --spool /var/lib/freio-b2b-discovery --endpoint ${FREIO_B2B_DISCOVERY_ENDPOINT} --send --transport-secret-file /run/credentials/freio-b2b-discovery-submit.service/intake-hmac --identity-secret-file /run/credentials/freio-b2b-discovery-submit.service/identity-index-hmac --max-batches 5
+TimeoutStartSec=3min
+UMask=0007
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/srv/homelab/scripts/freio-b2b-discovery /srv/homelab/scripts/freio-prospecting
+ReadWritePaths=/var/lib/freio-b2b-discovery/ready /var/lib/freio-b2b-discovery/processing /var/lib/freio-b2b-discovery/processed /var/lib/freio-b2b-discovery/state /var/lib/freio-b2b-discovery/quarantine/claimed /run/freio-b2b-intake
+TasksMax=32
+MemoryMax=256M

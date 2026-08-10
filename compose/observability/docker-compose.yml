@@ -11,6 +11,46 @@ services:
     networks: [dokploy-network]
     restart: unless-stopped
 
+  obs-alertmanager:
+    image: prom/alertmanager:v0.33.1@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d
+    container_name: obs-alertmanager
+    profiles: [telegram]
+    # The host credentials stay 0600 root:root. Root in this unprivileged
+    # container can read the two read-only binds; all Linux capabilities are
+    # still removed and the host filesystem is not otherwise exposed.
+    user: "0:0"
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=:9093
+      - --cluster.listen-address=
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - type: bind
+        source: /etc/homelab-telegram/telegram-token
+        target: /run/credentials/telegram-token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /etc/homelab-telegram/telegram-chat-id
+        target: /run/credentials/telegram-chat-id
+        read_only: true
+        bind:
+          create_host_path: false
+      - obs-alertmanager-data:/alertmanager
+    networks: [dokploy-network]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    ulimits:
+      core: 0
+
   obs-node-exporter:
     image: prom/node-exporter:latest
     container_name: obs-node-exporter
@@ -93,5 +133,6 @@ networks:
     external: true
 volumes:
   obs-prometheus-data:
+  obs-alertmanager-data:
   obs-loki-data:
   obs-grafana-data:

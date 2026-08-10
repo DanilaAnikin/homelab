@@ -38,5 +38,5 @@ fi
 
 DIGEST=$(awk '/=== HEALTH DIGEST ===/{f=1;next} f' "$OUT" | head -c 3500)
 [[ -z "$DIGEST" ]] && DIGEST=$(tail -c 1200 "$OUT")
-/srv/homelab/self-healing/notify.sh "📋 Denní health-review homelabu:
-$DIGEST" || true
+printf '%s\n' "📋 Denní health-review homelabu:
+$DIGEST" | /srv/homelab/self-healing/notify.sh || true

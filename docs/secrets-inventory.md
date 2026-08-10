@@ -23,16 +23,24 @@ workstationu (`~/programming/homelab/secrets/`, gitignored). Off-site: šifrovan
 | `uptimerobot.env` | (legacy monitoring) | UptimeRobot |
 | `kuma-backup-push-url.txt` | backup.sh | Kuma push monitor „Nightly backup" |
 
+## Server `/etc/homelab-telegram/`
+
+| soubor | konzument | zdroj / jak obnovit |
+|---|---|---|
+| `telegram-token` | socket transport, Alertmanager, Freio handoff | BotFather; po historické expozici vždy nový rotovaný token |
+| `telegram-chat-id` | socket transport, Alertmanager, Freio handoff | cílový Telegram chat; nikdy nevkládat do gitu nebo env |
+
 ## Jen workstation (`~/programming/homelab/secrets/`)
 `brevo.txt`, `cloudflare-api-token.txt`, `contact-mailboxes.txt`, `grafana-login.txt`,
 `inngest.env`, `r2-lokwave.txt`, `wedos-dns-snapshot.txt`, `launchmail-domain-ids.txt`.
 
 ## Interní identifikátory (neexploitovatelné, ale mimo git)
-- `homelab.conf` — TUNNEL_ID, DOKPLOY_API/ENV_ID/GITHUB_ID, TELEGRAM_CHAT_ID/TOKEN_FILE (server i workstation).
+- `homelab.conf` — TUNNEL_ID, DOKPLOY_API/ENV_ID/GITHUB_ID. Historické Telegram položky po migraci odstranit.
 - `dokploy-apps.conf` (server) — mapování appName→appId pro self-healing agenta.
 
 ## Externí (mimo homelab)
-- Telegram bot token: `/srv/frem/telegram-token` (server), chat_id (v secrets/homelab.conf).
+- Telegram legacy: `/srv/frem/telegram-token` a hodnoty v `homelab.conf` jsou po
+  migraci deprecated; token musí být rotovaný a staré zdroje odstraněné.
 - Grafana admin pw + PG exporter DSN: v `compose/observability/.env` (gitignored); v gitu jen `${VAR}` šablona.
 
 \* server vs workstation se historicky rozešly — při DR ber jako zdroj pravdy R2 secrets bundle (nejnovější).

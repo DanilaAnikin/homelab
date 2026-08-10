@@ -21,6 +21,7 @@ trap cleanup EXIT
 
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 RESULTS=""; FAIL=0
+notify(){ printf '%s\n' "$1" | "$NOTIFY"; }
 
 [[ -s "$BACKUP_KEY" ]] || { echo "chybí klíč"; exit 1; }
 
@@ -33,7 +34,7 @@ for _ in $(seq 1 45); do
   if docker exec "$DRILL_CT" pg_isready -U postgres >/dev/null 2>&1; then ready=1; break; fi
   sleep 2
 done
-[[ $ready -eq 1 ]] || { $NOTIFY "🔄 Restore drill ❌ throwaway postgres nenaběhl"; exit 1; }
+[[ $ready -eq 1 ]] || { notify "🔄 Restore drill ❌ throwaway postgres nenaběhl"; exit 1; }
 sleep 3   # doběhnutí supabase init (role/extenze)
 
 # ── per-DB: stáhni → dešifruj → restore → ověř ──────────────────────────────
@@ -72,9 +73,9 @@ done
 MSG=$(echo -e "$RESULTS")
 { echo "═══ RESTORE DRILL $(date -Iseconds) ═══"; echo -e "$RESULTS"; } >> "$LOG"
 if [[ $FAIL -eq 0 ]]; then
-  $NOTIFY "🔄 Restore drill ✅ všechny zálohy obnovitelné:"$'\n'"$MSG" || true
+  notify "🔄 Restore drill ✅ všechny zálohy obnovitelné:"$'\n'"$MSG" || true
   exit 0
 else
-  $NOTIFY "🔄 Restore drill ❌ PROBLÉM s obnovitelností:"$'\n'"$MSG" || true
+  notify "🔄 Restore drill ❌ PROBLÉM s obnovitelností:"$'\n'"$MSG" || true
   exit 1
 fi

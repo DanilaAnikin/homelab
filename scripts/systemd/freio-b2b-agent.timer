@@ -1,0 +1,14 @@
+[Unit]
+Description=Disabled-by-default Freio B2B classifier schedule
+Documentation=file:/srv/homelab/docs/freio-b2b-agent-worker.md
+
+[Timer]
+OnBootSec=12min
+OnUnitActiveSec=3min
+RandomizedDelaySec=30s
+AccuracySec=30s
+Persistent=true
+Unit=freio-b2b-agent.service
+
+[Install]
+WantedBy=timers.target

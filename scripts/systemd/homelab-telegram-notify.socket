@@ -1,0 +1,19 @@
+[Unit]
+Description=Privileged Homelab Telegram notification socket
+Documentation=file:/srv/homelab/docs/homelab-telegram-transport.md
+ConditionPathExists=/etc/homelab-telegram/enabled
+
+[Socket]
+ListenStream=/run/homelab-telegram-notify/notify.sock
+Accept=yes
+SocketUser=root
+SocketGroup=telegram-notify
+SocketMode=0660
+DirectoryMode=0755
+Backlog=16
+MaxConnections=8
+RemoveOnStop=yes
+FlushPending=yes
+
+[Install]
+WantedBy=sockets.target

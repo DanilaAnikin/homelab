@@ -1,0 +1,13 @@
+[Unit]
+Description=Disabled-by-default Freio B2B intake submission schedule
+Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=freio-b2b-discovery-submit.service
+
+[Install]
+WantedBy=timers.target

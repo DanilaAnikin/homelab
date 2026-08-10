@@ -20,9 +20,10 @@ cleanup(){ docker rm -f "$CT" >/dev/null 2>&1 || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 R=""; FAIL=0
 add(){ R+="$1"$'\n'; }
+notify(){ printf '%s\n' "$1" | "$NOTIFY"; }
 { echo "═══ REBUILD DRILL $(date -Iseconds) ═══"; } >> "$LOG"
 
-[[ -s "$BACKUP_KEY" ]] || { "$NOTIFY" "🧱 Rebuild drill ❌ chybí off-box klíč"; exit 1; }
+[[ -s "$BACKUP_KEY" ]] || { notify "🧱 Rebuild drill ❌ chybí off-box klíč"; exit 1; }
 
 # ── 1) git clone (source of truth) ───────────────────────────────────────────
 if git clone --depth 1 -q "$REPO" "$WORK/repo" 2>/dev/null && [[ -s "$WORK/repo/scripts/backup.sh" ]]; then
@@ -88,7 +89,7 @@ fi
 MSG=$(echo "$R")
 { echo "$MSG"; } >> "$LOG"
 if [[ $FAIL -eq 0 ]]; then
-  "$NOTIFY" "🧱 Rebuild drill ✅ homelab je plně obnovitelný z gitu + R2:"$'\n'"$MSG" || true; exit 0
+  notify "🧱 Rebuild drill ✅ homelab je plně obnovitelný z gitu + R2:"$'\n'"$MSG" || true; exit 0
 else
-  "$NOTIFY" "🧱 Rebuild drill ❌ PROBLÉM s obnovitelností:"$'\n'"$MSG" || true; exit 1
+  notify "🧱 Rebuild drill ❌ PROBLÉM s obnovitelností:"$'\n'"$MSG" || true; exit 1
 fi

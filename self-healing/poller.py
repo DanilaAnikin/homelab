@@ -56,7 +56,15 @@ RECUR_BACKOFF = 4 * 3600  # po eskalaci prodluž cooldown (přestaň mlátit to 
 
 def notify(msg):
     try:
-        subprocess.run([NOTIFY, msg], timeout=20)
+        subprocess.run(
+            [NOTIFY],
+            input=msg,
+            text=True,
+            timeout=20,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
     except Exception:
         pass
 

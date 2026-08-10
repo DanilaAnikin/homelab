@@ -9,6 +9,7 @@ NOTIFY=/srv/homelab/self-healing/notify.sh
 LOG=/srv/homelab/self-healing/trivy-scan.log
 CACHE_VOL=trivy-cache
 TRIVY="docker run --rm -v $CACHE_VOL:/root/.cache -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest"
+notify(){ printf '%s\n' "$1" | "$NOTIFY"; }
 
 docker pull aquasec/trivy:latest >/dev/null 2>&1 || true
 
@@ -43,9 +44,9 @@ print(c)" 2>/dev/null || echo 0)
 done
 
 if [[ "$CRIT_TOTAL" -gt 0 ]]; then
-  "$NOTIFY" "🛡️ Trivy sken — nalezeny CRITICAL zranitelnosti (zvaž povýšení image):
+  notify "🛡️ Trivy sken — nalezeny CRITICAL zranitelnosti (zvaž povýšení image):
 $REPORT" || true
 else
-  "$NOTIFY" "🛡️ Trivy sken OK — žádné CRITICAL zranitelnosti v běžících image." || true
+  notify "🛡️ Trivy sken OK — žádné CRITICAL zranitelnosti v běžících image." || true
 fi
 echo "  (CRITICAL celkem: $CRIT_TOTAL)" >> "$LOG"

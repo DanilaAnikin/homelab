@@ -1,0 +1,52 @@
+[Unit]
+Description=Freio B2B public-source discovery (no intake credential)
+Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/freio-b2b-discovery/enabled/discover
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/ready
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/deferred/discovery
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/quarantine/discovery
+
+[Service]
+Type=oneshot
+User=freio-b2b-discover
+Group=freio-b2b-discovery
+RuntimeDirectory=freio-b2b-discovery
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+WorkingDirectory=/run/freio-b2b-discovery
+LoadCredential=anthropic-api-key:/etc/freio-b2b-discovery/anthropic-api-key
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /srv/homelab/scripts/freio-b2b-discovery/discover.py --spool /var/lib/freio-b2b-discovery --claude --claude-bin /usr/local/bin/claude --anthropic-api-key-file /run/credentials/freio-b2b-discovery-discover.service/anthropic-api-key --claude-home /run/freio-b2b-discovery/claude-home
+TimeoutStartSec=10min
+UMask=0007
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/srv/homelab/scripts/freio-b2b-discovery /srv/homelab/scripts/freio-prospecting
+ReadWritePaths=/var/lib/freio-b2b-discovery/ready /var/lib/freio-b2b-discovery/deferred/discovery /var/lib/freio-b2b-discovery/quarantine/discovery /run/freio-b2b-discovery
+TasksMax=128
+MemoryMax=1G

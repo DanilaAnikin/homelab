@@ -1,0 +1,46 @@
+[Unit]
+Description=Freio B2B discovery raw-spool retention
+Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
+ConditionPathExists=/etc/freio-b2b-discovery/enabled/discover-housekeeping
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/ready
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/deferred/discovery
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/quarantine/discovery
+
+[Service]
+Type=oneshot
+User=freio-b2b-discover
+Group=freio-b2b-discovery
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /srv/homelab/scripts/freio-b2b-discovery/discover.py --spool /var/lib/freio-b2b-discovery --housekeeping
+TimeoutStartSec=2min
+UMask=0007
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/srv/homelab/scripts/freio-b2b-discovery /srv/homelab/scripts/freio-prospecting
+ReadWritePaths=/var/lib/freio-b2b-discovery/ready /var/lib/freio-b2b-discovery/deferred/discovery /var/lib/freio-b2b-discovery/quarantine/discovery
+TasksMax=16
+MemoryMax=128M

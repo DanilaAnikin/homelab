@@ -1,0 +1,14 @@
+[Unit]
+Description=Poll Freio for one pending Telegram owner handoff
+Documentation=file:/srv/homelab/docs/freio-telegram-handoff.md
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+AccuracySec=1s
+Persistent=false
+Unit=freio-telegram-handoff.service
+
+[Install]
+WantedBy=timers.target

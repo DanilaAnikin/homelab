@@ -11,6 +11,7 @@ LOG=/srv/homelab/self-healing/incidents.log
 NOTIFY=/srv/homelab/self-healing/notify.sh
 OUT=$(mktemp)
 trap 'rm -f "$OUT"' EXIT
+notify(){ printf '%s\n' "$1" | "$NOTIFY"; }
 
 {
   echo "═══════════ INCIDENT $TS ═══════════"
@@ -36,11 +37,11 @@ echo "" >> "$LOG"
 TAIL=$(tail -c 600 "$OUT" | tr '\n' ' ')
 if grep -qiE 'ESKALACE:' "$OUT"; then
   ESC=$(grep -iE 'ESKALACE:' "$OUT" | head -1)
-  "$NOTIFY" "⚠️ Self-healing ESKALACE — incident: ${INCIDENT} | ${ESC}" || true
+  notify "⚠️ Self-healing ESKALACE — incident: ${INCIDENT} | ${ESC}" || true
 elif grep -qiE 'agent timeout/selhal' "$OUT"; then
-  "$NOTIFY" "❌ Self-healing agent SELHAL/timeout na incidentu: ${INCIDENT}" || true
+  notify "❌ Self-healing agent SELHAL/timeout na incidentu: ${INCIDENT}" || true
 elif grep -qiE 'OPRAVENO' "$OUT"; then
-  "$NOTIFY" "✅ Self-healing OPRAVIL: ${INCIDENT} | …${TAIL: -300}" || true
+  notify "✅ Self-healing OPRAVIL: ${INCIDENT} | …${TAIL: -300}" || true
 else
-  "$NOTIFY" "ℹ️ Self-healing doběhl (nejednoznačný výsledek): ${INCIDENT} | …${TAIL: -250}" || true
+  notify "ℹ️ Self-healing doběhl (nejednoznačný výsledek): ${INCIDENT} | …${TAIL: -250}" || true
 fi

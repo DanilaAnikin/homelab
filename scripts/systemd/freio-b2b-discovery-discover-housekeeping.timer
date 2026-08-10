@@ -1,0 +1,13 @@
+[Unit]
+Description=Disabled-by-default Freio B2B discovery retention schedule
+Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
+
+[Timer]
+OnBootSec=25min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+Persistent=true
+Unit=freio-b2b-discovery-discover-housekeeping.service
+
+[Install]
+WantedBy=timers.target

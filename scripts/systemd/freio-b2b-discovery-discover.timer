@@ -1,0 +1,12 @@
+[Unit]
+Description=Disabled-by-default daily Freio B2B discovery schedule
+Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
+
+[Timer]
+OnCalendar=*-*-* 08:43:00 Europe/Prague
+RandomizedDelaySec=30min
+Persistent=true
+Unit=freio-b2b-discovery-discover.service
+
+[Install]
+WantedBy=timers.target

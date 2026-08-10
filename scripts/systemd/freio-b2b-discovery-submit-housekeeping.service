@@ -1,0 +1,47 @@
+[Unit]
+Description=Freio B2B submit receipt retention and reconciliation maintenance
+Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
+ConditionPathExists=/etc/freio-b2b-discovery/enabled/submit-housekeeping
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/processed
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/state
+ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/quarantine/claimed
+
+[Service]
+Type=oneshot
+User=freio-b2b-intake
+Group=freio-b2b-discovery
+LoadCredential=identity-index-hmac:/etc/freio-b2b-discovery/identity-index-hmac
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /srv/homelab/scripts/freio-b2b-discovery/submit.py --spool /var/lib/freio-b2b-discovery --housekeeping --identity-secret-file /run/credentials/freio-b2b-discovery-submit-housekeeping.service/identity-index-hmac
+TimeoutStartSec=2min
+UMask=0007
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/srv/homelab/scripts/freio-b2b-discovery /srv/homelab/scripts/freio-prospecting
+ReadWritePaths=/var/lib/freio-b2b-discovery/processed /var/lib/freio-b2b-discovery/state /var/lib/freio-b2b-discovery/quarantine/claimed
+TasksMax=16
+MemoryMax=128M

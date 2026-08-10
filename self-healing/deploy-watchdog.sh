@@ -13,6 +13,7 @@ WATCH_WINDOW=1800    # jen services updatované za posledních 30 min (= čerstv
 REROLL_COOLDOWN=7200 # nerollbackuj stejnou service častěji než 2h (anti-loop)
 touch "$STATE" 2>/dev/null || true
 NOW=$(date +%s)
+notify(){ printf '%s\n' "$1" | "$NOTIFY"; }
 
 # Dokploy/app swarm services (ne infra jako obs-*, supabase-* běží mimo swarm / jinak)
 SERVICES=$(docker service ls --format '{{.Name}} {{.Replicas}}' 2>/dev/null | grep -E '^(app-|ripieno-|lokwave-|launchmail-)' || true)
@@ -34,7 +35,7 @@ while read -r name repl; do
   [[ "$hasprev" != "1" ]] && continue
   # anti-loop
   lr=$(last_roll "$name"); [[ -n "$lr" && $(( NOW - lr )) -lt "$REROLL_COOLDOWN" ]] && {
-    "$NOTIFY" "⚠️ deploy-watchdog: '$name' spadlá i po nedávném rollbacku — nutný zásah (bad previous spec?)." || true
+    notify "⚠️ deploy-watchdog: '$name' spadlá i po nedávném rollbacku — nutný zásah (bad previous spec?)." || true
     echo "[$(date -Iseconds)] $name: skip (rollback v cooldownu)" >> "$LOG"; continue; }
 
   echo "[$(date -Iseconds)] $name: čerstvý deploy ($age s) spadlý ($repl) → ROLLBACK" >> "$LOG"
@@ -43,12 +44,12 @@ while read -r name repl; do
     nr=$(docker service ls --format '{{.Name}} {{.Replicas}}' | awk -v n="$name" '$1==n{print $2}')
     r2="${nr%%/*}"; d2="${nr##*/}"
     if [[ "$r2" == "$d2" && "$r2" != "0" ]]; then
-      "$NOTIFY" "↩️ deploy-watchdog: '$name' po deployi spadla → AUTO-ROLLBACK na předchozí verzi ÚSPĚŠNÝ ($nr)." || true
+      notify "↩️ deploy-watchdog: '$name' po deployi spadla → AUTO-ROLLBACK na předchozí verzi ÚSPĚŠNÝ ($nr)." || true
     else
-      "$NOTIFY" "❌ deploy-watchdog: '$name' rollback NEOBNOVIL zdraví ($nr) — nutný zásah." || true
+      notify "❌ deploy-watchdog: '$name' rollback NEOBNOVIL zdraví ($nr) — nutný zásah." || true
     fi
   else
-    "$NOTIFY" "❌ deploy-watchdog: '$name' spadlá po deployi, rollback SELHAL — nutný zásah." || true
+    notify "❌ deploy-watchdog: '$name' spadlá po deployi, rollback SELHAL — nutný zásah." || true
   fi
 done <<< "$SERVICES"
 

@@ -5,6 +5,7 @@ After=network-online.target docker.service
 [Service]
 Type=simple
 User=anakin
+SupplementaryGroups=telegram-notify
 ExecStart=/usr/bin/python3 /srv/homelab/self-healing/poller.py
 Restart=always
 RestartSec=5

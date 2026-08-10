@@ -1,0 +1,51 @@
+[Unit]
+Description=Disabled-by-default Freio B2B inbound classifier
+Documentation=file:/srv/homelab/docs/freio-b2b-agent-worker.md
+After=network-online.target tailscaled.service
+Wants=network-online.target
+ConditionPathExists=/etc/freio-b2b-agent/enabled/classifier
+
+[Service]
+Type=oneshot
+User=freio-b2b-agent
+Group=freio-b2b-agent
+StateDirectory=freio-b2b-agent
+StateDirectoryMode=0700
+RuntimeDirectory=freio-b2b-agent
+RuntimeDirectoryMode=0700
+WorkingDirectory=/run/freio-b2b-agent
+LoadCredential=freio-api-bearer:/etc/freio-b2b-agent/api-bearer
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /srv/homelab/scripts/freio_b2b_agent/worker.py --spool /var/lib/freio-b2b-agent --api-secret-file /run/credentials/freio-b2b-agent.service/freio-api-bearer
+TimeoutStartSec=1min
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/srv/homelab/scripts/freio_b2b_agent
+ReadWritePaths=/var/lib/freio-b2b-agent /run/freio-b2b-agent
+TasksMax=32
+MemoryMax=128M

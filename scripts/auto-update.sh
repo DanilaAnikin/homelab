@@ -10,6 +10,7 @@ NOTIFY=/srv/homelab/self-healing/notify.sh
 LOG=/srv/homelab/self-healing/auto-update.log
 STACK_DIR=/srv/homelab/compose/observability
 PROJECT=observability   # compose project name (docker inspect label)
+notify(){ printf '%s\n' "$1" | "$NOTIFY"; }
 
 exec > >(tee -a "$LOG") 2>&1
 echo "═══ AUTO-UPDATE $(date -Iseconds) ═══"
@@ -57,10 +58,10 @@ if [[ -n "$UNHEALTHY" ]]; then
     [[ "$st" == "running" ]] || STILL+="$c "
   done
   if [[ -n "$STILL" ]]; then
-    "$NOTIFY" "⚠️ auto-update: rollback observability NEDOKONČEN, stále nezdravé: $STILL — nutný zásah." || true
+    notify "⚠️ auto-update: rollback observability NEDOKONČEN, stále nezdravé: $STILL — nutný zásah." || true
     exit 1
   fi
-  "$NOTIFY" "↩️ auto-update: nový image observability byl NEZDRAVÝ ($UNHEALTHY) → rollback na předchozí, běží OK." || true
+  notify "↩️ auto-update: nový image observability byl NEZDRAVÝ ($UNHEALTHY) → rollback na předchozí, běží OK." || true
   exit 0
 fi
 
@@ -68,7 +69,7 @@ fi
 AFTER=$(docker images --format '{{.Repository}}:{{.Tag}}@{{.ID}}' | sort)
 CHANGED=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") | grep -vE '@<none>|<none>' | cut -d@ -f1 | sort -u | tr '\n' ' ')
 if [[ -n "$CHANGED" ]]; then
-  "$NOTIFY" "⬆️ auto-update observability OK (health gate prošel). Aktualizováno: $CHANGED" || true
+  notify "⬆️ auto-update observability OK (health gate prošel). Aktualizováno: $CHANGED" || true
   echo "  aktualizováno: $CHANGED"
 else
   echo "  žádné nové image (vše aktuální)"

@@ -10,6 +10,7 @@ LOG=/srv/homelab/self-healing/synthetic-check.log
 exec > >(tee -a "$LOG") 2>&1     # logovat vše BEZ subshellu (FAILS zůstane v main shellu)
 FAILS=""
 TMO=20
+notify(){ printf '%s\n' "$1" | "$NOTIFY"; }
 
 anon(){ grep -h "^ANON_KEY=" "$1" 2>/dev/null | cut -d= -f2; }
 GT_ANON=$(anon /srv/homelab/compose/supabase-gorillatype/.env)
@@ -46,7 +47,7 @@ check_keyword "freio render" "https://freio.cz" "freio"
 check_keyword "ripieno render" "https://www.ripieno.xyz" "Ripieno"
 
 if [[ -n "$FAILS" ]]; then
-  "$NOTIFY" "🧪 Synthetic check SELHAL: $FAILS — funkční problém (ne jen uptime)." || true
+  notify "🧪 Synthetic check SELHAL: $FAILS — funkční problém (ne jen uptime)." || true
   exit 1
 fi
 echo "  ✓ vše OK"
