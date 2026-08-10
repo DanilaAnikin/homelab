@@ -13,6 +13,7 @@ from helpers import research_bytes
 from freio_b2b_discovery.discovery import (
     CLAUDE_TIMEOUT_SECONDS,
     MAX_PROMPT_BYTES,
+    _extract_structured_output,
     _load_anthropic_api_key,
     run_claude_discovery,
 )
@@ -27,7 +28,14 @@ class ClaudeDiscoveryTests(unittest.TestCase):
         credential = root / "anthropic-api-key"
         state_home = root / "state"
         api_key = "sk-ant-" + "a" * 64
-        output = research_bytes()
+        output = json.dumps(
+            {
+                "is_error": False,
+                "structured_output": json.loads(research_bytes()),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
         binary.write_text(
             "#!/usr/bin/python3\n"
             "import hashlib\n"
@@ -73,7 +81,7 @@ class ClaudeDiscoveryTests(unittest.TestCase):
                 state_home=state_home,
                 timeout_seconds=CLAUDE_TIMEOUT_SECONDS,
             )
-            self.assertEqual(output, research_bytes())
+            self.assertEqual(json.loads(output), json.loads(research_bytes()))
             record = json.loads((state_home / "record.json").read_text())
             self.assertEqual(
                 record["envKeys"],
@@ -91,7 +99,8 @@ class ClaudeDiscoveryTests(unittest.TestCase):
                 hashlib.sha256(api_key.encode("ascii")).hexdigest(),
             )
             self.assertIn("PROMPT_SENTINEL", record["stdin"])
-            self.assertIn("SCHEMA_SENTINEL", record["stdin"])
+            self.assertNotIn("SCHEMA_SENTINEL", record["stdin"])
+            self.assertIn("SCHEMA_SENTINEL", " ".join(record["argv"]))
             self.assertNotIn(api_key, record["stdin"])
             self.assertNotIn(api_key, " ".join(record["argv"]))
             self.assertNotIn("PROMPT_SENTINEL", " ".join(record["argv"]))
@@ -106,17 +115,33 @@ class ClaudeDiscoveryTests(unittest.TestCase):
                     "--permission-mode",
                     "dontAsk",
                     "--output-format",
-                    "text",
+                    "json",
                     "--input-format",
                     "text",
                     "--no-session-persistence",
+                    "--safe-mode",
                     "--strict-mcp-config",
                     "--tools",
                     "WebSearch,WebFetch",
                     "--allowedTools",
                     "WebSearch,WebFetch",
+                    "--json-schema",
+                    '{"SCHEMA_SENTINEL":true}',
                 ],
             )
+
+    def test_rejects_invalid_or_failed_structured_output_envelopes(self) -> None:
+        cases = (
+            b"not-json",
+            b'{"is_error":false,"is_error":false,"structured_output":{}}',
+            b'{"is_error":true,"structured_output":{}}',
+            b'{"is_error":false,"structured_output":null}',
+            b'{"is_error":false,"structured_output":{"value":NaN}}',
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValidationError):
+                    _extract_structured_output(raw)
 
     def test_rejects_oversized_prompt_and_nonprivate_or_unsafe_key_before_spawn(
         self,

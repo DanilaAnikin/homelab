@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import stat
@@ -9,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from .model import (
@@ -222,6 +223,48 @@ def _load_anthropic_api_key(path: Path) -> str:
         raise ValidationError("Anthropic API key must be ASCII") from exc
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"unsupported JSON constant: {value}")
+
+
+def _extract_structured_output(raw: bytes) -> bytes:
+    try:
+        envelope = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValidationError("Claude structured-output envelope is invalid") from exc
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("is_error") is not False
+        or not isinstance(envelope.get("structured_output"), dict)
+    ):
+        raise ValidationError("Claude structured output was not successful")
+    try:
+        serialized = json.dumps(
+            envelope["structured_output"],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("Claude structured output cannot be serialized") from exc
+    if not serialized or len(serialized) > MAX_JSON_BYTES:
+        raise ValidationError("Claude structured output exceeds its size bound")
+    return serialized
+
+
 def run_claude_discovery(
     *,
     claude_binary: Path,
@@ -266,9 +309,8 @@ def run_claude_discovery(
 
     combined_prompt = (
         f"{prompt}\n\n"
-        "The exact output JSON Schema follows. It is authoritative. "
-        "Return one JSON object and nothing else.\n"
-        f"<output-json-schema>\n{schema}\n</output-json-schema>\n"
+        "The Claude CLI enforces the authoritative output JSON Schema. "
+        "Return the structured object and no prose.\n"
     ).encode("utf-8")
     if len(combined_prompt) > MAX_CLAUDE_STDIN_BYTES:
         raise ValidationError("Claude discovery input exceeds 96 KiB")
@@ -290,15 +332,18 @@ def run_claude_discovery(
         "--permission-mode",
         "dontAsk",
         "--output-format",
-        "text",
+        "json",
         "--input-format",
         "text",
         "--no-session-persistence",
+        "--safe-mode",
         "--strict-mcp-config",
         "--tools",
         "WebSearch,WebFetch",
         "--allowedTools",
         "WebSearch,WebFetch",
+        "--json-schema",
+        schema,
     ]
     completed = _run_bounded_command(
         command,
@@ -313,7 +358,7 @@ def run_claude_discovery(
         )
     if not completed.stdout or len(completed.stdout) > MAX_JSON_BYTES:
         raise ValidationError("Claude discovery output is empty or exceeds 96 KiB")
-    return completed.stdout
+    return _extract_structured_output(completed.stdout)
 
 
 @dataclass(frozen=True)
