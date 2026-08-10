@@ -1,0 +1,64 @@
+networks:
+  dokploy-network:
+    external: true
+  postiz-internal:
+    driver: bridge
+volumes:
+  postiz-config:
+  postiz-uploads:
+  postiz-postgres:
+  postiz-redis:
+services:
+  postiz:
+    image: postiz-freio:patched
+    pull_policy: never
+    container_name: postiz
+    restart: unless-stopped
+    mem_limit: 1700m
+    env_file: /srv/postiz/postiz.env
+    volumes:
+      - postiz-config:/config/
+      - postiz-uploads:/uploads/
+    networks: [dokploy-network, postiz-internal]
+    depends_on: [postiz-postgres, postiz-redis]
+  postiz-postgres:
+    image: postgres:17-alpine
+    container_name: postiz-postgres
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      POSTGRES_USER: postiz
+      POSTGRES_PASSWORD: f6459bbf4898d5e99d98c1ceb99ac366
+      POSTGRES_DB: postiz
+    volumes:
+      - postiz-postgres:/var/lib/postgresql/data
+    networks: [postiz-internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postiz -d postiz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  postiz-redis:
+    image: redis:7.2
+    container_name: postiz-redis
+    restart: unless-stopped
+    mem_limit: 256m
+    volumes:
+      - postiz-redis:/data
+    networks: [postiz-internal]
+  postiz-temporal:
+    image: temporalio/auto-setup:1.25.2
+    container_name: postiz-temporal
+    restart: unless-stopped
+    mem_limit: 1024m
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_SEEDS=postiz-postgres
+      - POSTGRES_USER=postiz
+      - POSTGRES_PWD=f6459bbf4898d5e99d98c1ceb99ac366
+      - DBNAME=temporal
+      - VISIBILITY_DBNAME=temporal_visibility
+      - SKIP_ADD_CUSTOM_SEARCH_ATTRIBUTES=true
+    networks: [postiz-internal]
+    depends_on: [postiz-postgres]

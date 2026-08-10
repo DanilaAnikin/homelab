@@ -1,0 +1,10 @@
+FROM ghcr.io/gitroomhq/postiz-app:v2.11.3
+# Fix: nové LinkedIn appky nedostanou legacy r_basicprofile; Postiz ho ale posílá
+# a LinkedIn pak celý OAuth odmítne. Osobní provider omezíme na scopes, co appka má.
+RUN set -e; \
+  for f in $(find /app -name 'linkedin.provider.js' -not -path '*/node_modules/*'); do \
+    sed -i "/'r_basicprofile',/d;/'r_organization_social',/d;/'rw_organization_admin',/d;/'w_organization_social',/d" "$f"; \
+  done; \
+  for f in $(find /app -name 'linkedin.page.provider.js' -not -path '*/node_modules/*'); do \
+    sed -i "/'r_basicprofile',/d" "$f"; \
+  done
