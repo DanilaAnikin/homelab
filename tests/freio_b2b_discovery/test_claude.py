@@ -6,11 +6,13 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from helpers import research_bytes
 
 from freio_b2b_discovery.discovery import (
     MAX_PROMPT_BYTES,
+    _load_anthropic_api_key,
     run_claude_discovery,
 )
 from freio_prospecting.common import ValidationError
@@ -148,6 +150,28 @@ class ClaudeDiscoveryTests(unittest.TestCase):
                             timeout_seconds=10,
                         )
                     self.assertFalse((state_home / "record.json").exists())
+
+    def test_accepts_systemd_delivered_key_only_from_exact_credential_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _binary, _prompt, _schema, credential, _state_home, api_key = self._fixture(
+                root
+            )
+            os.chmod(credential, 0o440)
+            with patch.dict(os.environ):
+                os.environ.pop("CREDENTIALS_DIRECTORY", None)
+                with self.assertRaises(ValidationError):
+                    _load_anthropic_api_key(credential)
+            with patch.dict(
+                os.environ,
+                {"CREDENTIALS_DIRECTORY": str(credential.parent)},
+            ):
+                self.assertEqual(_load_anthropic_api_key(credential), api_key)
+                os.chmod(credential, 0o640)
+                with self.assertRaises(ValidationError):
+                    _load_anthropic_api_key(credential)
 
 
 if __name__ == "__main__":
