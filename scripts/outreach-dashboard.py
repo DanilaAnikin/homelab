@@ -27,7 +27,7 @@ MAIL_DB = ("launchmail-postgres", "postgres", "launchmail")
 BRANDS = ["auto", "bistro", "dental", "fit", "salon", "vet"]
 BRAND_LABEL = {"auto": "AutoLocal", "bistro": "BistroLocal", "dental": "DentalLocal",
                "fit": "FitLocal", "salon": "SalonLocal", "vet": "VetLocal"}
-DAILY_CAP = 3  # must match DAILY_CAP in bot-orchestrator.py
+DAILY_CAP = 5  # must match DAILY_CAP in bot-orchestrator.py
 
 # Prospects that never got as far as an email are attrition, not breakage:
 # a place with no website or no published address was simply not reachable.
@@ -209,6 +209,24 @@ def inbound(limit=300, search=None):
         ORDER BY i.received_at DESC LIMIT {int(limit)}
     """, ncols=10)
     return rows, num(total)
+
+
+def subject_variants():
+    """Which subject-line strategy earns the open, and the click.
+
+    'gap' leads with a defect found in the profile, 'rival' with a named
+    neighbour doing better. Rows sent before the split have a null variant and
+    are excluded — attributing them to either arm would invent a result.
+    """
+    return q(APP_DB, """
+        SELECT subject_variant,
+               count(*),
+               count(*) FILTER (WHERE opened_at IS NOT NULL),
+               count(*) FILTER (WHERE clicked_at IS NOT NULL)
+        FROM outreach_prospects
+        WHERE subject_variant IS NOT NULL AND sent_at IS NOT NULL
+        GROUP BY 1 ORDER BY 1
+    """, ncols=4)
 
 
 def waiting():
@@ -545,6 +563,26 @@ def render_home():
     b.append('<p class="note">„Nedosažitelných“ = firma nemá web nebo se nepodařilo najít e-mail; '
              "to není chyba systému, jen přirozený odpad při prospektování. Sloupec „Chyb“ jsou "
              "skutečná selhání odeslání.</p>")
+
+    variants = subject_variants()
+    VLABEL = {"gap": "Nedostatek z auditu", "rival": "Srovnání s konkurencí"}
+    b.append("<h2>Varianty předmětu</h2>")
+    if not variants:
+        b.append('<div class="empty">Zatím nic — měření začíná dalším odeslaným e-mailem.</div>')
+    else:
+        b.append('<div class="tw"><table><thead><tr><th>Strategie</th><th>Odesláno</th>'
+                 "<th>Otevřeno</th><th>Prokliků</th></tr></thead><tbody>")
+        for key, sent, opened, clicked in variants:
+            n = num(sent)
+            b.append(f"<tr><td><strong>{E(VLABEL.get(key, key))}</strong></td>"
+                     f'<td class="n">{n}</td>'
+                     f'<td class="n">{opened} <span class="tag">{pct(opened, n)} %</span></td>'
+                     f'<td class="n">{clicked} <span class="tag">{pct(clicked, n)} %</span></td></tr>')
+        b.append("</tbody></table></div>")
+        total = sum(num(v[1]) for v in variants)
+        if total < 100:
+            b.append(f'<p class="note">Zatím {total} e-mailů — na závěr je to málo. '
+                     "Rozdíl pod několika stovkami odeslaných je šum, ne výsledek.</p>")
 
     b.append("<h2>Kontrolky</h2><dl class='grid'>")
     for label, value, bad in health():
