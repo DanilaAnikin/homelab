@@ -15,7 +15,19 @@
 set -uo pipefail
 
 PROJECT="${1:?usage: farm-deploy.sh <project> [request_id]}"
+# Whitelist tvaru jména PŘED čímkoliv dalším. Jméno teče do SQL i do cest, a
+# přichází z volného textového sloupce deploy_requests.project. Escape v report()
+# je druhá vrstva; tohle je první a odmítne i mezery (word splitting jinde).
+if [[ ! "$PROJECT" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+  echo "[farm-deploy] ✗ neplatné jméno projektu '${PROJECT:0:60}' (povoleno jen a-z, 0-9, pomlčka)" >&2
+  exit 2
+fi
 REQ_ID="${2:-}"
+# Totéž pro id requestu — jde do SQL v report() bez escapu.
+if [[ -n "${2:-}" && ! "$2" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+  echo "[farm-deploy] ✗ neplatné request_id" >&2
+  exit 2
+fi
 DRY_RUN="${DRY_RUN:-0}"
 FARM_ENV="/srv/homelab/compose/agent-farm/app/.env"
 LOG_TAG="[farm-deploy:$PROJECT]"
@@ -41,10 +53,15 @@ sql_escape(){ printf '%s' "$1" | sed "s/'/''/g"; }
 report(){ # status detail  → deploy_requests (když REQ_ID) + vždy event
   local status="$1" detail="$2"
   local esc; esc="$(sql_escape "${detail:0:2000}")"
+  # $PROJECT MUSÍ být escapovaný jako $detail: pochází z deploy_requests.project,
+  # což je volný text bez FK, a DBQ jede jako superuser. Bez escapu = SQL injekce
+  # spustitelná i na cestě „neznámý projekt" (die → report proběhne dřív, než
+  # registr cokoliv odmítne).
+  local pesc; pesc="$(sql_escape "$PROJECT")"
   if [[ -n "$REQ_ID" ]]; then
     DBQ "update deploy_requests set status='$status', detail='$esc', commit_sha='${DEPLOYED_SHA:-}', finished_at=case when '$status' in ('done','failed') then now() else finished_at end, started_at=coalesce(started_at,now()) where id='$REQ_ID';" >/dev/null || true
   fi
-  DBQ "insert into events(project_id, level, type, message) select id, case when '$status'='failed' then 'error' else 'info' end, 'deploy_$status', '$esc' from projects where name='$PROJECT';" >/dev/null || true
+  DBQ "insert into events(project_id, level, type, message) select id, case when '$status'='failed' then 'error' else 'info' end, 'deploy_$status', '$esc' from projects where name='$pesc';" >/dev/null || true
 }
 
 # --- Registr projektů: repo | prod_dir | compose_file(rel) | compose_project | health_url
@@ -155,7 +172,15 @@ TS="$(date +%Y%m%dT%H%M%SZ)"
 sudo mkdir -p "$BACKUP_ROOT"
 BACKUP_TAR="$BACKUP_ROOT/${PROJECT}-preploy-${TS}.tar.gz"
 if [[ "$DRY_RUN" != "1" ]]; then
-  sudo tar --exclude='*/node_modules' --exclude='*/.next' --exclude='*/volumes' -czf "$BACKUP_TAR" -C "$(dirname "$PROD_DIR")" "$(basename "$PROD_DIR")" 2>/dev/null && log "záloha: $BACKUP_TAR" || log "varování: záloha se nepovedla"
+  # Selhání zálohy = KONEC, ne varování. Bez taru je `rollback_tar` prázdné gesto
+  # (rozbalí neexistující soubor přes `|| true` a nahodí compose nad rozbitým
+  # stromem) — tzn. právě ve chvíli, kdy je rollback potřeba, žádný neexistuje.
+  if ! sudo tar --exclude='*/node_modules' --exclude='*/.next' --exclude='*/volumes' \
+       -czf "$BACKUP_TAR" -C "$(dirname "$PROD_DIR")" "$(basename "$PROD_DIR")" 2>/dev/null; then
+    die "záloha prod adresáře selhala — NEnasazuji (bez zálohy není rollback)"
+  fi
+  [[ -s "$BACKUP_TAR" ]] || die "záloha je prázdná ($BACKUP_TAR) — NEnasazuji"
+  log "záloha: $BACKUP_TAR"
 fi
 
 PREV_SHA=""

@@ -3,6 +3,16 @@
 # 'running' a spustí farm-deploy.sh <project> <id>. Běží ze systemd timeru á 30 s.
 set -uo pipefail
 DBQ(){ sudo docker exec -i agentfarm-supabase-db-1 psql -U postgres -tAc "$1" 2>/dev/null; }
+
+# REAPER: když farm-deploy umře tvrdě (OOM, reboot, systemctl stop) mezi claimem
+# a zápisem výsledku, řádek zůstane 'running' NAVŽDY → tlačítko v dashboardu je
+# trvale zablokované ("Deploy už probíhá") a auto-deploy ten projekt navždy
+# přeskakuje. Nic jiného takový řádek neuklidí.
+DBQ "update deploy_requests set status='failed',
+       detail=coalesce(detail,'')||' [reaper: proces nedoběhl do 2 h]',
+       finished_at=now()
+     where status='running' and started_at < now() - interval '2 hours';" >/dev/null || true
+
 CLAIM="with c as (select id, project from deploy_requests where status='pending' order by requested_at limit 1 for update skip locked) update deploy_requests d set status='running', started_at=now() from c where d.id=c.id returning d.id||'|'||d.project;"
 # grep -m1 '|' → jen datový řádek (ignoruje případný command-tag "UPDATE 1")
 ROW="$(DBQ "$CLAIM" | grep -m1 '|')"
