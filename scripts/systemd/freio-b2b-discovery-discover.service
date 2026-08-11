@@ -3,6 +3,7 @@ Description=Freio B2B public-source discovery (no intake credential)
 Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
 After=network-online.target
 Wants=network-online.target
+OnFailure=notify-failure@freio-b2b-discovery-discover.service
 ConditionPathExists=/etc/freio-b2b-discovery/enabled/discover
 ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/ready
 ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/deferred/discovery

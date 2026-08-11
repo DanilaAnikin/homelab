@@ -30,6 +30,11 @@ class SystemdContractTests(unittest.TestCase):
                 self.assertIn("PrivateDevices=true", unit)
                 self.assertIn("CapabilityBoundingSet=\n", unit)
                 self.assertIn("SystemCallFilter=@system-service", unit)
+                expected_unit = f"freio-b2b-discovery-{name}"
+                self.assertIn(
+                    f"OnFailure=notify-failure@{expected_unit}",
+                    unit,
+                )
                 self.assertNotIn("WantedBy=", unit)
 
     def test_discovery_and_submit_credentials_are_process_separated(self) -> None:

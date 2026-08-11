@@ -13,6 +13,7 @@ from helpers import (
 from freio_b2b_discovery.model import (
     FETCHER_VERSION,
     build_verified_envelope,
+    is_relevant_secondary_school_legal_name,
     parse_research_document,
     validate_intake_envelope,
     validate_success_response,
@@ -29,10 +30,66 @@ class ModelContractTests(unittest.TestCase):
         self.assertEqual(parsed[0].name, "Doučování Příklad s.r.o.")
         self.assertEqual(parsed[0].legal_form, "sro")
 
-    def test_rejects_school_red_izo_unknown_fields_and_noncanonical_urls(self) -> None:
+    def test_accepts_only_explicit_relevant_school_legal_entities(self) -> None:
+        school_variants = (
+            (
+                "Střední škola Příklad, příspěvková organizace",
+                "prispevkova_organizace",
+            ),
+            (
+                "Gymnázium Příklad, státní příspěvková organizace",
+                "statni_prispevkova_organizace",
+            ),
+            (
+                "Obchodní akademie Příklad, školská právnická osoba",
+                "skolska_pravnicka_osoba",
+            ),
+            ("Gymnázium Příklad s.r.o.", "sro"),
+        )
+        for legal_name, legal_form in school_variants:
+            with self.subTest(legal_form=legal_form):
+                value = research_document()
+                lead = value["candidates"][0]["lead"]  # type: ignore[index]
+                lead.update(  # type: ignore[union-attr]
+                    {
+                        "leadType": "school",
+                        "name": legal_name,
+                        "legalForm": legal_form,
+                    }
+                )
+                parsed = parse_research_document(value)
+                self.assertEqual(parsed[0].lead_type, "school")
+                self.assertTrue(is_relevant_secondary_school_legal_name(legal_name))
+        self.assertFalse(
+            is_relevant_secondary_school_legal_name("FooéGymnázium Příklad s.r.o.")
+        )
+        self.assertFalse(
+            is_relevant_secondary_school_legal_name("Gymnáziumák Příklad s.r.o.")
+        )
+
+    def test_rejects_unsafe_school_red_izo_unknown_fields_and_urls(self) -> None:
         invalid_documents = []
         for lead_change in (
             {"leadType": "school"},
+            {
+                "leadType": "company",
+                "name": "Gymnázium Příklad s.r.o.",
+            },
+            {
+                "leadType": "company",
+                "name": "Vzdělávání Příklad, příspěvková organizace",
+                "legalForm": "prispevkova_organizace",
+            },
+            {
+                "leadType": "school",
+                "name": "Gymnázium Příklad, státní příspěvková organizace",
+                "legalForm": "prispevkova_organizace",
+            },
+            {
+                "leadType": "school",
+                "name": "Gymnázium Příklad, Nestátní příspěvková organizace",
+                "legalForm": "statni_prispevkova_organizace",
+            },
             {"redIzo": "600012345"},
             {"name": "Jan Novák OSVČ s.r.o.", "legalForm": "sro"},
             {"name": "Pouhá značka", "legalForm": "sro"},
@@ -145,6 +202,26 @@ class ModelContractTests(unittest.TestCase):
         self.assertNotIn("consent", serialized)
         self.assertNotIn("director", serialized)
         self.assertNotIn("owner", serialized)
+
+    def test_builds_inert_school_envelope_without_red_izo(self) -> None:
+        school = candidate(
+            lead_type="school",
+            name="Gymnázium Příklad, příspěvková organizace",
+            legal_form="prispevkova_organizace",
+            category="gymnázium",
+        )
+        evidence = fetched_document(
+            legal_name="Gymnázium Příklad, příspěvková organizace"
+        )
+        envelope = build_verified_envelope(school, evidence, evidence)
+        validate_intake_envelope(envelope)
+        lead = envelope["items"][0]["lead"]
+        self.assertEqual(lead["leadType"], "school")
+        self.assertEqual(lead["legalForm"], "prispevkova_organizace")
+        self.assertNotIn("redIzo", lead)
+        serialized = repr(envelope).lower()
+        self.assertNotIn("authorization", serialized)
+        self.assertNotIn("send", serialized)
 
     def test_tampered_receipt_evidence_or_unknown_field_fails(self) -> None:
         envelope = build_verified_envelope(

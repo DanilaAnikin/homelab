@@ -31,6 +31,10 @@ class SystemdContractTests(unittest.TestCase):
         self.assertNotIn("EnvironmentFile=", self.service)
         self.assertNotIn("worker-id", self.service.lower())
         self.assertNotIn("--endpoint", self.service)
+        self.assertIn(
+            "OnFailure=notify-failure@freio-b2b-agent.service",
+            self.service,
+        )
 
     def test_service_has_expected_sandbox(self) -> None:
         for directive in [

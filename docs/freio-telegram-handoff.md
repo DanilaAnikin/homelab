@@ -26,7 +26,10 @@ Před vytvořením markeru musí být splněno vše:
 Token, chat ID ani machine secret nesmí být v argumentech procesu, běžných
 proměnných prostředí nebo logu. Jednotka je načítá pouze přes systemd
 `LoadCredential=`. Sandbox navíc procesu výslovně skrývá starý tokenový soubor
-i obecný adresář Homelab secrets.
+i obecný adresář Homelab secrets. Nenulový výsledek dispatcheru i samostatného
+health-checku spadne přes `OnFailure=` do existujícího obecného
+`notify-failure@.service`; žádný z těchto alertů nepřenáší původní e-mailový
+obsah.
 
 ## Instalace bez aktivace
 
@@ -35,10 +38,16 @@ Spouštět z kořene repozitáře na Homelabu:
 ```bash
 sudo install -D -m 0755 scripts/freio_telegram_handoff/dispatcher.py \
   /usr/local/libexec/freio-telegram-handoff
+sudo install -D -m 0755 scripts/freio_telegram_handoff/health.py \
+  /usr/local/libexec/freio-telegram-handoff-health
 sudo install -D -m 0644 scripts/systemd/freio-telegram-handoff.service \
   /etc/systemd/system/freio-telegram-handoff.service
 sudo install -D -m 0644 scripts/systemd/freio-telegram-handoff.timer \
   /etc/systemd/system/freio-telegram-handoff.timer
+sudo install -D -m 0644 scripts/systemd/freio-telegram-handoff-health.service \
+  /etc/systemd/system/freio-telegram-handoff-health.service
+sudo install -D -m 0644 scripts/systemd/freio-telegram-handoff-health.timer \
+  /etc/systemd/system/freio-telegram-handoff-health.timer
 sudo install -d -o root -g root -m 0700 /etc/freio-telegram-handoff
 sudo systemctl daemon-reload
 ```
@@ -59,7 +68,9 @@ sudo install -o root -g root -m 0600 /dev/null \
 sudoedit /etc/freio-telegram-handoff/freio-machine-secret
 sudo systemd-analyze verify \
   /etc/systemd/system/freio-telegram-handoff.service \
-  /etc/systemd/system/freio-telegram-handoff.timer
+  /etc/systemd/system/freio-telegram-handoff.timer \
+  /etc/systemd/system/freio-telegram-handoff-health.service \
+  /etc/systemd/system/freio-telegram-handoff-health.timer
 ```
 
 Ověřit oprávnění bez čtení obsahu:
@@ -76,7 +87,8 @@ Očekávání: oba adresáře `700 root:root`, credential soubory `600 root:root
 
 ## Přesný síťový kontrakt
 
-Claim je `POST` bez body na
+Claim je `POST` s canonical JSON tělem `{}` a hlavičkou
+`Content-Type: application/json` na
 `https://outreach.freio.cz/api/internal/b2b-agent/notifications/claim` s
 dedikovaným Bearer machine secretem. Úspěch je HTTP 200 `application/json` a
 přesně jeden top-level klíč:
@@ -85,8 +97,9 @@ přesně jeden top-level klíč:
 {"notification":null}
 ```
 
-nebo objekt s přesnými klíči `id`, `claimId`, `eventId`, `kind`,
-`actionSummary`, `deepLink`.
+nebo objekt s přesnými klíči `id`, `claimId`, `eventId`, `kind`, `priority`,
+`actionSummary`, `deepLink`. `priority` je přesně jeden z enumů `low`, `normal`,
+`high`, `urgent`; žádný volný text se nepřenáší.
 Všechny tři identifikátory musí být kanonické UUID. Historicky pojmenované
 `eventId` v tomto kontraktu vždy obsahuje UUID konverzace. Dispatcher povolí
 jen tento deep link na celé vlákno, bez dalších parametrů, jiné cesty nebo
@@ -118,11 +131,41 @@ Obsahuje `notificationId`, `claimId`, `outcome` a jen relevantní volitelné pol
 Úspěch je HTTP 200 `application/json` s `{"success":true}`. Opakování stejného
 finalize po ztracené odpovědi musí vrátit stejný úspěch.
 
-Telegram zpráva neobsahuje PII. Dispatcher mapuje `kind` na krátkou akci a
-`intent` na deterministický popis potřeby klienta. Dále zobrazí jen počet
-nabídek, případnou poslední cenu v CZK a jediný výše allowlistovaný Tailnet
-deep link na celé vlákno. Text e-mailu ani modelové shrnutí nepřijímá.
+Telegram zpráva neobsahuje PII. Dispatcher mapuje `kind` na krátkou akci,
+`priority` na český allowlistovaný štítek a `intent` na deterministický popis
+potřeby klienta. Dále zobrazí jen počet nabídek, případnou poslední cenu v CZK a
+jediný výše allowlistovaný Tailnet deep link na celé vlákno. Text e-mailu ani
+modelové shrnutí nepřijímá.
 Redirecty a proxy z prostředí jsou zakázané.
+
+## Privátní heartbeat a health-check
+
+Každý dokončený běh dispatcheru atomicky přepíše
+`/var/lib/freio-telegram-handoff/heartbeat-v1.json`. Soubor má mód `0600` uvnitř
+`0700` systemd `StateDirectory` a obsahuje přesně jen verzi, UTC čas na sekundy a
+jeden stav `idle`, `sent`, `retry` nebo `error`. Neobsahuje UUID, URL, e-mail,
+chat ID, provider ID, credential ani text zprávy. Zápis probíhá pod stejným
+zámkem jako běh workeru a je fsyncnutý před návratem služby.
+
+Protože dispatcher používá `DynamicUser=true`, systemd mapuje tuto stabilní
+cestu přes svůj symlink na privátní backing adresář
+`/var/lib/private/freio-telegram-handoff`. Dispatcher povoluje pouze toto přesné
+systemd mapování; jiný symlink odmítne. Root-only health služba čte přímo
+privátní backing cestu.
+
+Root-only health služba nečte Telegram ani Freio credential. Pokud existuje
+bezpečný aktivační marker, ověří přes systemd, že
+`freio-telegram-handoff.timer` je active, heartbeat má přesný privátní formát,
+není více než 10 minut starý ani nepřiměřeně v budoucnosti a poslední stav je
+`idle` nebo `sent`. Chybějící, poškozený či starý heartbeat a stavy `retry` nebo
+`error` ukončí health službu nenulově. `OnFailure=` pak použije existující
+`notify-failure@.service`; health log obsahuje pouze obecný event, stav a stáří
+v sekundách.
+
+Health služba potřebuje pouze `CAP_DAC_READ_SEARCH`, aby mohla přečíst privátní
+StateDirectory dynamického uživatele. Nemá síťové address family, credentialy
+ani zápis do systému. Health timer je stejně jako dispatcher timer po instalaci
+vypnutý a nesmí se zapnout před úspěšným interním canary.
 
 ## Řízená aktivace
 
@@ -142,15 +185,21 @@ ověření canary zapnout timer:
 
 ```bash
 sudo systemctl enable --now freio-telegram-handoff.timer
-systemctl list-timers freio-telegram-handoff.timer --no-pager
+sudo systemctl start freio-telegram-handoff-health.service
+sudo systemctl enable --now freio-telegram-handoff-health.timer
+systemctl list-timers \
+  freio-telegram-handoff.timer \
+  freio-telegram-handoff-health.timer --no-pager
 ```
 
 ## Chování chyb
 
-- Timeout nebo nejednoznačný transport po Telegram requestu se finalizuje jako
-  `uncertain`; stejná zpráva se už znovu neposílá.
-- HTTP 408, 425, 429 a 5xx se finalizují jako `retry`. `retry_after` se
-  respektuje v rozsahu 30 až 86400 sekund.
+- Timeout, nejednoznačný transport, HTTP 408/425 nebo 5xx po Telegram requestu
+  se finalizuje jako `uncertain` a otevře circuit; stejná zpráva ani další claim
+  se bez operátorské reconciliation znovu neposílá.
+- Pouze jistě pre-send síťová nedostupnost a striktně validovaný Telegram
+  `429` JSON envelope jsou retryable. `retry_after` se respektuje v rozsahu
+  30 až 86400 sekund; nevalidní 429 je `uncertain` a otevře circuit.
 - HTTP 400, 401, 403 a jiné trvalé 4xx se finalizují jako `dead` a otevřou
   circuit breaker.
 - TLS nebo porušení response/deep-link kontraktu failne zavřeně a otevře
@@ -170,6 +219,7 @@ Bezpečné vypnutí je vratné:
 
 ```bash
 sudo systemctl disable --now freio-telegram-handoff.timer
+sudo systemctl disable --now freio-telegram-handoff-health.timer
 sudo mv /etc/freio-telegram-handoff/enabled \
   /etc/freio-telegram-handoff/enabled.disabled
 ```

@@ -5,6 +5,7 @@ Wants=network-online.target
 After=network-online.target tailscaled.service
 ConditionPathExists=/etc/freio-telegram-handoff/enabled
 ConditionFileIsExecutable=/usr/local/libexec/freio-telegram-handoff
+OnFailure=notify-failure@freio-telegram-handoff.service
 
 [Service]
 Type=oneshot

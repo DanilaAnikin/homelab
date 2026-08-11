@@ -16,6 +16,9 @@ import subprocess, time, json, urllib.parse
 
 KUMA = "http://localhost:3001"; USER = "DanilaAnikin"
 COOLDOWN = 1800           # 30 min per incident-key
+# Záměrně pauznuté appky (uživatel je nepoužívá) — self-healing je NIKDY nekřísí,
+# nezávisle na stavu Kuma monitoru. Odeber odsud, až je zas budeš chtít živit.
+PAUSED_APPS = {"loot", "hummy", "classio", "lifeadmin"}
 ERROR_ESCALATE_AFTER = 5  # po tolika chybách pollu eskaluj (~7.5 min)
 INCIDENTS_LOG = "/srv/homelab/self-healing/incidents.log"
 NOTIFY = "/srv/homelab/self-healing/notify.sh"
@@ -88,6 +91,8 @@ def alive_ping():
 
 
 def trigger(key, incident):
+    if any(p in key.lower() for p in PAUSED_APPS):
+        return  # záměrně pauznutá appka — nekřísit
     now = time.time()
     if now - handled.get(key, 0) < COOLDOWN:
         return

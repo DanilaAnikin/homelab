@@ -3,6 +3,7 @@ Description=Freio B2B HMAC intake-only submission
 Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
 After=network-online.target tailscaled.service
 Wants=network-online.target
+OnFailure=notify-failure@freio-b2b-discovery-submit.service
 ConditionPathExists=/etc/freio-b2b-discovery/enabled/submit
 ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/ready
 ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/processing

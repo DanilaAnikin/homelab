@@ -35,7 +35,7 @@ from freio_prospecting.fetcher import (  # noqa: E402
 MAX_CANDIDATES = 10
 MAX_SIGNED_BODY_BYTES = 64 * 1024
 FETCHER_VERSION = "b2b-discovery-1.0.0"
-LEAD_TYPES = frozenset({"tutoring", "company"})
+LEAD_TYPES = frozenset({"tutoring", "company", "school"})
 GENERIC_INBOX_LOCAL_PARTS = frozenset(
     {
         "b2b",
@@ -78,6 +78,16 @@ LEGAL_FORMS = frozenset(
         "ks",
         "nadace",
         "nadacni_fond",
+        "prispevkova_organizace",
+        "statni_prispevkova_organizace",
+        "skolska_pravnicka_osoba",
+    }
+)
+SCHOOL_ONLY_LEGAL_FORMS = frozenset(
+    {
+        "prispevkova_organizace",
+        "statni_prispevkova_organizace",
+        "skolska_pravnicka_osoba",
     }
 )
 LEGAL_FORM_PATTERNS = {
@@ -97,7 +107,23 @@ LEGAL_FORM_PATTERNS = {
     "ks": re.compile(r"(?:\bk\s*\.\s*s\s*\.|komanditní společnost)", re.IGNORECASE),
     "nadace": re.compile(r"\bnadace\b", re.IGNORECASE),
     "nadacni_fond": re.compile(r"\bnadační fond\b", re.IGNORECASE),
+    "prispevkova_organizace": re.compile(r"\bpříspěvková organizace\b", re.IGNORECASE),
+    "statni_prispevkova_organizace": re.compile(
+        r"\bstátní příspěvková organizace\b", re.IGNORECASE
+    ),
+    "skolska_pravnicka_osoba": re.compile(
+        r"\bškolská právnická osoba\b", re.IGNORECASE
+    ),
 }
+SCHOOL_LEGAL_NAME_MARKER = re.compile(
+    r"(?:\bgymn[áa]zium\b"
+    r"|\bstřední(?: odborná| průmyslová| zdravotnická| pedagogická| umělecká"
+    r"| zemědělská| lesnická| technická| hotelová| soukromá| veřejná)? škola\b"
+    r"|\bstřední odborné učiliště\b"
+    r"|\bobchodní akademie\b"
+    r"|\bkonzervatoř\b)",
+    re.IGNORECASE,
+)
 NATURAL_PERSON_MARKERS = re.compile(
     r"\b(?:osvč|osvc|živnostník|zivnostnik|fyzická osoba|fyzicka osoba)\b",
     re.IGNORECASE,
@@ -153,7 +179,35 @@ def normalize_email(value: object, field: str) -> str:
 
 def _has_legal_form(value: str, legal_form: str) -> bool:
     pattern = LEGAL_FORM_PATTERNS.get(legal_form)
-    return pattern is not None and pattern.search(value) is not None
+    if pattern is None or pattern.search(value) is None:
+        return False
+    if legal_form == "prispevkova_organizace":
+        return (
+            LEGAL_FORM_PATTERNS["statni_prispevkova_organizace"].search(value) is None
+        )
+    return True
+
+
+def is_relevant_secondary_school_legal_name(value: str) -> bool:
+    normalized = " ".join(unicodedata.normalize("NFKC", value).split())
+    return SCHOOL_LEGAL_NAME_MARKER.search(normalized) is not None
+
+
+def _validate_school_scope(
+    lead_type: str,
+    legal_name: str,
+    legal_form: str,
+    field: str,
+) -> None:
+    school_name = is_relevant_secondary_school_legal_name(legal_name)
+    if lead_type == "school" and not school_name:
+        raise ValidationError(
+            f"{field}.name must explicitly identify a relevant secondary school"
+        )
+    if lead_type != "school" and (school_name or legal_form in SCHOOL_ONLY_LEGAL_FORMS):
+        raise ValidationError(
+            f"{field}.leadType must be school for a school legal entity"
+        )
 
 
 def is_valid_czech_ico(value: str) -> bool:
@@ -250,8 +304,11 @@ def parse_research_document(value: object) -> tuple[Candidate, ...]:
         )
         lead_type = raw_lead["leadType"]
         if not isinstance(lead_type, str) or lead_type not in LEAD_TYPES:
-            raise ValidationError(f"{field}.lead.leadType must be tutoring or company")
-        # RED-IZO and school imports are deliberately absent from this schema.
+            raise ValidationError(
+                f"{field}.lead.leadType must be tutoring, company or school"
+            )
+        # RED-IZO is deliberately absent: official website evidence is bound
+        # to the Czech legal entity through its exact name, form and IČO.
         name = require_text(raw_lead["name"], f"{field}.lead.name", 2, 120)
         website = _canonical_website(raw_lead["website"], f"{field}.lead.website")
         ico = require_text(raw_lead["ico"], f"{field}.lead.ico", 8, 8)
@@ -268,6 +325,7 @@ def parse_research_document(value: object) -> tuple[Candidate, ...]:
             )
         if NATURAL_PERSON_MARKERS.search(name):
             raise ValidationError(f"{field}.lead.name identifies a natural person")
+        _validate_school_scope(lead_type, name, legal_form, f"{field}.lead")
         category = _optional_text(
             raw_lead.get("category"), f"{field}.lead.category", 1, 120
         )
@@ -558,6 +616,12 @@ def validate_intake_envelope(value: object) -> dict[str, Any]:
         raise ValidationError("intake legal name does not contain its legal form")
     if NATURAL_PERSON_MARKERS.search(legal_name):
         raise ValidationError("intake legal name identifies a natural person")
+    _validate_school_scope(
+        lead["leadType"],
+        legal_name,
+        legal_form,
+        "intake.items[0].lead",
+    )
     contact = require_object(item["contact"], "intake.items[0].contact")
     require_exact_keys(
         contact,

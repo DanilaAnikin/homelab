@@ -20,7 +20,7 @@
             "additionalProperties": false,
             "required": ["leadType", "name", "website", "ico", "legalForm"],
             "properties": {
-              "leadType": { "enum": ["tutoring", "company"] },
+              "leadType": { "enum": ["tutoring", "company", "school"] },
               "name": { "type": "string", "minLength": 2, "maxLength": 120 },
               "website": {
                 "type": "string",
@@ -44,7 +44,10 @@
                   "vos",
                   "ks",
                   "nadace",
-                  "nadacni_fond"
+                  "nadacni_fond",
+                  "prispevkova_organizace",
+                  "statni_prispevkova_organizace",
+                  "skolska_pravnicka_osoba"
                 ]
               },
               "category": { "type": "string", "minLength": 1, "maxLength": 120 },

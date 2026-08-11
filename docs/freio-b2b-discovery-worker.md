@@ -1,8 +1,8 @@
 # Freio B2B discovery worker V1
 
-Tato větev hledá veřejné potenciální B2B zákazníky Freio, primárně české
-doučovací, jazykové a komerčně vzdělávací právnické osoby. Je pouze discovery +
-intake:
+Tato větev hledá veřejné potenciální B2B zákazníky Freio: české doučovací,
+jazykové a komerčně vzdělávací právnické osoby a samostatně velmi konzervativní
+podmnožinu provozovatelů relevantních SŠ/gymnázií. Je pouze discovery + intake:
 nikdy neposílá e-mail, nevyplňuje formulář, nedomlouvá cenu, nevytváří souhlas,
 autorizaci kontaktu ani outreach zprávu. Nový lead na straně Freio zůstává
 `stage=new`, `outreach_status=not_enrolled`.
@@ -14,6 +14,12 @@ inertních leadů `new/not_enrolled` a idempotentní opakování zpracovalo 0. O
 discovery nevznikla žádná initial-outreach authorization ani zpráva; outbound
 gate zůstává `false`/cap `0`. Discover, submit i oba housekeeping timery jsou
 enabled/active. Telegram je samostatná větev a zůstává vypnutý do rotace tokenu.
+
+Rozšíření o školní větev je připravené v kódu, ale není tímto dokumentem
+prohlášeno za nasazené: vyžaduje Freio migraci
+`20260810203000_b2b_discovery_school_scope.sql`, odpovídající release workeru a
+nový bounded canary. Do té doby platí produkční acceptance výše pouze pro
+původní komerční větev.
 
 ## Dvě oddělené bezpečnostní identity
 
@@ -43,9 +49,19 @@ identity index jsou samostatné.
 ## Co worker přijme
 
 - nejvýše 10 kandidátů z jednoho Claude běhu;
-- pouze `leadType=tutoring|company`, nikdy `school` ani RED-IZO;
+- pouze `leadType=tutoring|company|school`; `school` je samostatná fail-closed
+  větev a RED-IZO se nikdy nepřijímá;
 - pouze právnickou osobu s přesným veřejným právním názvem, povinnou allowlisted
   právní formou a povinným IČO, které projde lokálním českým checksumem;
+- u `school` musí přesný právní název sám explicitně obsahovat relevantní typ
+  střední školy (`gymnázium`, `střední … škola`, `střední odborné učiliště`,
+  `obchodní akademie` nebo `konzervatoř`); nestačí značka, marketingový název,
+  registr, zřizovatel ani inference;
+- školní právní formy `prispevkova_organizace`,
+  `statni_prispevkova_organizace` a `skolska_pravnicka_osoba` jsou povolené jen
+  pro `leadType=school` a musí být doslova součástí přesného právního názvu;
+  bezpečné běžné formy jako `sro` mohou být použity také, jsou-li stejně
+  prokázané;
 - veřejnou `legalEntitySourceUrl` na oficiálním webu, kde trusted fetcher ve
   viditelném textu přesně ověří právní název, formu a IČO;
 - nikdy OSVČ, fyzickou osobu, freelancera, osobní jméno, person mailbox ani
@@ -133,8 +149,10 @@ python3 scripts/freio-b2b-discovery/submit.py \
 
 Neaktivovat, dokud současně neplatí:
 
-1. Freio release obsahuje migraci `20260810193000_b2b_discovery_intake.sql` a
-   přesný HMAC handler `/api/internal/b2b-agent/prospect-intake`.
+1. Freio release obsahuje migraci `20260810193000_b2b_discovery_intake.sql`, pro
+   školní větev také forward-only migraci
+   `20260810203000_b2b_discovery_school_scope.sql`, a přesný HMAC handler
+   `/api/internal/b2b-agent/prospect-intake`.
 2. `middleware.ts` explicitně propouští pouze exact `POST` na tento path, HTTPS
    authority `outreach.freio.cz`, bez query. Bez toho vrací private host 404.
 3. Produkční env Freio obsahuje nový a nikde nereusovaný

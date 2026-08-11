@@ -1,6 +1,7 @@
 [Unit]
 Description=Freio B2B submit receipt retention and reconciliation maintenance
 Documentation=file:/srv/homelab/docs/freio-b2b-discovery-worker.md
+OnFailure=notify-failure@freio-b2b-discovery-submit-housekeeping.service
 ConditionPathExists=/etc/freio-b2b-discovery/enabled/submit-housekeeping
 ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/processed
 ConditionPathIsDirectory=/var/lib/freio-b2b-discovery/state

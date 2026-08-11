@@ -33,6 +33,7 @@ CLAIM_URL = "https://outreach.freio.cz/api/internal/b2b-agent/notifications/clai
 FINALIZE_URL = "https://outreach.freio.cz/api/internal/b2b-agent/notifications/finalize"
 TELEGRAM_API_ORIGIN = "https://api.telegram.org"
 STATE_DIRECTORY = Path("/var/lib/freio-telegram-handoff")
+PRIVATE_STATE_DIRECTORY = Path("/var/lib/private/freio-telegram-handoff")
 MAX_RESPONSE_BYTES = 64 * 1024
 HTTP_TIMEOUT_SECONDS = 20
 API_TIMEOUT_SECONDS = 15
@@ -41,6 +42,7 @@ NETWORK_RETRY_SECONDS = 120
 MIN_RETRY_SECONDS = 30
 MAX_RETRY_SECONDS = 86_400
 MESSAGE_HEADING = "Freio outreach"
+HEARTBEAT_STATUSES = frozenset({"idle", "sent", "retry", "error"})
 
 UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
@@ -74,6 +76,7 @@ INTENTS = frozenset(
         "other",
     }
 )
+PRIORITIES = frozenset({"low", "normal", "high", "urgent"})
 ACTION_LABELS = {
     "new_inquiry": "Zkontrolovat novou poptávku a navázat kontakt.",
     "reply_review": "Zkontrolovat odpověď klienta a rozhodnout další krok.",
@@ -93,6 +96,12 @@ INTENT_LABELS = {
     "bounce": "Doručení zprávy selhalo.",
     "ambiguous": "Potřeba klienta není jasná.",
     "other": "Klient má jinou potřebu.",
+}
+PRIORITY_LABELS = {
+    "low": "nízká",
+    "normal": "běžná",
+    "high": "vysoká",
+    "urgent": "urgentní",
 }
 SAFE_UNAVAILABLE_ERRNOS = frozenset(
     {
@@ -291,6 +300,7 @@ class Notification:
     claim_id: str
     event_id: str
     kind: str
+    priority: str
     action_summary: ActionSummary
     deep_link: str
 
@@ -508,6 +518,7 @@ def _parse_notification(value: Any) -> Notification:
         "claimId",
         "eventId",
         "kind",
+        "priority",
         "actionSummary",
         "deepLink",
     }:
@@ -526,6 +537,9 @@ def _parse_notification(value: Any) -> Notification:
         kind = value["kind"]
         if not isinstance(kind, str) or kind not in EVENT_KINDS:
             raise ConfigurationFailure()
+        priority = value["priority"]
+        if not isinstance(priority, str) or priority not in PRIORITIES:
+            raise ConfigurationFailure()
         action_summary = _parse_action_summary(value["actionSummary"])
         expected_link = _canonical_deep_link(event_id)
         if value["deepLink"] != expected_link:
@@ -538,6 +552,7 @@ def _parse_notification(value: Any) -> Notification:
         claim_id=claim_id,
         event_id=event_id,
         kind=kind,
+        priority=priority,
         action_summary=action_summary,
         deep_link=expected_link,
     )
@@ -612,15 +627,36 @@ def load_credentials() -> Credentials:
 
 class StateStore:
     def __init__(self, root: Path = STATE_DIRECTORY) -> None:
-        self.root = Path(os.path.abspath(root))
+        requested_root = Path(os.path.abspath(root))
+        if requested_root.is_symlink() and not self._is_systemd_state_symlink(
+            requested_root
+        ):
+            raise ConfigurationFailure()
+        # Keep the stable /var/lib path inside the DynamicUser mount namespace.
+        # /var/lib/private is the host backing store, not the worker API path.
+        self.root = requested_root
         self.pending_path = self.root / "pending-finalize-v1.json"
         self.circuit_path = self.root / "circuit-open-v1.json"
+        self.heartbeat_path = self.root / "heartbeat-v1.json"
         self.lock_path = self.root / "dispatcher.lock"
+
+    @staticmethod
+    def _is_systemd_state_symlink(path: Path) -> bool:
+        return (
+            path == STATE_DIRECTORY
+            and path.is_symlink()
+            and Path(os.path.realpath(path)) == PRIVATE_STATE_DIRECTORY
+        )
 
     def ensure(self) -> None:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        details = self.root.lstat()
-        if self.root.is_symlink() or not self.root.is_dir() or details.st_mode & 0o077:
+        if self.root.is_symlink():
+            if not self._is_systemd_state_symlink(self.root):
+                raise ConfigurationFailure()
+            details = self.root.stat()
+        else:
+            details = self.root.lstat()
+        if not stat.S_ISDIR(details.st_mode) or details.st_mode & 0o077:
             raise ConfigurationFailure()
 
     def _fsync_root(self) -> None:
@@ -733,6 +769,28 @@ class StateStore:
             {"version": 1, "reason": reason, "openedAt": opened_at},
         )
 
+    def save_heartbeat(
+        self,
+        status: str,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        if status not in HEARTBEAT_STATUSES:
+            raise ConfigurationFailure()
+        timestamp = recorded_at or datetime.now(timezone.utc)
+        if timestamp.tzinfo is None:
+            raise ConfigurationFailure()
+        normalized = timestamp.astimezone(timezone.utc).isoformat(timespec="seconds")
+        if not normalized.endswith("+00:00"):
+            raise ConfigurationFailure()
+        self._atomic_write(
+            self.heartbeat_path,
+            {
+                "version": 1,
+                "status": status,
+                "recordedAt": normalized.removesuffix("+00:00") + "Z",
+            },
+        )
+
 
 class FreioClient:
     def __init__(self, transport: Transport, machine_secret: str) -> None:
@@ -745,11 +803,19 @@ class FreioClient:
         }
 
     def claim(self) -> HttpResponse:
+        # The machine route uses the same bounded JSON boundary as finalize.
+        # Send the one canonical representation of its strict empty object
+        # schema; a zero-byte POST is correctly rejected as unsupported input.
+        body = b"{}"
         return self.transport.request(
             "POST",
             CLAIM_URL,
-            {**self.headers, "Content-Length": "0"},
-            b"",
+            {
+                **self.headers,
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+            body,
             API_TIMEOUT_SECONDS,
         )
 
@@ -776,6 +842,7 @@ def build_telegram_text(notification: Notification) -> str:
     lines = [
         MESSAGE_HEADING,
         f"Akce: {ACTION_LABELS[notification.kind]}",
+        f"Priorita: {PRIORITY_LABELS[notification.priority]}",
     ]
     if notification.action_summary.intent is not None:
         lines.append(f"Potřeba: {INTENT_LABELS[notification.action_summary.intent]}")
@@ -836,22 +903,37 @@ def _bounded_retry(value: int | None, default: int) -> int:
     return min(MAX_RETRY_SECONDS, max(MIN_RETRY_SECONDS, candidate))
 
 
-def _telegram_retry_after(response: HttpResponse, default: int) -> int:
+def _telegram_rate_limit_retry_after(response: HttpResponse) -> int | None:
+    """Return a retry delay only for Telegram's authenticated 429 envelope.
+
+    A bare/intermediary 429 is not enough to prove that sendMessage had no side
+    effect. The direct TLS peer must return Telegram's JSON error contract.
+    """
+    try:
+        value = _read_json_response(response)
+    except ConfigurationFailure:
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("ok") is not False
+        or value.get("error_code") != 429
+    ):
+        return None
+    parameters = value.get("parameters")
+    if parameters is not None and not isinstance(parameters, dict):
+        return None
+    body_retry: int | None = None
+    if isinstance(parameters, dict) and "retry_after" in parameters:
+        candidate = parameters["retry_after"]
+        if not isinstance(candidate, int) or isinstance(candidate, bool):
+            return None
+        body_retry = candidate
     header_value = response.headers.get("retry-after", "")
-    if header_value.isdigit():
-        return _bounded_retry(int(header_value), default)
-    if not response.truncated:
-        try:
-            value = _decode_json(response.body)
-        except ConfigurationFailure:
-            value = None
-        if isinstance(value, dict):
-            parameters = value.get("parameters")
-            if isinstance(parameters, dict):
-                retry_after = parameters.get("retry_after")
-                if isinstance(retry_after, int) and not isinstance(retry_after, bool):
-                    return _bounded_retry(retry_after, default)
-    return _bounded_retry(None, default)
+    header_retry = int(header_value) if header_value.isdigit() else None
+    return _bounded_retry(
+        body_retry if body_retry is not None else header_retry,
+        DEFAULT_RETRY_SECONDS,
+    )
 
 
 def _sent_provider_id(response: HttpResponse) -> str:
@@ -908,12 +990,24 @@ def _telegram_http_finalization(
             outcome="sent",
             provider_message_id=provider_id,
         )
-    if response.status in {408, 425, 429} or 500 <= response.status <= 599:
-        default = 120 if response.status in {408, 425} else DEFAULT_RETRY_SECONDS
+    if response.status == 429:
+        retry_after = _telegram_rate_limit_retry_after(response)
+        if retry_after is None:
+            return build(
+                outcome="uncertain",
+                error_code="telegram_invalid_rate_limit_response",
+                open_circuit=True,
+            )
         return build(
             outcome="retry",
-            error_code=f"telegram_http_{response.status}",
-            retry_after_seconds=_telegram_retry_after(response, default),
+            error_code="telegram_http_429",
+            retry_after_seconds=retry_after,
+        )
+    if response.status in {408, 425} or 500 <= response.status <= 599:
+        return build(
+            outcome="uncertain",
+            error_code=f"telegram_http_{response.status}_ambiguous",
+            open_circuit=True,
         )
     if 300 <= response.status <= 499:
         return build(
@@ -947,6 +1041,21 @@ class Dispatcher:
         self.state = state
         self.freio = freio
         self.telegram = telegram
+        self.last_run_status = "error"
+
+    def _finish(self, status: str, exit_code: int) -> int:
+        if status not in HEARTBEAT_STATUSES:
+            raise ConfigurationFailure()
+        self.last_run_status = status
+        return exit_code
+
+    @staticmethod
+    def _finalization_status(finalization: Finalization) -> str:
+        if finalization.outcome == "sent":
+            return "sent"
+        if finalization.outcome == "retry":
+            return "retry"
+        return "error"
 
     def _finalize_pending(self, pending: Finalization) -> bool:
         try:
@@ -990,14 +1099,14 @@ class Dispatcher:
         if not self._finalize_pending(finalization):
             if self.state.circuit_open():
                 _log("finalize_circuit_open")
-                return 78
+                return self._finish("error", 78)
             _log("finalize_deferred")
-            return 1
+            return self._finish("retry", 1)
         if finalization.open_circuit:
             _log("delivery_circuit_open", outcome=finalization.outcome)
-            return 78
+            return self._finish("error", 78)
         _log("delivery_finalized", outcome=finalization.outcome)
-        return 0
+        return self._finish(self._finalization_status(finalization), 0)
 
     def _invalid_claim(self, error: InvalidClaimPayload) -> int:
         if error.notification_id and error.claim_id:
@@ -1012,44 +1121,44 @@ class Dispatcher:
             )
         self.state.open_circuit("freio_invalid_claim_envelope")
         _log("claim_circuit_open")
-        return 78
+        return self._finish("error", 78)
 
     def run(self) -> int:
         if self.state.circuit_open():
             _log("circuit_open")
-            return 78
+            return self._finish("error", 78)
 
         pending = self.state.load_pending()
         if pending is not None:
             if not self._finalize_pending(pending):
                 if self.state.circuit_open():
                     _log("finalize_recovery_circuit_open")
-                    return 78
+                    return self._finish("error", 78)
                 _log("finalize_recovery_deferred")
-                return 1
+                return self._finish("retry", 1)
             if pending.open_circuit:
                 _log("finalize_recovered_circuit_open")
-                return 78
+                return self._finish("error", 78)
             _log("finalize_recovered")
-            return 0
+            return self._finish(self._finalization_status(pending), 0)
 
         try:
             response = self.freio.claim()
         except (NetworkUnavailable, AmbiguousTransport):
             _log("claim_deferred")
-            return 1
+            return self._finish("retry", 1)
         except TlsValidationFailure:
             self.state.open_circuit("freio_claim_tls_failure")
             _log("claim_circuit_open")
-            return 78
+            return self._finish("error", 78)
 
         if response.status != 200:
             if response.status in {408, 425, 429} or 500 <= response.status <= 599:
                 _log("claim_deferred", status=response.status)
-                return 1
+                return self._finish("retry", 1)
             self.state.open_circuit(f"freio_claim_http_{response.status}")
             _log("claim_circuit_open", status=response.status)
-            return 78
+            return self._finish("error", 78)
 
         try:
             notification = parse_claim_response(response)
@@ -1058,11 +1167,11 @@ class Dispatcher:
         except ConfigurationFailure:
             self.state.open_circuit("freio_claim_invalid_response")
             _log("claim_circuit_open")
-            return 78
+            return self._finish("error", 78)
 
         if notification is None:
             _log("idle")
-            return 0
+            return self._finish("idle", 0)
 
         # Persist a conservative terminal decision before entering the network
         # call. If the process dies anywhere around sendMessage, recovery can
@@ -1086,6 +1195,7 @@ class Dispatcher:
                     claim_id=notification.claim_id,
                     outcome="uncertain",
                     error_code="telegram_timeout_ambiguous",
+                    open_circuit=True,
                 )
             )
         except AmbiguousTransport:
@@ -1095,6 +1205,7 @@ class Dispatcher:
                     claim_id=notification.claim_id,
                     outcome="uncertain",
                     error_code="telegram_transport_ambiguous",
+                    open_circuit=True,
                 )
             )
         except NetworkUnavailable:
@@ -1133,22 +1244,44 @@ class Dispatcher:
         )
 
 
+def run_and_record_heartbeat(dispatcher: Dispatcher) -> int:
+    result = dispatcher.run()
+    dispatcher.state.save_heartbeat(dispatcher.last_run_status)
+    return result
+
+
+def _best_effort_error_heartbeat(state: StateStore) -> None:
+    try:
+        state.save_heartbeat("error")
+    except Exception:
+        # The only caller is already handling a failure. Never shadow its safe
+        # generic log event with a second exception or expose a filesystem path.
+        pass
+
+
 def main() -> int:
     try:
-        credentials = load_credentials()
         state = StateStore()
-        transport = UrllibTransport()
-        dispatcher = Dispatcher(
-            state=state,
-            freio=FreioClient(transport, credentials.freio_machine_secret),
-            telegram=TelegramClient(
-                transport,
-                credentials.telegram_token,
-                credentials.telegram_chat_id,
-            ),
-        )
         with state.lock():
-            return dispatcher.run()
+            try:
+                credentials = load_credentials()
+                transport = UrllibTransport()
+                dispatcher = Dispatcher(
+                    state=state,
+                    freio=FreioClient(transport, credentials.freio_machine_secret),
+                    telegram=TelegramClient(
+                        transport,
+                        credentials.telegram_token,
+                        credentials.telegram_chat_id,
+                    ),
+                )
+                return run_and_record_heartbeat(dispatcher)
+            except ConfigurationFailure:
+                _best_effort_error_heartbeat(state)
+                raise
+            except Exception:
+                _best_effort_error_heartbeat(state)
+                raise
     except AlreadyRunning:
         _log("already_running")
         return 0

@@ -3,6 +3,7 @@ Description=Disabled-by-default Freio B2B inbound classifier
 Documentation=file:/srv/homelab/docs/freio-b2b-agent-worker.md
 After=network-online.target tailscaled.service
 Wants=network-online.target
+OnFailure=notify-failure@freio-b2b-agent.service
 ConditionPathExists=/etc/freio-b2b-agent/enabled/classifier
 
 [Service]

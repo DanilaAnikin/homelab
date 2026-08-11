@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodically verify Freio Telegram handoff liveness
+Documentation=file:/srv/homelab/docs/freio-telegram-handoff.md
+
+[Timer]
+OnBootSec=12min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+AccuracySec=1s
+Persistent=false
+Unit=freio-telegram-handoff-health.service
+
+[Install]
+WantedBy=timers.target

@@ -30,6 +30,18 @@ class DeploymentContractTests(unittest.TestCase):
             self.assertIsNone(unsafe_shell.search(content), source)
             self.assertIsNone(unsafe_python.search(content), source)
 
+    def test_poller_preserves_paused_apps_and_stdin_only_notify(self) -> None:
+        poller = (ROOT / "self-healing/poller.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'PAUSED_APPS = {"loot", "hummy", "classio", "lifeadmin"}',
+            poller,
+        )
+        self.assertIn("if any(p in key.lower() for p in PAUSED_APPS):", poller)
+        self.assertIn(
+            "subprocess.run(\n            [NOTIFY],\n            input=msg,", poller
+        )
+        self.assertNotIn("subprocess.run([NOTIFY, msg]", poller)
+
     def test_socket_transport_owns_credentials_and_is_default_off(self) -> None:
         socket_unit = (
             ROOT / "scripts/systemd/homelab-telegram-notify.socket"

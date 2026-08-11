@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +17,7 @@ from scripts.freio_telegram_handoff.dispatcher import (
     FINALIZE_URL,
     MESSAGE_HEADING,
     AmbiguousTransport,
+    ConfigurationFailure,
     Credentials,
     Dispatcher,
     Finalization,
@@ -27,7 +29,9 @@ from scripts.freio_telegram_handoff.dispatcher import (
     TelegramClient,
     UrllibTransport,
     load_credentials,
+    main as dispatcher_main,
     parse_claim_response,
+    run_and_record_heartbeat,
 )
 
 
@@ -59,6 +63,7 @@ def response(
 def claim_response(
     *,
     kind: str = "reply_review",
+    priority: str = "normal",
     deep_link: str = CONVERSATION_LINK,
     event_id: str = EVENT_ID,
     action_summary: object | None = None,
@@ -80,6 +85,7 @@ def claim_response(
                 "claimId": CLAIM_ID,
                 "eventId": event_id,
                 "kind": kind,
+                "priority": priority,
                 "actionSummary": summary,
                 "deepLink": deep_link,
             }
@@ -161,9 +167,11 @@ class DispatcherTests(unittest.TestCase):
     ) -> tuple[int, FakeFreio, FakeTelegram, str]:
         freio = FakeFreio(claim_effect, finalize_effects)
         telegram = FakeTelegram(telegram_effect)
+        dispatcher = Dispatcher(self.state, freio, telegram)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            result = Dispatcher(self.state, freio, telegram).run()
+            result = dispatcher.run()
+        self.last_run_status = dispatcher.last_run_status
         return result, freio, telegram, output.getvalue()
 
     def test_idle_claim_does_not_touch_telegram_or_finalize(self) -> None:
@@ -175,6 +183,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(telegram.links, [])
         self.assertEqual(freio.finalizations, [])
+        self.assertEqual(self.last_run_status, "idle")
         self.assertIn('"event":"idle"', output)
 
     def test_success_finalizes_provider_message_id_without_logging_ids(self) -> None:
@@ -190,6 +199,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(finalization.outcome, "sent")
         self.assertEqual(finalization.provider_message_id, "91234")
         self.assertFalse(self.state.pending_path.exists())
+        self.assertEqual(self.last_run_status, "sent")
         self.assertNotIn(NOTIFICATION_ID, output)
         self.assertNotIn(EVENT_ID, output)
         self.assertNotIn("outreach.freio.cz", output)
@@ -218,14 +228,33 @@ class DispatcherTests(unittest.TestCase):
             RequestTimedOut(),
         )
 
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 78)
         self.assertEqual(telegram.links, [CONVERSATION_LINK])
         self.assertEqual(freio.finalizations[0].outcome, "uncertain")
         self.assertEqual(
             freio.finalizations[0].error_code,
             "telegram_timeout_ambiguous",
         )
+        self.assertTrue(freio.finalizations[0].open_circuit)
         self.assertFalse(self.state.pending_path.exists())
+        self.assertTrue(self.state.circuit_path.exists())
+        self.assertEqual(self.last_run_status, "error")
+
+    def test_ambiguous_transport_is_uncertain_and_opens_circuit(self) -> None:
+        result, freio, telegram, _ = self.run_dispatcher(
+            claim_response(),
+            AmbiguousTransport(),
+        )
+
+        self.assertEqual(result, 78)
+        self.assertEqual(telegram.links, [CONVERSATION_LINK])
+        self.assertEqual(freio.finalizations[0].outcome, "uncertain")
+        self.assertEqual(
+            freio.finalizations[0].error_code,
+            "telegram_transport_ambiguous",
+        )
+        self.assertTrue(freio.finalizations[0].open_circuit)
+        self.assertTrue(self.state.circuit_path.exists())
 
     def test_network_failure_is_a_delayed_retry(self) -> None:
         result, freio, _, _ = self.run_dispatcher(
@@ -237,13 +266,19 @@ class DispatcherTests(unittest.TestCase):
         finalization = freio.finalizations[0]
         self.assertEqual(finalization.outcome, "retry")
         self.assertEqual(finalization.retry_after_seconds, 120)
+        self.assertEqual(self.last_run_status, "retry")
 
     def test_rate_limit_respects_provider_retry_after(self) -> None:
         result, freio, _, _ = self.run_dispatcher(
             claim_response(),
             response(
                 429,
-                {"ok": False, "parameters": {"retry_after": 731}},
+                {
+                    "ok": False,
+                    "error_code": 429,
+                    "description": "Too Many Requests",
+                    "parameters": {"retry_after": 731},
+                },
             ),
         )
 
@@ -253,15 +288,38 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(finalization.retry_after_seconds, 731)
         self.assertEqual(finalization.error_code, "telegram_http_429")
 
-    def test_server_error_uses_bounded_backoff(self) -> None:
+    def test_invalid_rate_limit_response_is_uncertain_and_opens_circuit(
+        self,
+    ) -> None:
         result, freio, _, _ = self.run_dispatcher(
             claim_response(),
-            response(503, {"ok": False}),
+            response(429, {"ok": False, "parameters": {"retry_after": 731}}),
         )
 
-        self.assertEqual(result, 0)
-        self.assertEqual(freio.finalizations[0].outcome, "retry")
-        self.assertEqual(freio.finalizations[0].retry_after_seconds, 300)
+        self.assertEqual(result, 78)
+        self.assertEqual(freio.finalizations[0].outcome, "uncertain")
+        self.assertEqual(
+            freio.finalizations[0].error_code,
+            "telegram_invalid_rate_limit_response",
+        )
+        self.assertTrue(self.state.circuit_path.exists())
+
+    def test_ambiguous_http_responses_are_uncertain_and_open_circuit(self) -> None:
+        for status in (408, 425, 500, 503, 599):
+            with self.subTest(status=status):
+                with tempfile.TemporaryDirectory() as temporary:
+                    state = StateStore(Path(temporary) / "state")
+                    freio = FakeFreio(claim_response())
+                    telegram = FakeTelegram(response(status, {"ok": False}))
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        result = Dispatcher(state, freio, telegram).run()
+                self.assertEqual(result, 78)
+                self.assertEqual(freio.finalizations[0].outcome, "uncertain")
+                self.assertEqual(
+                    freio.finalizations[0].error_code,
+                    f"telegram_http_{status}_ambiguous",
+                )
+                self.assertTrue(freio.finalizations[0].open_circuit)
 
     def test_telegram_auth_failure_is_dead_and_opens_circuit(self) -> None:
         result, freio, _, _ = self.run_dispatcher(
@@ -468,7 +526,9 @@ class ProtocolAndCredentialTests(unittest.TestCase):
 
         claim_call, finalize_call = transport.calls
         self.assertEqual(claim_call[0:2], ("POST", CLAIM_URL))
-        self.assertEqual(claim_call[3], b"")
+        self.assertEqual(claim_call[3], b"{}")
+        self.assertEqual(claim_call[2]["Content-Type"], "application/json")
+        self.assertEqual(claim_call[2]["Content-Length"], "2")
         self.assertEqual(
             claim_call[2]["Authorization"],
             "Bearer machine-secret-value-for-tests-123456789",
@@ -508,6 +568,7 @@ class ProtocolAndCredentialTests(unittest.TestCase):
             [
                 f"{MESSAGE_HEADING}\n"
                 "Akce: Schválit nebo upravit cenovou nabídku.\n"
+                "Priorita: běžná\n"
                 "Potřeba: Klient potřebuje vyřešit cenu.\n"
                 "Kontext: nabídky: 2 | poslední cena: 240 000 Kč\n"
                 f"Celé vlákno: {CONVERSATION_LINK}"
@@ -548,9 +609,31 @@ class ProtocolAndCredentialTests(unittest.TestCase):
         )
         self.assertNotIn("summary", form["text"][0].lower())
 
+    def test_urgent_priority_is_allowlisted_and_rendered_without_free_text(
+        self,
+    ) -> None:
+        transport = RecordingTransport([telegram_success()])
+        client = TelegramClient(
+            transport,
+            "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijk",
+            "-123456789",
+        )
+        notification = parse_claim_response(claim_response(priority="urgent"))
+        self.assertIsNotNone(notification)
+        self.assertEqual(notification.priority, "urgent")
+
+        client.send(notification)
+
+        form = urllib.parse.parse_qs(
+            transport.calls[0][3].decode("ascii"),
+            strict_parsing=True,
+        )
+        self.assertIn("Priorita: urgentní", form["text"][0])
+
     def test_strict_parser_rejects_extra_or_mismatched_parameters(self) -> None:
         valid = parse_claim_response(claim_response())
         self.assertIsNotNone(valid)
+        self.assertEqual(valid.priority, "normal")
 
         with self.assertRaises(Exception):
             parse_claim_response(
@@ -591,6 +674,8 @@ class ProtocolAndCredentialTests(unittest.TestCase):
                 claim_response(kind="raw_llm_summary", deep_link=CONVERSATION_LINK)
             )
         with self.assertRaises(Exception):
+            parse_claim_response(claim_response(priority="critical"))
+        with self.assertRaises(Exception):
             parse_claim_response(
                 claim_response(
                     kind="new_inquiry",
@@ -607,6 +692,165 @@ class ProtocolAndCredentialTests(unittest.TestCase):
                     body=duplicate_key_body,
                 )
             )
+
+    def test_run_writes_exact_private_pii_free_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = StateStore(Path(temporary) / "state")
+            dispatcher = Dispatcher(
+                state,
+                FakeFreio(response(200, {"notification": None})),
+                FakeTelegram(AssertionError("Telegram must stay idle")),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = run_and_record_heartbeat(dispatcher)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(state.heartbeat_path.stat().st_mode & 0o777, 0o600)
+            heartbeat = json.loads(state.heartbeat_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(heartbeat), {"version", "status", "recordedAt"})
+            self.assertEqual(heartbeat["version"], 1)
+            self.assertEqual(heartbeat["status"], "idle")
+            self.assertRegex(
+                heartbeat["recordedAt"],
+                r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            )
+            raw = state.heartbeat_path.read_text(encoding="utf-8")
+            for forbidden in (
+                NOTIFICATION_ID,
+                CLAIM_ID,
+                EVENT_ID,
+                "https://",
+                "email",
+            ):
+                self.assertNotIn(forbidden, raw)
+
+    def test_run_records_sent_retry_and_error_heartbeat_statuses(self) -> None:
+        scenarios = (
+            (
+                "sent",
+                claim_response(),
+                telegram_success(),
+                [response(200, {"success": True})],
+                0,
+            ),
+            (
+                "retry",
+                NetworkUnavailable(),
+                AssertionError("Telegram must not run"),
+                None,
+                1,
+            ),
+            (
+                "error",
+                claim_response(),
+                response(401, {"ok": False}),
+                [response(200, {"success": True})],
+                78,
+            ),
+        )
+        for (
+            status,
+            claim_effect,
+            telegram_effect,
+            finalize_effects,
+            exit_code,
+        ) in scenarios:
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                state = StateStore(Path(temporary) / "state")
+                dispatcher = Dispatcher(
+                    state,
+                    FakeFreio(claim_effect, finalize_effects),
+                    FakeTelegram(telegram_effect),
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = run_and_record_heartbeat(dispatcher)
+
+                self.assertEqual(result, exit_code)
+                heartbeat = json.loads(state.heartbeat_path.read_text(encoding="utf-8"))
+                self.assertEqual(heartbeat["status"], status)
+
+    def test_main_records_configuration_failure_as_error_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = StateStore(Path(temporary) / "state")
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "scripts.freio_telegram_handoff.dispatcher.StateStore",
+                    return_value=state,
+                ),
+                mock.patch(
+                    "scripts.freio_telegram_handoff.dispatcher.load_credentials",
+                    side_effect=ConfigurationFailure(),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                result = dispatcher_main()
+
+            self.assertEqual(result, 78)
+            self.assertEqual(
+                json.loads(state.heartbeat_path.read_text(encoding="utf-8"))["status"],
+                "error",
+            )
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"event": "configuration_failure"},
+            )
+
+    def test_heartbeat_rejects_unknown_status_and_naive_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = StateStore(Path(temporary) / "state")
+            with self.assertRaises(Exception):
+                state.save_heartbeat("unknown")
+            with self.assertRaises(Exception):
+                state.save_heartbeat("idle", datetime(2026, 8, 11, 0, 0, 0))
+
+            state.save_heartbeat(
+                "sent",
+                datetime(2026, 8, 11, 0, 0, 0, tzinfo=timezone.utc),
+            )
+            self.assertEqual(
+                json.loads(state.heartbeat_path.read_text(encoding="utf-8")),
+                {
+                    "recordedAt": "2026-08-11T00:00:00Z",
+                    "status": "sent",
+                    "version": 1,
+                },
+            )
+
+    def test_state_store_accepts_only_exact_dynamic_user_state_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            public = root / "public-state"
+            private = root / "private-state"
+            private.mkdir(mode=0o700)
+            public.symlink_to(private)
+            with (
+                mock.patch(
+                    "scripts.freio_telegram_handoff.dispatcher.STATE_DIRECTORY",
+                    public,
+                ),
+                mock.patch(
+                    "scripts.freio_telegram_handoff.dispatcher.PRIVATE_STATE_DIRECTORY",
+                    private,
+                ),
+            ):
+                state = StateStore(public)
+                state.ensure()
+                self.assertEqual(state.root, public)
+                self.assertTrue(state.root.is_symlink())
+
+                public.unlink()
+                public.symlink_to(root / "wrong-private-state")
+                with self.assertRaises(Exception):
+                    StateStore(public)
+
+            arbitrary_symlink = root / "arbitrary-state"
+            arbitrary_symlink.symlink_to(private)
+            with self.assertRaises(Exception):
+                StateStore(arbitrary_symlink).ensure()
 
     def test_credentials_are_read_from_files_and_never_need_secret_env_values(
         self,
