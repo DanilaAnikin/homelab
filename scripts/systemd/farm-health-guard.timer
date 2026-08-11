@@ -1,0 +1,10 @@
+[Unit]
+Description=Hodinova kontrola zdravi agent-farmy
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

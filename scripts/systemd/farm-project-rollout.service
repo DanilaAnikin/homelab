@@ -1,0 +1,6 @@
+[Unit]
+Description=agent-farm: postupne zapinani projektu podle zdravi (rollout gate)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/farm-project-rollout.py

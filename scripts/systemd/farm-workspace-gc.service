@@ -1,0 +1,6 @@
+[Unit]
+Description=agent-farm: uklid worktree adresaru po dokoncenych taskach (disk GC)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/farm-workspace-gc.py apply

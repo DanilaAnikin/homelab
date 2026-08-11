@@ -1,0 +1,6 @@
+[Unit]
+Description=agent-farm: hlidac chybove smycky (churn / fan-out / uvaznuty dispatch)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/farm-health-guard.sh
