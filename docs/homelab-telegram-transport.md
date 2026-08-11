@@ -10,8 +10,15 @@ Alertmanager a neodešle testovací zprávu.
 Historický token v `/srv/frem/telegram-token` byl dříve dostupný s příliš
 širokými právy a jeho hodnota se objevila mimo bezpečnou credential hranici.
 Nelze jej považovat za důvěryhodný, ani když má soubor nyní mód `0600`.
-Před aktivací je nutné token rotovat přes BotFather. Starý token se nesmí
-kopírovat do nové cesty ani použít pro canary.
+Je kompromitovaný a jeho použití je zakázané pro Freio, Alertmanager i nový
+Homelab transport. Nesmí se kopírovat do nové cesty ani použít pro canary.
+
+Soubor je však nyní stále aktivním credentialem odděleného izolovaného Frem
+control bota. Pouze tento existující consumer jej smí dočasně používat do své
+samostatné migrace nebo ukončení. Tato omezená výjimka z tokenu znovu nedělá
+důvěryhodný credential a nesmí se rozšířit na žádný další proces. Freio cutover
+tím není blokovaný: Freio, Alertmanager i nový transport používají nový
+kanonický pár v `/etc/homelab-telegram/` a starou cestu mají nepřístupnou.
 
 Také historický Alertmanager config obsahoval konkrétní chat ID v souboru
 sledovaném gitem. Nový config používá `bot_token_file` i `chat_id_file`; žádná
@@ -162,9 +169,20 @@ sudo mv /etc/homelab-telegram/enabled \
   /etc/homelab-telegram/enabled.disabled
 ```
 
-Po prokázaném přechodu všech consumerů odstranit historický revoked tokenový
-soubor `/srv/frem/telegram-token` a tracked hodnotu chat ID opravit také v
-repozitáři `/srv/frem/repo`. Samotné odstranění z aktuálního commitu nemaže
-historii; chat ID považovat za zveřejněné a token za kompromitovaný. Přepis git
-historie je samostatná koordinovaná operace a není podmínkou, pokud byl token
-rotován.
+`/srv/frem/telegram-token` dnes ještě není revoked a nesmí se zatím unlinknout.
+Jeho retirement má pevné pořadí:
+
+1. Oddělený Frem control bot migrovat na vlastní nový credential, nebo jej
+   prokazatelně ukončit.
+2. Teprve potom starý token revoke přes BotFather.
+3. Bez čtení hodnoty ověřit, že cestu nepoužívá žádný consumer, container mount
+   ani otevřený file descriptor. Historické textové zmínky a sandboxové
+   `InaccessiblePaths=` nejsou consumer, ale žádný spustitelný config nesmí
+   starý soubor načítat.
+4. Až po těchto třech gatech odstranit přesně tento soubor pomocí
+   `sudo unlink -- /srv/frem/telegram-token`.
+
+Tracked hodnotu chat ID opravit také v repozitáři `/srv/frem/repo`. Samotné
+odstranění z aktuálního commitu nemaže historii; chat ID považovat za
+zveřejněné a token za kompromitovaný. Přepis git historie je samostatná
+koordinovaná operace a není podmínkou bezpečného Freio cutoveru.
