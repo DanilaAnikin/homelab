@@ -211,6 +211,24 @@ def inbound(limit=300, search=None):
     return rows, num(total)
 
 
+def waiting():
+    """Zprávy, u kterých se bot vědomě zastavil a předal je člověku.
+
+    Tohle je jediná fronta, do které se má chodit ručně. Do 11. 8. v ní leželo
+    40 položek, z toho 39 strojů (DMARC reporty, hlášky z Instagramu, úřední
+    e-podatelny) — a jeden skutečný zájemce, kterého v tom nikdo nenašel.
+    """
+    return q(MAIL_DB, f"""
+        SELECT i.received_at, i.from_address, coalesce(i.from_name,''),
+               coalesce(i.subject,''), coalesce(i.text, i.snippet, ''),
+               coalesce(s.from_address,'')
+        FROM incoming_emails i
+        LEFT JOIN smtp_configs s ON s.id = i.smtp_config_id
+        WHERE {MAIL_SCOPE} AND i.starred AND i.replied_at IS NULL
+        ORDER BY i.received_at DESC LIMIT 100
+    """, ncols=6)
+
+
 def delivery_log(limit=150):
     return q(MAIL_DB, f"""
         SELECT created_at, "to"::text, coalesce(subject,''), status, coalesce(error,'')
@@ -247,7 +265,7 @@ def health():
             SELECT count(*) FROM incoming_emails
             WHERE {MAIL_SCOPE} AND NOT seen AND replied_at IS NULL AND NOT archived
          """, lambda v: num(v) > 0),
-        ("Čeká na tebe (označené)", MAIL_DB,
+        ("Čeká na tebe", MAIL_DB,
          f"SELECT count(*) FROM incoming_emails WHERE {MAIL_SCOPE} AND starred AND replied_at IS NULL",
          lambda v: num(v) > 0),
     ]
@@ -428,7 +446,8 @@ footer{margin-top:3.5rem;padding-top:1.2rem;border-top:1px solid var(--line);
 
 def page(body, active="", refreshed=""):
     tabs = [("/", "home", "Přehled"), ("/odeslane", "out", "Odeslané"),
-            ("/prijate", "in", "Přijaté"), ("/doruceni", "log", "Doručování")]
+            ("/prijate", "in", "Přijaté"), ("/ceka", "wait", "Čeká na tebe"),
+            ("/doruceni", "log", "Doručování")]
     nav = "".join(f'<a href="{href}" class="{"on" if active == key else ""}">{label}</a>'
                   for href, key, label in tabs)
     return f"""<!doctype html>
@@ -622,6 +641,37 @@ def render_inbound(search=None):
     return "".join(b)
 
 
+def render_waiting():
+    rows = waiting()
+    leads = prospect_senders()
+    b = [f'<h2>Čeká na tebe <span class="count">{len(rows)}</span></h2>']
+    if not rows:
+        b.append('<div class="empty">Nic nečeká — bot vyřídil všechno sám.</div>')
+        return "".join(b)
+    b.append('<p class="note">Bot se u těchhle zpráv <strong>záměrně zastavil</strong> a nechal je '
+             "na tebe: odesílatele nedokázal spárovat s osloveným podnikem, nebo šlo o citlivou "
+             "žádost (smazání údajů, právní dotaz), kterou automat řešit nemá.</p>")
+    b.append('<div class="list">')
+    for received, frm, frm_name, subject, text, mailbox in rows:
+        lead = leads.get((frm or "").lower())
+        tags = []
+        if lead:
+            tags.append('<span class="tag lead">prospekt</span>')
+        if mailbox:
+            tags.append(f'<span class="tag">{E(mailbox)}</span>')
+        who = frm_name or (lead["name"] if lead else "") or frm
+        b.append(
+            "<details open><summary>"
+            f'<span class="av">{initial(who)}</span><span class="sm">'
+            f'<span class="l1"><strong>{E(who)}</strong>'
+            f'<span class="addr">{E(frm)}</span>{"".join(tags)}</span>'
+            f'<span class="l2">{E(subject) or "(bez předmětu)"}</span></span>'
+            f'<span class="when">{E(fmt_dt(received))}</span></summary>'
+            f"<pre>{E(text) if text else '(prázdné)'}</pre></details>")
+    b.append("</div>")
+    return "".join(b)
+
+
 def render_log():
     rows = delivery_log()
     ok = sum(1 for r in rows if r[3] in ("sent", "delivered", "queued"))
@@ -644,7 +694,8 @@ def render_log():
 
 
 ROUTES = {"/": ("home", render_home), "/odeslane": ("out", render_outbound),
-          "/prijate": ("in", render_inbound), "/doruceni": ("log", render_log)}
+          "/prijate": ("in", render_inbound), "/ceka": ("wait", render_waiting),
+          "/doruceni": ("log", render_log)}
 
 
 class Handler(BaseHTTPRequestHandler):
