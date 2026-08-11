@@ -38,6 +38,12 @@ NOT_REACHABLE = ("no_email_found", "no_website", "placeholder_email")
 # its tables hold their mail too. Every query against it must be scoped to our
 # own mailboxes or the numbers on this page quietly describe someone else's
 # outreach — 13 of the 135 stored inbound messages are not ours.
+# The prospect table is shared with the other projects on this host too. Their
+# rows carry a vertical we do not own (and no place_id at all), so without this
+# every count on the page — sends, opens, the daily cap — quietly includes
+# someone else's outreach.
+VERT_SCOPE = "vertical IN (" + ", ".join("'" + b + "'" for b in BRANDS) + ")"
+
 OUR_MAILBOXES = tuple([f"contact@{b}local.cz" for b in BRANDS] + ["contact@lokwave.cz"])
 MAIL_SCOPE = ("smtp_config_id IN (SELECT id FROM smtp_configs WHERE from_address IN "
               f"{OUR_MAILBOXES})")
@@ -89,14 +95,14 @@ def funnel():
     # `status='sent'` alone over-counts: 57 rows carry the status with a NULL
     # sent_at and NULL body, left behind by an earlier send path. They never
     # reached anyone, so counting them deflates every rate below.
-    sent = one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE status='sent' AND sent_at IS NOT NULL")
-    ghosts = one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE status='sent' AND sent_at IS NULL")
+    sent = one(APP_DB, f"SELECT count(*) FROM outreach_prospects WHERE status='sent' AND sent_at IS NOT NULL AND {VERT_SCOPE}")
+    ghosts = one(APP_DB, f"SELECT count(*) FROM outreach_prospects WHERE status='sent' AND sent_at IS NULL AND {VERT_SCOPE}")
     return {
         "audits": one(APP_DB, "SELECT count(*) FROM audits"),
         "sent": sent,
         "ghosts": ghosts,
-        "opened": one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE opened_at IS NOT NULL"),
-        "clicked": one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE clicked_at IS NOT NULL"),
+        "opened": one(APP_DB, f"SELECT count(*) FROM outreach_prospects WHERE opened_at IS NOT NULL AND {VERT_SCOPE}"),
+        "clicked": one(APP_DB, f"SELECT count(*) FROM outreach_prospects WHERE clicked_at IS NOT NULL AND {VERT_SCOPE}"),
         "orgs": one(APP_DB, "SELECT count(*) FROM organizations WHERE deleted_at IS NULL"),
         "locations": one(APP_DB, "SELECT count(*) FROM locations"),
         # Trials and past_due are NOT revenue. Keep them visible, keep them apart.
@@ -122,10 +128,10 @@ def pipeline():
 
 
 def sent_today():
-    rows = q(APP_DB, """
+    rows = q(APP_DB, f"""
         SELECT vertical, count(*)
         FROM outreach_prospects
-        WHERE status='sent' AND sent_at::date = current_date
+        WHERE status='sent' AND sent_at::date = current_date AND {VERT_SCOPE}
         GROUP BY 1
     """, ncols=2)
     return {v: num(n) for v, n in rows}
@@ -135,7 +141,7 @@ def daily_series(days=14):
     rows = q(APP_DB, f"""
         SELECT to_char(sent_at::date, 'DD.MM'), count(*)
         FROM outreach_prospects
-        WHERE status='sent' AND sent_at > now() - interval '{days} days'
+        WHERE status='sent' AND sent_at > now() - interval '{days} days' AND {VERT_SCOPE}
         GROUP BY sent_at::date ORDER BY sent_at::date
     """, ncols=2)
     return [(d, num(n)) for d, n in rows]
@@ -169,7 +175,7 @@ def prospect_senders():
 
 
 def outbound(limit=300, brand=None, search=None):
-    where = ["status='sent'", "sent_at IS NOT NULL"]
+    where = ["status='sent'", "sent_at IS NOT NULL", VERT_SCOPE]
     if brand in BRANDS:
         where.append(f"vertical = {lit(brand)}")
     if search:
@@ -218,13 +224,13 @@ def subject_variants():
     neighbour doing better. Rows sent before the split have a null variant and
     are excluded — attributing them to either arm would invent a result.
     """
-    return q(APP_DB, """
+    return q(APP_DB, f"""
         SELECT subject_variant,
                count(*),
                count(*) FILTER (WHERE opened_at IS NOT NULL),
                count(*) FILTER (WHERE clicked_at IS NOT NULL)
         FROM outreach_prospects
-        WHERE subject_variant IS NOT NULL AND sent_at IS NOT NULL
+        WHERE subject_variant IS NOT NULL AND sent_at IS NOT NULL AND {VERT_SCOPE}
         GROUP BY 1 ORDER BY 1
     """, ncols=4)
 
@@ -263,19 +269,19 @@ def health():
          lambda v: False),
         ("Chyby odeslání za 48 h", APP_DB, f"""
             SELECT count(*) FROM outreach_prospects
-            WHERE status='failed' AND coalesce(error,'') NOT IN {NOT_REACHABLE}
+            WHERE status='failed' AND {VERT_SCOPE} AND coalesce(error,'') NOT IN {NOT_REACHABLE}
               AND updated_at > now() - interval '2 days'
          """, lambda v: num(v) > 0),
-        ("Hodin od posledního odeslání", APP_DB, """
+        ("Hodin od posledního odeslání", APP_DB, f"""
             SELECT coalesce(extract(epoch FROM now() - max(sent_at))/3600, 999)::int
-            FROM outreach_prospects WHERE status='sent'
+            FROM outreach_prospects WHERE status='sent' AND {VERT_SCOPE}
          """, lambda v: num(v) > 24),
         # A `benchmark` key holding JSON null is what a lookup that found no
         # neighbours writes. Counting the key alone reported the queue as ready
         # while those emails still had no competitor to name.
-        ("Fronta bez srovnání s konkurencí", APP_DB, """
+        ("Fronta bez srovnání s konkurencí", APP_DB, f"""
             SELECT count(*) FROM outreach_prospects p
-            WHERE p.status='pending' AND NOT EXISTS (
+            WHERE p.status='pending' AND p.{VERT_SCOPE} AND NOT EXISTS (
               SELECT 1 FROM audits a WHERE a.prospect_place_id = p.place_id
                 AND jsonb_typeof(a.payload -> 'benchmark') = 'object')
          """, lambda v: num(v) > 0),
