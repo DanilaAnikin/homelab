@@ -1,42 +1,25 @@
 #!/usr/bin/env python3
-"""
-Outreach dashboard — outreach.lokwave.cz
+"""Lokwave outreach dashboard — outreach.lokwave.cz
 
-One place to see whether the Lokwave outreach machine is actually working. It
-reads two databases directly (the app's Postgres and LaunchMail's) because
-everything it shows already exists there; nothing is aggregated ahead of time,
-so a number on this page is never stale or a copy that drifted.
+Reads the two production databases directly through `docker exec psql`. There is
+no cache and no intermediate store: every page load is a fresh query, so what it
+shows is what the system actually holds.
 
-What it exists to answer, in order:
-
-  1. Is the funnel converting?      audits → sent → opened → clicked → trial → paid
-  2. Is the machine actually alive? sends today per brand against the cap
-  3. What did we say, and to whom?  every outbound email, in full
-  4. What came back?                every inbound reply, in full
-
-The third and fourth matter more than they look. The bot writes cold email with
-an LLM and answers replies unattended; without reading what it actually sent,
-"it's running" is not the same as "it's working", and the first sign of a bad
-prompt is a mail nobody would have sent by hand.
-
-Auth is Cloudflare Access in front (owner email only) — this process trusts the
-edge and holds no credentials of its own. It binds the docker bridge, so the only
-route in is Traefik behind the tunnel.
+Read-only by construction — it issues SELECTs and serves HTML, nothing else.
+Access is gated by Cloudflare Access at the edge; the process itself listens
+only on the docker bridge, which is host-local.
 """
 
 import html
 import json
 import os
-import re
 import subprocess
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-PORT = int(os.environ.get("OUTREACH_DASHBOARD_PORT", "8096"))
-# docker0 by default: Traefik must reach it from a container, and docker0 is not
-# routable from the LAN. The public path is the Cloudflare tunnel only.
 BIND = os.environ.get("OUTREACH_DASHBOARD_BIND", "172.17.0.1")
+PORT = int(os.environ.get("OUTREACH_DASHBOARD_PORT", "8096"))
 
 APP_DB = ("shared-postgres", "lokwave", "lokwave")
 MAIL_DB = ("launchmail-postgres", "postgres", "launchmail")
@@ -46,22 +29,45 @@ BRAND_LABEL = {"auto": "AutoLocal", "bistro": "BistroLocal", "dental": "DentalLo
                "fit": "FitLocal", "salon": "SalonLocal", "vet": "VetLocal"}
 DAILY_CAP = 3  # must match DAILY_CAP in bot-orchestrator.py
 
+# Prospects that never got as far as an email are attrition, not breakage:
+# a place with no website or no published address was simply not reachable.
+# Lumping them in with real send failures made 350 look like an outage.
+NOT_REACHABLE = ("no_email_found", "no_website", "placeholder_email")
+
+# LaunchMail is shared with the other projects on this host (Freio, Ripieno), so
+# its tables hold their mail too. Every query against it must be scoped to our
+# own mailboxes or the numbers on this page quietly describe someone else's
+# outreach — 13 of the 135 stored inbound messages are not ours.
+OUR_MAILBOXES = tuple([f"contact@{b}local.cz" for b in BRANDS] + ["contact@lokwave.cz"])
+MAIL_SCOPE = ("smtp_config_id IN (SELECT id FROM smtp_configs WHERE from_address IN "
+              f"{OUR_MAILBOXES})")
+
+# psql writes one record per line by default, which silently corrupts any column
+# holding a multi-line value — and email bodies are exactly that. An explicit
+# record separator keeps embedded newlines inside their field where they belong.
+FS = "\x1f"
+RS = "\x1e"
+
 
 class QueryError(RuntimeError):
     pass
 
 
-def q(target, sql):
+def q(target, sql, ncols=None):
     """Run one read-only query. Rows come back as lists of strings."""
     container, user, dbname = target
     out = subprocess.run(
         ["docker", "exec", container, "psql", "-U", user, "-d", dbname,
-         "-tAF\x1f", "-c", sql],
+         "-tA", "-F", FS, "-R", RS, "-c", sql],
         capture_output=True, text=True, timeout=45,
     )
     if out.returncode != 0:
         raise QueryError(out.stderr.strip()[:300])
-    return [r.split("\x1f") for r in out.stdout.split("\n") if r.strip()]
+    rows = [r.split(FS) for r in out.stdout.split(RS) if r.strip("\n\r ")]
+    if ncols:
+        # Never let one malformed row take down the whole page.
+        rows = [(r + [""] * ncols)[:ncols] for r in rows]
+    return rows
 
 
 def one(target, sql, default="0"):
@@ -69,31 +75,49 @@ def one(target, sql, default="0"):
     return rows[0][0] if rows and rows[0] else default
 
 
+def num(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ── data ─────────────────────────────────────────────────────────────────────
 
 def funnel():
     """The whole point of the page: does outreach turn into money?"""
-    audits = one(APP_DB, "SELECT count(*) FROM audits")
-    sent = one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE status='sent'")
-    opened = one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE opened_at IS NOT NULL")
-    clicked = one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE clicked_at IS NOT NULL")
-    orgs = one(APP_DB, "SELECT count(*) FROM organizations WHERE deleted_at IS NULL")
-    paying = one(APP_DB, "SELECT count(*) FROM subscriptions WHERE status IN ('active','trialing','past_due')")
-    locations = one(APP_DB, "SELECT count(*) FROM locations")
-    return {"audits": audits, "sent": sent, "opened": opened, "clicked": clicked,
-            "orgs": orgs, "paying": paying, "locations": locations}
+    # `status='sent'` alone over-counts: 57 rows carry the status with a NULL
+    # sent_at and NULL body, left behind by an earlier send path. They never
+    # reached anyone, so counting them deflates every rate below.
+    sent = one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE status='sent' AND sent_at IS NOT NULL")
+    ghosts = one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE status='sent' AND sent_at IS NULL")
+    return {
+        "audits": one(APP_DB, "SELECT count(*) FROM audits"),
+        "sent": sent,
+        "ghosts": ghosts,
+        "opened": one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE opened_at IS NOT NULL"),
+        "clicked": one(APP_DB, "SELECT count(*) FROM outreach_prospects WHERE clicked_at IS NOT NULL"),
+        "orgs": one(APP_DB, "SELECT count(*) FROM organizations WHERE deleted_at IS NULL"),
+        "locations": one(APP_DB, "SELECT count(*) FROM locations"),
+        # Trials and past_due are NOT revenue. Keep them visible, keep them apart.
+        "paying": one(APP_DB, "SELECT count(*) FROM subscriptions WHERE status='active'"),
+        "trialing": one(APP_DB, "SELECT count(*) FROM subscriptions WHERE status='trialing'"),
+    }
 
 
 def pipeline():
-    rows = q(APP_DB, """
-        SELECT vertical, status, count(*)
+    rows = q(APP_DB, f"""
+        SELECT vertical,
+               CASE WHEN status='failed' AND coalesce(error,'') IN {NOT_REACHABLE}
+                    THEN 'unreachable' ELSE status END,
+               count(*)
         FROM outreach_prospects
         WHERE vertical IN ('auto','bistro','dental','fit','salon','vet')
         GROUP BY 1, 2
-    """)
+    """, ncols=3)
     table = {b: {} for b in BRANDS}
     for vert, status, n in rows:
-        table.setdefault(vert, {})[status] = int(n)
+        table.setdefault(vert, {})[status] = num(n)
     return table
 
 
@@ -103,93 +127,137 @@ def sent_today():
         FROM outreach_prospects
         WHERE status='sent' AND sent_at::date = current_date
         GROUP BY 1
-    """)
-    return {v: int(n) for v, n in rows}
+    """, ncols=2)
+    return {v: num(n) for v, n in rows}
 
 
 def daily_series(days=14):
     rows = q(APP_DB, f"""
-        SELECT sent_at::date, count(*)
+        SELECT to_char(sent_at::date, 'DD.MM'), count(*)
         FROM outreach_prospects
         WHERE status='sent' AND sent_at > now() - interval '{days} days'
-        GROUP BY 1 ORDER BY 1
-    """)
-    return [(d, int(n)) for d, n in rows]
+        GROUP BY sent_at::date ORDER BY sent_at::date
+    """, ncols=2)
+    return [(d, num(n)) for d, n in rows]
 
 
-def outbound(limit=200, brand=None, search=None):
-    where = ["status='sent'", "sent_body IS NOT NULL"]
+def prospect_senders():
+    """Which inbound addresses belong to a business we actually emailed?
+
+    This is the only metric that matters on the inbound side — everything else
+    in that mailbox is noise. The two databases are separate, so it is done as
+    two cheap queries rather than a join: distinct senders (a handful) checked
+    against the prospect table.
+    """
+    rows = q(MAIL_DB, f"""
+        SELECT DISTINCT lower(from_address) FROM incoming_emails
+        WHERE coalesce(from_address,'') <> '' AND {MAIL_SCOPE}
+    """, ncols=1)
+    addrs = [r[0] for r in rows if r[0]][:400]
+    if not addrs:
+        return {}
+    inlist = ", ".join(lit(a) for a in addrs)
+    # The prospect table is shared with the other projects too — a Ripieno lead
+    # replying is not a Lokwave lead.
+    verticals = ", ".join(lit(b) for b in BRANDS)
+    hits = q(APP_DB, f"""
+        SELECT lower(email), name, vertical, coalesce(city,'')
+        FROM outreach_prospects
+        WHERE lower(email) IN ({inlist}) AND vertical IN ({verticals})
+    """, ncols=4)
+    return {h[0]: {"name": h[1], "vertical": h[2], "city": h[3]} for h in hits}
+
+
+def outbound(limit=300, brand=None, search=None):
+    where = ["status='sent'", "sent_at IS NOT NULL"]
     if brand in BRANDS:
         where.append(f"vertical = {lit(brand)}")
     if search:
         s = lit(f"%{search}%")
-        where.append(f"(name ILIKE {s} OR email ILIKE {s} OR sent_subject ILIKE {s} OR sent_body ILIKE {s})")
-    return q(APP_DB, f"""
+        where.append(f"(name ILIKE {s} OR email ILIKE {s} OR coalesce(sent_subject,'') ILIKE {s}"
+                     f" OR coalesce(sent_body,'') ILIKE {s} OR coalesce(city,'') ILIKE {s})")
+    clause = " AND ".join(where)
+    total = one(APP_DB, f"SELECT count(*) FROM outreach_prospects WHERE {clause}")
+    rows = q(APP_DB, f"""
         SELECT sent_at, vertical, name, email, coalesce(sent_subject,''),
                coalesce(sent_body,''), opened_at IS NOT NULL, clicked_at IS NOT NULL,
-               coalesce(city,'')
+               coalesce(city,''), coalesce(audit_score::text,'')
         FROM outreach_prospects
-        WHERE {' AND '.join(where)}
+        WHERE {clause}
         ORDER BY sent_at DESC LIMIT {int(limit)}
-    """)
+    """, ncols=10)
+    return rows, num(total)
 
 
-def inbound(limit=200, search=None):
-    where = ["1=1"]
+def inbound(limit=300, search=None):
+    where = [MAIL_SCOPE]
     if search:
         s = lit(f"%{search}%")
-        where.append(f"(from_address ILIKE {s} OR subject ILIKE {s} OR coalesce(text,'') ILIKE {s})")
+        where.append(f"(i.from_address ILIKE {s} OR coalesce(i.subject,'') ILIKE {s}"
+                     f" OR coalesce(i.text,'') ILIKE {s})")
+    clause = " AND ".join(where)
+    total = one(MAIL_DB, f"""
+        SELECT count(*) FROM incoming_emails i
+        LEFT JOIN smtp_configs s ON s.id = i.smtp_config_id WHERE {clause}""")
+    rows = q(MAIL_DB, f"""
+        SELECT i.received_at, i.from_address, coalesce(i.from_name,''), coalesce(i.subject,''),
+               coalesce(i.text, i.snippet, ''), i.replied_at IS NOT NULL, i.starred, i.archived,
+               coalesce(i.auto_submitted,''), coalesce(s.from_address,'')
+        FROM incoming_emails i
+        LEFT JOIN smtp_configs s ON s.id = i.smtp_config_id
+        WHERE {clause}
+        ORDER BY i.received_at DESC LIMIT {int(limit)}
+    """, ncols=10)
+    return rows, num(total)
+
+
+def delivery_log(limit=150):
     return q(MAIL_DB, f"""
-        SELECT received_at, from_address, coalesce(from_name,''), coalesce(subject,''),
-               coalesce(text, snippet, ''), seen, replied_at IS NOT NULL,
-               coalesce(auto_submitted,'')
-        FROM incoming_emails
-        WHERE {' AND '.join(where)}
-        ORDER BY received_at DESC LIMIT {int(limit)}
-    """)
-
-
-def delivery_log(limit=120):
-    return q(MAIL_DB, """
         SELECT created_at, "to"::text, coalesce(subject,''), status, coalesce(error,'')
         FROM email_logs
-        ORDER BY created_at DESC LIMIT %d
-    """ % int(limit))
+        WHERE {MAIL_SCOPE}
+        ORDER BY created_at DESC LIMIT {int(limit)}
+    """, ncols=5)
 
 
 def health():
     """Things that have silently broken before, checked every page load."""
-    out = []
-    try:
-        suppressed = one(APP_DB, "SELECT count(*) FROM email_suppression")
-        out.append(("Odhlášené adresy", suppressed, False))
-    except QueryError:
-        out.append(("Odhlášené adresy", "chyba", True))
-    try:
-        failed = one(APP_DB, """
+    checks = [
+        ("Odhlášené adresy", APP_DB, "SELECT count(*) FROM email_suppression",
+         lambda v: False),
+        ("Chyby odeslání za 48 h", APP_DB, f"""
             SELECT count(*) FROM outreach_prospects
-            WHERE status='failed' AND updated_at > now() - interval '2 days'
-        """)
-        out.append(("Selhalo za 48 h", failed, int(failed) > 0))
-    except QueryError:
-        out.append(("Selhalo za 48 h", "chyba", True))
-    try:
-        stale = one(APP_DB, """
+            WHERE status='failed' AND coalesce(error,'') NOT IN {NOT_REACHABLE}
+              AND updated_at > now() - interval '2 days'
+         """, lambda v: num(v) > 0),
+        ("Hodin od posledního odeslání", APP_DB, """
             SELECT coalesce(extract(epoch FROM now() - max(sent_at))/3600, 999)::int
             FROM outreach_prospects WHERE status='sent'
-        """)
-        out.append(("Hodin od posledního odeslání", stale, int(stale) > 24))
-    except QueryError:
-        out.append(("Hodin od posledního odeslání", "chyba", True))
-    try:
-        noaudit = one(APP_DB, """
+         """, lambda v: num(v) > 24),
+        ("Fronta bez srovnání s konkurencí", APP_DB, """
             SELECT count(*) FROM outreach_prospects p
             WHERE p.status='pending' AND NOT EXISTS (
-              SELECT 1 FROM audits a WHERE a.prospect_place_id = p.place_id AND a.payload ? 'benchmark')
-        """)
-        out.append(("Fronta bez srovnání s konkurencí", noaudit, int(noaudit) > 0))
-    except QueryError:
-        out.append(("Fronta bez srovnání s konkurencí", "chyba", True))
+              SELECT 1 FROM audits a WHERE a.prospect_place_id = p.place_id
+                AND a.payload ? 'benchmark')
+         """, lambda v: num(v) > 0),
+        # `seen` is not a reliable signal: LaunchMail leaves it false on messages
+        # the bot archived after replying. What actually matters is whether a
+        # message was neither answered, nor filed, nor flagged for a human.
+        ("Nevyřízená pošta", MAIL_DB, f"""
+            SELECT count(*) FROM incoming_emails
+            WHERE {MAIL_SCOPE} AND NOT seen AND replied_at IS NULL AND NOT archived
+         """, lambda v: num(v) > 0),
+        ("Čeká na tebe (označené)", MAIL_DB,
+         f"SELECT count(*) FROM incoming_emails WHERE {MAIL_SCOPE} AND starred AND replied_at IS NULL",
+         lambda v: num(v) > 0),
+    ]
+    out = []
+    for label, target, sql, is_bad in checks:
+        try:
+            value = one(target, sql)
+            out.append((label, value, is_bad(value)))
+        except QueryError:
+            out.append((label, "chyba", True))
     return out
 
 
@@ -209,79 +277,174 @@ def fmt_dt(raw):
     return str(raw)[:16].replace("T", " ")
 
 
+def pct(part, whole):
+    whole = num(whole)
+    return round(100 * num(part) / whole, 1) if whole else 0.0
+
+
+def initial(text):
+    text = (text or "?").strip()
+    return E(text[0].upper()) if text else "?"
+
+
+CSS = """
+:root{
+  --ground:#f4f6f5; --surface:#fff; --raise:#fbfcfb; --sunk:#eceff0;
+  --ink:#101614; --soft:#39443f; --muted:#6b7671; --line:#dde3e0; --line-2:#eef1ef;
+  --accent:#0d6152; --accent-soft:#e3f0eb; --crit:#a52a1d; --crit-soft:#fbe9e6;
+  --warn:#8a5b12; --warn-soft:#fbf0da; --ok:#256b4b; --ok-soft:#e2f1e8;
+  --shadow:0 1px 2px rgba(16,22,20,.05),0 8px 24px -16px rgba(16,22,20,.28);
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --ground:#0d1211; --surface:#151b19; --raise:#1a2220; --sunk:#111716;
+  --ink:#e8ecea; --soft:#c2cbc7; --muted:#8d9894; --line:#252d2b; --line-2:#1e2523;
+  --accent:#4fbfa1; --accent-soft:#16332c; --crit:#ea8073; --crit-soft:#331c19;
+  --warn:#d6a44e; --warn-soft:#33290f; --ok:#6fbf95; --ok-soft:#16301f;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px -18px rgba(0,0,0,.8);
+}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;padding:0 1.25rem 5rem;background:var(--ground);color:var(--ink);
+ font:15px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+.wrap{max-width:78rem;margin:0 auto}
+a{color:inherit}
+
+header{display:flex;flex-wrap:wrap;gap:1rem;align-items:baseline;justify-content:space-between;
+ padding:2rem 0 1.1rem}
+.brand{display:flex;align-items:center;gap:.6rem}
+.dot{width:.55rem;height:.55rem;border-radius:50%;background:var(--ok);flex:none;
+ box-shadow:0 0 0 3px var(--ok-soft)}
+h1{font-size:1.35rem;margin:0;letter-spacing:-.02em;font-weight:680}
+.meta{font-family:var(--mono);font-size:.75rem;color:var(--muted);letter-spacing:.02em}
+
+nav.tabs{display:flex;flex-wrap:wrap;gap:.3rem;padding:.3rem;background:var(--sunk);
+ border-radius:.65rem;margin-bottom:1.8rem;width:fit-content;max-width:100%}
+nav.tabs a{font-size:.86rem;text-decoration:none;color:var(--muted);padding:.42rem .85rem;
+ border-radius:.45rem;white-space:nowrap;font-weight:520}
+nav.tabs a:hover{color:var(--ink)}
+nav.tabs a.on{background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}
+
+h2{font-size:.78rem;margin:2.2rem 0 .8rem;font-weight:660;text-transform:uppercase;
+ letter-spacing:.08em;color:var(--muted);display:flex;align-items:center;gap:.5rem}
+h2:first-child{margin-top:0}
+h2 .count{font-family:var(--mono);font-weight:500;text-transform:none;letter-spacing:0;
+ color:var(--muted);background:var(--sunk);padding:.1rem .45rem;border-radius:.3rem;font-size:.75rem}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(8.5rem,1fr));gap:.6rem}
+.cell{background:var(--surface);border:1px solid var(--line);border-radius:.6rem;
+ padding:.85rem .95rem;box-shadow:var(--shadow)}
+.cell dt{font-size:.72rem;letter-spacing:.02em;color:var(--muted);margin:0 0 .45rem;font-weight:520}
+.cell dd{margin:0;font-size:1.6rem;font-weight:700;line-height:1.05;letter-spacing:-.03em;
+ font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:.4rem}
+.cell dd small{font-size:.75rem;font-weight:500;color:var(--muted);letter-spacing:0}
+.cell.bad dd{color:var(--crit)} .cell.good dd{color:var(--ok)} .cell.warn dd{color:var(--warn)}
+.cell.bad{border-color:color-mix(in srgb,var(--crit) 32%,var(--line))}
+.cell.good{border-color:color-mix(in srgb,var(--ok) 28%,var(--line))}
+
+.note{font-size:.8rem;color:var(--muted);margin:.6rem 0 0;line-height:1.5}
+.note strong{color:var(--soft);font-weight:600}
+
+.caps{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:.6rem}
+.cap{background:var(--surface);border:1px solid var(--line);border-radius:.6rem;padding:.75rem .9rem;
+ box-shadow:var(--shadow)}
+.cap b{display:block;font-size:.82rem;font-weight:600;margin-bottom:.1rem}
+.cap span{font-family:var(--mono);font-size:.72rem;color:var(--muted)}
+.pips{display:flex;gap:.25rem;margin-top:.5rem}
+.pips i{flex:1;height:.4rem;border-radius:.2rem;background:var(--sunk)}
+.pips i.f{background:var(--accent)}
+
+.chart{display:flex;align-items:flex-end;gap:.45rem;background:var(--surface);border:1px solid var(--line);
+ border-radius:.6rem;padding:1rem .9rem .6rem;box-shadow:var(--shadow);overflow-x:auto}
+.chart .col{flex:1;min-width:2.1rem;display:flex;flex-direction:column;align-items:center;gap:.3rem}
+.chart .v{font-family:var(--mono);font-size:.7rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.chart .bar{width:100%;background:var(--accent);border-radius:.25rem .25rem 0 0;min-height:.2rem}
+.chart .d{font-family:var(--mono);font-size:.66rem;color:var(--muted);white-space:nowrap}
+
+.tw{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:.6rem;
+ box-shadow:var(--shadow)}
+table{border-collapse:collapse;width:100%;font-size:.88rem}
+th,td{text-align:left;padding:.62rem .85rem;border-bottom:1px solid var(--line-2);vertical-align:middle}
+th{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+ white-space:nowrap;font-weight:620;background:var(--raise)}
+td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td.z{color:var(--muted)}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--raise)}
+.runway{display:inline-block;height:.35rem;border-radius:.2rem;background:var(--accent);
+ vertical-align:middle;min-width:.2rem}
+
+.list{display:flex;flex-direction:column;gap:.4rem}
+details{background:var(--surface);border:1px solid var(--line);border-radius:.6rem;
+ box-shadow:var(--shadow);overflow:hidden}
+details[open]{border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
+summary{padding:.7rem .9rem;cursor:pointer;list-style:none;display:flex;gap:.75rem;align-items:flex-start}
+summary::-webkit-details-marker{display:none}
+summary:hover{background:var(--raise)}
+.av{flex:none;width:2rem;height:2rem;border-radius:.45rem;background:var(--accent-soft);color:var(--accent);
+ display:grid;place-items:center;font-weight:700;font-size:.85rem}
+.sm{min-width:0;flex:1}
+.l1{display:flex;flex-wrap:wrap;gap:.4rem;align-items:baseline}
+.l1 strong{font-weight:620;font-size:.92rem}
+.l1 .addr{font-family:var(--mono);font-size:.75rem;color:var(--muted);word-break:break-all}
+.l2{font-size:.87rem;color:var(--soft);margin-top:.15rem;overflow:hidden;text-overflow:ellipsis}
+.when{flex:none;font-family:var(--mono);font-size:.72rem;color:var(--muted);white-space:nowrap;
+ padding-top:.15rem}
+pre{margin:0;padding:.9rem 1.1rem 1.2rem 3.6rem;white-space:pre-wrap;word-break:break-word;
+ font:13px/1.7 var(--mono);color:var(--soft);border-top:1px solid var(--line-2);background:var(--raise)}
+
+.tag{font-size:.66rem;text-transform:uppercase;letter-spacing:.05em;font-weight:640;
+ padding:.12rem .4rem;border-radius:.28rem;background:var(--sunk);color:var(--muted);white-space:nowrap}
+.tag.ok{background:var(--ok-soft);color:var(--ok)}
+.tag.hot{background:var(--crit-soft);color:var(--crit)}
+.tag.w{background:var(--warn-soft);color:var(--warn)}
+.tag.lead{background:var(--accent);color:var(--surface)}
+
+form.search{display:flex;gap:.4rem;margin:0 0 .8rem}
+input[type=search]{flex:1;padding:.55rem .8rem;border:1px solid var(--line);background:var(--surface);
+ color:var(--ink);border-radius:.5rem;font-size:.9rem;font-family:var(--sans)}
+input[type=search]:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+button{padding:.55rem 1.1rem;border:1px solid var(--accent);background:var(--accent);color:var(--surface);
+ border-radius:.5rem;font-size:.88rem;font-weight:600;cursor:pointer;font-family:var(--sans)}
+nav.chips{display:flex;flex-wrap:wrap;gap:.35rem;margin:0 0 .9rem}
+nav.chips a{font-size:.8rem;text-decoration:none;color:var(--muted);border:1px solid var(--line);
+ padding:.3rem .7rem;border-radius:1rem;background:var(--surface);white-space:nowrap}
+nav.chips a.on{background:var(--accent);color:var(--surface);border-color:var(--accent);font-weight:600}
+
+.err{border:1px solid var(--crit);background:var(--crit-soft);color:var(--crit);padding:.9rem 1.1rem;
+ border-radius:.6rem;margin:1rem 0;font-size:.9rem}
+.empty{background:var(--surface);border:1px dashed var(--line);border-radius:.6rem;padding:2rem;
+ text-align:center;color:var(--muted);font-size:.9rem}
+footer{margin-top:3.5rem;padding-top:1.2rem;border-top:1px solid var(--line);
+ font-size:.76rem;color:var(--muted);line-height:1.7}
+@media (max-width:34rem){
+  body{padding:0 .8rem 4rem}
+  .cell dd{font-size:1.35rem}
+  .when{display:none}
+}
+"""
+
+
 def page(body, active="", refreshed=""):
+    tabs = [("/", "home", "Přehled"), ("/odeslane", "out", "Odeslané"),
+            ("/prijate", "in", "Přijaté"), ("/doruceni", "log", "Doručování")]
+    nav = "".join(f'<a href="{href}" class="{"on" if active == key else ""}">{label}</a>'
+                  for href, key, label in tabs)
     return f"""<!doctype html>
 <html lang="cs"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <title>Lokwave outreach</title>
-<style>
-:root {{
-  --ground:#f5f6f4; --surface:#fff; --surface-2:#edf0ee; --ink:#141a18; --soft:#3d4744;
-  --muted:#5c6663; --line:#dbe1de; --accent:#0e5c4a; --crit:#a62b1f; --warn:#96631a; --ok:#2f6b4c;
-  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
-}}
-@media (prefers-color-scheme:dark) {{ :root {{
-  --ground:#0f1412; --surface:#171d1b; --surface-2:#1e2523; --ink:#e7ebe8; --soft:#c3cbc7;
-  --muted:#939d99; --line:#262e2b; --accent:#5cbfa0; --crit:#e8776a; --warn:#d5a24a; --ok:#6dbb92;
-}} }}
-*{{box-sizing:border-box}}
-body{{margin:0;padding:0 1rem 5rem;background:var(--ground);color:var(--ink);
- font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}}
-.wrap{{max-width:74rem;margin:0 auto}}
-header{{padding:2rem 0 1rem;border-bottom:2px solid var(--ink);margin-bottom:1.5rem}}
-h1{{font-family:var(--mono);font-size:1.5rem;margin:0 0 .3rem;letter-spacing:-.02em}}
-.meta{{font-family:var(--mono);font-size:.78rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}}
-nav{{display:flex;flex-wrap:wrap;gap:.4rem;margin:1.2rem 0}}
-nav a{{font-family:var(--mono);font-size:.8rem;text-decoration:none;color:var(--soft);
- border:1px solid var(--line);padding:.35rem .7rem;border-radius:2px;background:var(--surface)}}
-nav a.on{{background:var(--accent);color:var(--ground);border-color:var(--accent)}}
-h2{{font-size:1.1rem;margin:2rem 0 .7rem;font-weight:640}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:1px;background:var(--line);
- border:1px solid var(--line)}}
-.cell{{background:var(--surface);padding:.85rem 1rem}}
-.cell dt{{font-family:var(--mono);font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 .3rem}}
-.cell dd{{margin:0;font-family:var(--mono);font-size:1.5rem;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}}
-.cell dd small{{font-size:.8rem;font-weight:400;color:var(--muted)}}
-.bad dd{{color:var(--crit)}} .good dd{{color:var(--ok)}} .warn dd{{color:var(--warn)}}
-.tw{{overflow-x:auto;border:1px solid var(--line);background:var(--surface)}}
-table{{border-collapse:collapse;width:100%;font-size:.88rem}}
-th,td{{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--line);vertical-align:top}}
-th{{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);white-space:nowrap}}
-td.n{{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}}
-tbody tr:last-child td{{border-bottom:none}}
-details{{border:1px solid var(--line);background:var(--surface);margin-bottom:1px}}
-details summary{{padding:.6rem .8rem;cursor:pointer;font-size:.9rem;display:flex;flex-wrap:wrap;gap:.5rem;align-items:baseline}}
-details summary::-webkit-details-marker{{display:none}}
-details[open] summary{{border-bottom:1px solid var(--line);background:var(--surface-2)}}
-pre{{margin:0;padding:.9rem 1.1rem;white-space:pre-wrap;word-break:break-word;font:13px/1.65 var(--mono);color:var(--soft)}}
-.tag{{font-family:var(--mono);font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;
- padding:.1rem .35rem;border-radius:2px;background:var(--surface-2);color:var(--muted)}}
-.tag.ok{{color:var(--ok)}} .tag.hot{{color:var(--crit)}} .tag.w{{color:var(--warn)}}
-form{{display:flex;gap:.4rem;margin:.8rem 0}}
-input[type=search]{{flex:1;padding:.45rem .6rem;border:1px solid var(--line);background:var(--surface);
- color:var(--ink);border-radius:2px;font-size:.9rem}}
-button{{padding:.45rem .9rem;border:1px solid var(--accent);background:var(--accent);color:var(--ground);
- border-radius:2px;font-size:.85rem;cursor:pointer}}
-.spark{{display:flex;align-items:flex-end;gap:2px;height:44px;margin:.5rem 0}}
-.spark i{{flex:1;background:var(--accent);min-height:2px;border-radius:1px 1px 0 0}}
-.err{{border:1px solid var(--crit);background:var(--surface);color:var(--crit);padding:.8rem 1rem;margin:1rem 0;font-size:.9rem}}
-footer{{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--line);font-family:var(--mono);
- font-size:.75rem;color:var(--muted)}}
-</style></head><body><div class="wrap">
+<style>{CSS}</style></head><body><div class="wrap">
 <header>
-  <h1>Lokwave outreach</h1>
-  <div class="meta">{refreshed} · 6 značek · strop {DAILY_CAP}/den/značku</div>
+  <div class="brand"><span class="dot"></span><h1>Lokwave outreach</h1></div>
+  <div class="meta">{E(refreshed)} &nbsp;·&nbsp; 6 značek &nbsp;·&nbsp; strop {DAILY_CAP}/den/značku</div>
 </header>
-<nav>
-  <a href="/" class="{'on' if active == 'home' else ''}">Přehled</a>
-  <a href="/odeslane" class="{'on' if active == 'out' else ''}">Odeslané e-maily</a>
-  <a href="/prijate" class="{'on' if active == 'in' else ''}">Přijaté e-maily</a>
-  <a href="/doruceni" class="{'on' if active == 'log' else ''}">Doručování</a>
-</nav>
+<nav class="tabs">{nav}</nav>
 {body}
-<footer>Čte přímo z produkční databáze — žádná mezivrstva, žádná zastaralá kopie.<br>
+<footer>Čte přímo z produkčních databází — žádná mezivrstva, žádná zastaralá kopie.<br>
 Přístup hlídá Cloudflare Access; služba naslouchá jen na docker bridge.</footer>
 </div></body></html>"""
 
@@ -296,115 +459,174 @@ def render_home():
     pipe = pipeline()
     today = sent_today()
     series = daily_series()
+    leads = prospect_senders()
 
-    sent_n = int(f["sent"]) or 1
-    open_pct = round(100 * int(f["opened"]) / sent_n)
-    click_pct = round(100 * int(f["clicked"]) / sent_n)
+    open_pct = pct(f["opened"], f["sent"])
+    click_pct = pct(f["clicked"], f["sent"])
 
     b = ['<h2>Trychtýř</h2><dl class="grid">']
     b.append(cell("Auditů", f["audits"]))
     b.append(cell("Odesláno", f["sent"]))
     b.append(cell("Otevřeno", f["opened"], f"{open_pct} %", "good" if open_pct >= 20 else ""))
-    b.append(cell("Prokliků", f["clicked"], f"{click_pct} %", "good" if click_pct > 0 else "bad"))
+    b.append(cell("Prokliků", f["clicked"], f"{click_pct} %", "good" if num(f["clicked"]) else "bad"))
+    b.append(cell("Odpovědí od oslovených", len(leads), "", "good" if leads else "bad"))
     b.append(cell("Registrací", f["orgs"]))
     b.append(cell("Poboček", f["locations"]))
-    b.append(cell("Platících", f["paying"], "", "good" if int(f["paying"]) else "bad"))
+    b.append(cell("Platících", f["paying"], f"+{f['trialing']} ve zkušební",
+                  "good" if num(f["paying"]) else "bad"))
     b.append("</dl>")
+
+    notes = []
+    if num(f["ghosts"]):
+        notes.append(f"<strong>{f['ghosts']}</strong> záznamů má stav „odesláno“, ale prázdné "
+                     "<code>sent_at</code> i tělo — pozůstatek staršího odesílání. "
+                     "Do čísel výše se nepočítají.")
+    notes.append("„Platících“ = jen předplatné ve stavu <code>active</code>. Zkušební verze "
+                 "ani nezaplacené faktury se za tržbu nepovažují.")
+    b.append('<p class="note">' + "<br>".join(notes) + "</p>")
 
     total_today = sum(today.values())
     cap_total = DAILY_CAP * len(BRANDS)
-    b.append("<h2>Dnes odesláno</h2>")
-    b.append('<dl class="grid">')
-    b.append(cell("Celkem dnes", f"{total_today}", f"z {cap_total}",
-                  "good" if total_today >= cap_total else "warn" if total_today else "bad"))
+    b.append(f'<h2>Dnes odesláno <span class="count">{total_today} z {cap_total}</span></h2>')
+    b.append('<div class="caps">')
     for br in BRANDS:
         n = today.get(br, 0)
-        b.append(cell(BRAND_LABEL[br], f"{n}", f"z {DAILY_CAP}", "good" if n >= DAILY_CAP else ""))
-    b.append("</dl>")
+        pips = "".join(f'<i class="{"f" if i < n else ""}"></i>' for i in range(DAILY_CAP))
+        b.append(f'<div class="cap"><b>{E(BRAND_LABEL[br])}</b>'
+                 f'<span>{n} z {DAILY_CAP}</span><div class="pips">{pips}</div></div>')
+    b.append("</div>")
 
     if series:
         peak = max(n for _, n in series) or 1
-        bars = "".join(
-            f'<i style="height:{max(2, round(100 * n / peak))}%" title="{E(d)}: {n}"></i>'
+        cols = "".join(
+            f'<div class="col"><span class="v">{n}</span>'
+            f'<span class="bar" style="height:{max(3, round(72 * n / peak))}px"></span>'
+            f'<span class="d">{E(d)}</span></div>'
             for d, n in series)
-        b.append(f'<h2>Posledních 14 dní</h2><div class="spark">{bars}</div>')
+        b.append(f'<h2>Odesílání za posledních 14 dní</h2><div class="chart">{cols}</div>')
 
-    b.append("<h2>Fronta podle značky</h2><div class='tw'><table><thead><tr><th>Značka</th>"
-             "<th>Čeká</th><th>Kvalifikováno</th><th>Odesláno</th><th>Selhalo</th><th>Přeskočeno</th>"
-             "<th>Dnů zásoby</th></tr></thead><tbody>")
+    b.append('<h2>Fronta podle značky</h2><div class="tw"><table><thead><tr><th>Značka</th>'
+             "<th>Čeká</th><th>Kvalifikováno</th><th>Odesláno</th><th>Nedosažitelných</th>"
+             "<th>Chyb</th><th>Zásoba</th></tr></thead><tbody>")
+    max_runway = max((pipe.get(br, {}).get("pending", 0) for br in BRANDS), default=0) or 1
     for br in BRANDS:
         row = pipe.get(br, {})
         pending = row.get("pending", 0)
-        runway = round(pending / DAILY_CAP) if pending else 0
+        days = round(pending / DAILY_CAP) if pending else 0
+        width = round(90 * pending / max_runway) if pending else 0
+
+        def td(v):
+            return f'<td class="n{"" if v else " z"}">{v}</td>'
         b.append(
-            f"<tr><td>{E(BRAND_LABEL[br])}</td>"
-            f'<td class="n">{pending}</td><td class="n">{row.get("qualified", 0)}</td>'
-            f'<td class="n">{row.get("sent", 0)}</td><td class="n">{row.get("failed", 0)}</td>'
-            f'<td class="n">{row.get("skipped", 0)}</td><td class="n">{runway}</td></tr>')
+            f"<tr><td><strong>{E(BRAND_LABEL[br])}</strong></td>"
+            + td(pending) + td(row.get("qualified", 0)) + td(row.get("sent", 0))
+            + td(row.get("unreachable", 0)) + td(row.get("failed", 0))
+            + f'<td class="n"><span class="runway" style="width:{width}px"></span> {days} d</td></tr>')
     b.append("</tbody></table></div>")
+    b.append('<p class="note">„Nedosažitelných“ = firma nemá web nebo se nepodařilo najít e-mail; '
+             "to není chyba systému, jen přirozený odpad při prospektování. Sloupec „Chyb“ jsou "
+             "skutečná selhání odeslání.</p>")
 
     b.append("<h2>Kontrolky</h2><dl class='grid'>")
     for label, value, bad in health():
-        b.append(cell(label, value, "", "bad" if bad else ""))
+        b.append(cell(label, value, "", "bad" if bad else "good"))
     b.append("</dl>")
     return "".join(b)
 
 
+def search_form(placeholder, value, hidden=""):
+    return (f'<form class="search" method="get">{hidden}'
+            f'<input type="search" name="q" placeholder="{E(placeholder)}" value="{E(value or "")}">'
+            f"<button>Hledat</button></form>")
+
+
 def render_outbound(brand=None, search=None):
-    rows = outbound(brand=brand, search=search)
-    b = [f'<h2>Odeslané e-maily <span class="tag">{len(rows)}</span></h2>']
-    b.append('<form method="get"><input type="search" name="q" placeholder="Hledat ve jménu, adrese, předmětu i textu…" '
-             f'value="{E(search or "")}"><button>Hledat</button></form>')
-    b.append('<nav><a href="/odeslane" class="' + ("on" if not brand else "") + '">Vše</a>' +
-             "".join(f'<a href="/odeslane?brand={br}" class="{"on" if brand == br else ""}">{BRAND_LABEL[br]}</a>'
-                     for br in BRANDS) + "</nav>")
+    rows, total = outbound(brand=brand, search=search)
+    shown = f'{len(rows)} z {total}' if total > len(rows) else str(total)
+    b = [f'<h2>Odeslané e-maily <span class="count">{shown}</span></h2>']
+    hidden = f'<input type="hidden" name="brand" value="{E(brand)}">' if brand else ""
+    b.append(search_form("Hledat ve jménu, adrese, městě, předmětu i textu…", search, hidden))
+    qs = f"&q={E(search)}" if search else ""
+    b.append('<nav class="chips"><a href="/odeslane?x=1' + qs + '" class="'
+             + ("on" if not brand else "") + '">Vše</a>'
+             + "".join(f'<a href="/odeslane?brand={br}{qs}" class="{"on" if brand == br else ""}">'
+                       f"{BRAND_LABEL[br]}</a>" for br in BRANDS) + "</nav>")
     if not rows:
-        b.append("<p>Nic neodpovídá.</p>")
-    for sent_at, vert, name, email, subject, body, opened, clicked, city in rows:
+        b.append('<div class="empty">Nic neodpovídá.</div>')
+        return "".join(b)
+
+    b.append('<div class="list">')
+    for sent_at, vert, name, email, subject, body, opened, clicked, city, score in rows:
         tags = [f'<span class="tag">{E(BRAND_LABEL.get(vert, vert))}</span>']
+        if score:
+            tags.append(f'<span class="tag">skóre {E(score)}</span>')
         if opened == "t":
             tags.append('<span class="tag ok">otevřel</span>')
         if clicked == "t":
-            tags.append('<span class="tag hot">proklik</span>')
+            tags.append('<span class="tag lead">proklik</span>')
         b.append(
             "<details><summary>"
-            f'<span class="tag">{E(fmt_dt(sent_at))}</span>'
-            f"<strong>{E(name)}</strong> <span class='tag'>{E(city)}</span> "
-            f"<span style='color:var(--muted)'>{E(email)}</span> {' '.join(tags)}"
-            f"<br>{E(subject)}</summary>"
-            f"<pre>{E(body)}</pre></details>")
+            f'<span class="av">{initial(name)}</span><span class="sm">'
+            f'<span class="l1"><strong>{E(name)}</strong>'
+            + (f'<span class="tag">{E(city)}</span>' if city else "")
+            + f'<span class="addr">{E(email)}</span>{"".join(tags)}</span>'
+            f'<span class="l2">{E(subject)}</span></span>'
+            f'<span class="when">{E(fmt_dt(sent_at))}</span></summary>'
+            f"<pre>{E(body) if body else '(tělo se neuložilo)'}</pre></details>")
+    b.append("</div>")
     return "".join(b)
 
 
 def render_inbound(search=None):
-    rows = inbound(search=search)
-    b = [f'<h2>Přijaté e-maily <span class="tag">{len(rows)}</span></h2>']
-    b.append('<form method="get"><input type="search" name="q" placeholder="Hledat v odesílateli, předmětu i textu…" '
-             f'value="{E(search or "")}"><button>Hledat</button></form>')
+    rows, total = inbound(search=search)
+    leads = prospect_senders()
+    shown = f'{len(rows)} z {total}' if total > len(rows) else str(total)
+    b = [f'<h2>Přijaté e-maily <span class="count">{shown}</span></h2>']
+    b.append(search_form("Hledat v odesílateli, předmětu i textu…", search))
+    if leads:
+        b.append('<p class="note">Odpovědi od firem, které jsme oslovili, jsou označené štítkem '
+                 "<strong>PROSPEKT</strong> — ty jsou jediné, které stojí za pozornost.</p>")
     if not rows:
-        b.append("<p>Nic neodpovídá.</p>")
-    for received, frm, frm_name, subject, text, seen, replied, auto in rows:
+        b.append('<div class="empty">Nic neodpovídá.</div>')
+        return "".join(b)
+
+    b.append('<div class="list">')
+    for received, frm, frm_name, subject, text, replied, starred, archived, auto, mailbox in rows:
         tags = []
+        lead = leads.get((frm or "").lower())
+        if lead:
+            tags.append('<span class="tag lead">prospekt</span>')
+            tags.append(f'<span class="tag">{E(BRAND_LABEL.get(lead["vertical"], lead["vertical"]))}</span>')
+        elif mailbox:
+            tags.append(f'<span class="tag">{E(mailbox.split("@")[-1])}</span>')
         if replied == "t":
             tags.append('<span class="tag ok">bot odpověděl</span>')
-        elif seen == "t":
-            tags.append('<span class="tag w">jen přečteno</span>')
+        elif starred == "t":
+            tags.append('<span class="tag w">čeká na tebe</span>')
+        elif archived == "t":
+            tags.append('<span class="tag">odloženo</span>')
         else:
-            tags.append('<span class="tag hot">nové</span>')
+            tags.append('<span class="tag hot">nevyřízeno</span>')
         if auto:
             tags.append('<span class="tag">automat</span>')
-        who = f"{frm_name} <{frm}>" if frm_name else frm
+        who = frm_name or (lead["name"] if lead else "") or frm
         b.append(
             "<details><summary>"
-            f'<span class="tag">{E(fmt_dt(received))}</span>'
-            f"<strong>{E(who)}</strong> {' '.join(tags)}<br>{E(subject)}</summary>"
-            f"<pre>{E(text)}</pre></details>")
+            f'<span class="av">{initial(who)}</span><span class="sm">'
+            f'<span class="l1"><strong>{E(who)}</strong>'
+            f'<span class="addr">{E(frm)}</span>{"".join(tags)}</span>'
+            f'<span class="l2">{E(subject) or "(bez předmětu)"}</span></span>'
+            f'<span class="when">{E(fmt_dt(received))}</span></summary>'
+            f"<pre>{E(text) if text else '(prázdné)'}</pre></details>")
+    b.append("</div>")
     return "".join(b)
 
 
 def render_log():
     rows = delivery_log()
-    b = ['<h2>Doručování (LaunchMail)</h2><div class="tw"><table><thead><tr>'
+    ok = sum(1 for r in rows if r[3] in ("sent", "delivered", "queued"))
+    b = [f'<h2>Doručování (LaunchMail) <span class="count">{ok} z {len(rows)} v pořádku</span></h2>'
+         '<div class="tw"><table><thead><tr>'
          "<th>Čas</th><th>Příjemce</th><th>Předmět</th><th>Stav</th><th>Chyba</th>"
          "</tr></thead><tbody>"]
     for created, to, subject, status, error in rows:
@@ -412,9 +634,11 @@ def render_log():
             addr = ", ".join(x.get("email", "") for x in json.loads(to))
         except Exception:
             addr = to
-        cls = "" if status in ("sent", "delivered", "queued") else ' style="color:var(--crit)"'
-        b.append(f'<tr><td class="n">{E(fmt_dt(created))}</td><td>{E(addr)}</td>'
-                 f"<td>{E(subject[:70])}</td><td{cls}>{E(status)}</td><td>{E(error[:70])}</td></tr>")
+        good = status in ("sent", "delivered", "queued")
+        pill = f'<span class="tag {"ok" if good else "hot"}">{E(status)}</span>'
+        b.append(f'<tr><td class="n">{E(fmt_dt(created))}</td><td class="n">{E(addr)}</td>'
+                 f"<td>{E(subject[:70])}</td><td>{pill}</td>"
+                 f'<td class="z">{E(error[:70])}</td></tr>')
     b.append("</tbody></table></div>")
     return "".join(b)
 
@@ -431,11 +655,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        route = ROUTES.get(parsed.path)
         if parsed.path == "/health":
             return self._send(200, "ok", "text/plain")
+        route = ROUTES.get(parsed.path)
         if not route:
-            return self._send(404, page("<h2>Stránka neexistuje</h2>", refreshed=stamp()), "text/html")
+            return self._send(404, page('<div class="empty">Stránka neexistuje.</div>',
+                                        refreshed=stamp()), "text/html")
 
         active, fn = route
         params = parse_qs(parsed.query)
@@ -453,7 +678,10 @@ class Handler(BaseHTTPRequestHandler):
         except QueryError as err:
             body = f'<div class="err">Dotaz do databáze selhal: {E(str(err))}</div>'
         except Exception as err:  # never show a stack trace at the edge
-            body = f'<div class="err">Neočekávaná chyba: {E(type(err).__name__)}</div>'
+            import traceback
+            traceback.print_exc()
+            body = (f'<div class="err">Neočekávaná chyba: {E(type(err).__name__)}: '
+                    f"{E(str(err)[:200])}</div>")
         self._send(200, page(body, active=active, refreshed=stamp()), "text/html")
 
     def _send(self, code, payload, ctype):
