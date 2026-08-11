@@ -1,0 +1,24 @@
+# outreach.lokwave.cz — the Lokwave outreach dashboard.
+#
+# Same shape as the Postiz route: Traefik only proxies, and the gate is
+# Cloudflare Access at the edge (email OTP, owner addresses only). The single
+# public entry point is the Cloudflare tunnel, so Access is genuinely the only
+# way in — the service itself binds 127.0.0.1 and is unreachable otherwise.
+#
+# Unlike Postiz there is NO bypass path here: nothing on this host needs to be
+# fetched anonymously. Every route is behind Access.
+http:
+  routers:
+    outreach-dashboard:
+      rule: Host(`outreach.lokwave.cz`)
+      priority: 10000
+      service: outreach-dashboard
+      entryPoints: [web]
+  services:
+    outreach-dashboard:
+      loadBalancer:
+        servers:
+          # host.docker.internal resolves to the host from inside Traefik, which
+          # is where the dashboard listens on loopback.
+          - url: http://172.17.0.1:8096
+        passHostHeader: true

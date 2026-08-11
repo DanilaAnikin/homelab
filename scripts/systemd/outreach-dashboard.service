@@ -1,0 +1,24 @@
+[Unit]
+Description=Lokwave outreach dashboard (outreach.lokwave.cz, behind Cloudflare Access)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root only because it reads both Postgres containers through
+# `docker exec`; it opens no socket beyond loopback and accepts no writes.
+ExecStart=/usr/bin/python3 /srv/homelab/scripts/outreach-dashboard.py
+Environment=OUTREACH_DASHBOARD_PORT=8096
+# Bind the docker bridge, not loopback: Traefik runs in a container and has to
+# reach it, while docker0 stays host-local so the LAN never sees this port.
+Environment=OUTREACH_DASHBOARD_BIND=172.17.0.1
+Restart=always
+RestartSec=10
+# Read-only view: nothing it does should be able to modify the host.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
