@@ -235,7 +235,7 @@ class HousekeepingUnitTests(unittest.TestCase):
         self.assertIn("RestrictAddressFamilies=AF_UNIX", discovery)
         self.assertIn("RestrictAddressFamilies=AF_UNIX", submit)
         self.assertNotIn("submit-hmac", submit)
-        self.assertNotIn("claude-token", discovery + submit)
+        self.assertNotIn("anthropic-api-key", discovery + submit)
 
 
 if __name__ == "__main__":

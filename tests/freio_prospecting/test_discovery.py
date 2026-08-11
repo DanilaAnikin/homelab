@@ -16,7 +16,11 @@ from freio_prospecting.discovery import (
     CLAUDE_TIMEOUT_SECONDS,
     DISCOVERY_OVERALL_BUDGET_SECONDS,
     DiscoveryEngine,
+    MAX_CLAUDE_STDIN_BYTES,
     ProcessOutput,
+    _extract_structured_output,
+    _load_anthropic_api_key,
+    _prepare_structured_schema,
     _run_bounded_command,
     run_claude_discovery,
 )
@@ -242,11 +246,78 @@ class ClaudeBoundaryTests(unittest.TestCase):
             Path(__file__).resolve().parents[2]
             / "scripts/systemd/freio-prospect-discovery.service"
         ).read_text(encoding="utf-8")
+        self.assertIn(
+            "ConditionPathExists=/etc/freio-prospecting/enabled/discovery\n",
+            unit,
+        )
+        self.assertIn("User=freio-discovery\n", unit)
+        self.assertIn("Group=freio-prospecting\n", unit)
         self.assertIn("RuntimeDirectory=freio-prospect-discovery\n", unit)
         self.assertIn("RuntimeDirectoryMode=0700\n", unit)
         self.assertIn("RuntimeDirectoryPreserve=no\n", unit)
+        self.assertIn(
+            "LoadCredential=anthropic-api-key:"
+            "/etc/freio-b2b-discovery/anthropic-api-key\n",
+            unit,
+        )
+        self.assertIn("--claude-auth-mode api-key", unit)
+        self.assertIn(
+            "--anthropic-api-key-file "
+            "/run/credentials/freio-prospect-discovery.service/"
+            "anthropic-api-key",
+            unit,
+        )
         self.assertIn("--claude-home /run/freio-prospect-discovery/claude-home", unit)
         self.assertNotIn("/var/lib/freio-prospecting/claude-home", unit)
+        self.assertNotIn("claude-token", unit)
+        self.assertNotIn("submit-hmac", unit)
+        self.assertNotIn("identity-index-hmac", unit)
+        self.assertNotIn("EnvironmentFile=", unit)
+
+    def test_cli_requires_explicit_api_key_auth_boundary(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/freio-prospecting/discover.py"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                (
+                    ["--spool", str(root / "first"), "--claude"],
+                    "--claude requires --claude-auth-mode api-key",
+                ),
+                (
+                    [
+                        "--spool",
+                        str(root / "second"),
+                        "--claude",
+                        "--claude-auth-mode",
+                        "api-key",
+                    ],
+                    "--claude-auth-mode api-key requires --anthropic-api-key-file",
+                ),
+                (
+                    [
+                        "--spool",
+                        str(root / "third"),
+                        "--housekeeping",
+                        "--claude-auth-mode",
+                        "api-key",
+                    ],
+                    "Claude authentication options require --claude",
+                ),
+            )
+            for arguments, expected in cases:
+                with self.subTest(expected=expected):
+                    completed = subprocess.run(
+                        [sys.executable, str(script), *arguments],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertEqual(json.loads(completed.stderr)["error"], expected)
 
     def test_claude_process_receives_only_minimal_environment_and_web_tools(
         self,
@@ -256,17 +327,26 @@ class ClaudeBoundaryTests(unittest.TestCase):
             binary = root / "claude"
             prompt = root / "prompt.txt"
             schema = root / "schema.json"
-            token = root / "token"
+            api_key_path = root / "anthropic-api-key"
             home = root / "state"
             binary.write_text("binary", encoding="utf-8")
             prompt.write_text("research", encoding="utf-8")
-            schema.write_text("{}", encoding="utf-8")
-            token.write_bytes(b"t" * 32)
-            for path in (binary, prompt, schema, token):
+            schema.write_text(
+                '{"$schema":"ignored","type":"object",'
+                '"additionalProperties":false,"minProperties":1}',
+                encoding="utf-8",
+            )
+            api_key = "sk-ant-" + "t" * 32
+            api_key_path.write_text(api_key + "\n", encoding="ascii")
+            for path in (binary, prompt, schema, api_key_path):
                 path.chmod(0o600)
             binary.chmod(0o700)
             completed = ProcessOutput(
-                returncode=0, stdout=b'{"schemaVersion":"1","candidates":[]}'
+                returncode=0,
+                stdout=(
+                    b'{"is_error":false,"structured_output":'
+                    b'{"schemaVersion":"1","candidates":[]}}'
+                ),
             )
             with mock.patch(
                 "freio_prospecting.discovery._run_bounded_command",
@@ -276,14 +356,38 @@ class ClaudeBoundaryTests(unittest.TestCase):
                     claude_binary=binary,
                     prompt_path=prompt,
                     schema_path=schema,
-                    claude_token_path=token,
+                    auth_mode="api-key",
+                    anthropic_api_key_path=api_key_path,
                     state_home=home,
                 )
             self.assertTrue(output.startswith(b"{"))
             command = run.call_args.args[0]
             environment = run.call_args.kwargs["environment"]
+            stdin_data = run.call_args.kwargs["stdin_data"]
             self.assertEqual(
-                command[command.index("--tools") + 1], "WebSearch,WebFetch"
+                command[1:],
+                [
+                    "--print",
+                    "--model",
+                    "claude-sonnet-5",
+                    "--max-budget-usd",
+                    "1.00",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--output-format",
+                    "json",
+                    "--input-format",
+                    "text",
+                    "--no-session-persistence",
+                    "--safe-mode",
+                    "--strict-mcp-config",
+                    "--tools",
+                    "WebSearch,WebFetch",
+                    "--allowedTools",
+                    "WebSearch,WebFetch",
+                    "--json-schema",
+                    '{"type":"object","additionalProperties":false}',
+                ],
             )
             self.assertNotIn("FREIO_PROSPECTING_HMAC", environment)
             self.assertEqual(
@@ -294,19 +398,154 @@ class ClaudeBoundaryTests(unittest.TestCase):
                     "LANG",
                     "LC_ALL",
                     "NO_COLOR",
-                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    "ANTHROPIC_API_KEY",
                 },
             )
-            self.assertEqual(environment["CLAUDE_CODE_OAUTH_TOKEN"], "t" * 32)
+            self.assertEqual(environment["ANTHROPIC_API_KEY"], api_key)
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+            self.assertNotIn(api_key, " ".join(command))
+            self.assertNotIn(api_key.encode("ascii"), stdin_data)
+            self.assertIn(b"research", stdin_data)
+            self.assertNotIn(b"ignored", stdin_data)
+            self.assertNotIn("research", command)
+            self.assertEqual(home.stat().st_mode & 0o777, 0o700)
 
-    def test_claude_failure_does_not_echo_stderr_or_token(self) -> None:
+    def test_structured_schema_removes_only_locally_enforced_constraints(
+        self,
+    ) -> None:
+        transformed = json.loads(
+            _prepare_structured_schema(
+                json.dumps(
+                    {
+                        "$schema": "ignored",
+                        "$id": "ignored",
+                        "title": "kept",
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["candidates"],
+                        "properties": {
+                            "candidates": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 30,
+                                "uniqueItems": True,
+                                "items": {
+                                    "type": "object",
+                                    "allOf": [
+                                        {
+                                            "if": {"required": ["handle"]},
+                                            "then": {"required": ["socialChannel"]},
+                                        }
+                                    ],
+                                },
+                            }
+                        },
+                    }
+                )
+            )
+        )
+        self.assertEqual(
+            transformed,
+            {
+                "title": "kept",
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["candidates"],
+                "properties": {
+                    "candidates": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    }
+                },
+            },
+        )
+
+    def test_rejects_invalid_or_failed_structured_output_envelopes(self) -> None:
+        cases = (
+            b"not-json",
+            b'{"is_error":false,"is_error":false,"structured_output":{}}',
+            b'{"is_error":true,"structured_output":{}}',
+            b'{"is_error":false,"structured_output":null}',
+            b'{"is_error":false,"structured_output":{"value":NaN}}',
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValidationError):
+                    _extract_structured_output(raw)
+
+    def test_rejects_implicit_auth_mode_before_reading_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = {
-                name: root / name for name in ("claude", "prompt", "schema", "token")
+                name: root / name
+                for name in ("claude", "prompt", "schema", "anthropic-api-key")
             }
             for name, path in paths.items():
-                path.write_bytes((b"t" * 32) if name == "token" else b"x")
+                path.write_bytes(
+                    b"sk-ant-" + b"t" * 32
+                    if name == "anthropic-api-key"
+                    else b"{}"
+                    if name == "schema"
+                    else b"x"
+                )
+                path.chmod(0o600)
+            paths["claude"].chmod(0o700)
+            with mock.patch(
+                "freio_prospecting.discovery._load_anthropic_api_key"
+            ) as load:
+                with self.assertRaisesRegex(
+                    ValidationError, "authentication mode must be api-key"
+                ):
+                    run_claude_discovery(
+                        claude_binary=paths["claude"],
+                        prompt_path=paths["prompt"],
+                        schema_path=paths["schema"],
+                        auth_mode="oauth-token",
+                        anthropic_api_key_path=paths["anthropic-api-key"],
+                        state_home=root / "home",
+                    )
+            load.assert_not_called()
+
+    def test_api_key_permissions_accept_only_private_or_exact_systemd_file(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credential = root / "anthropic-api-key"
+            api_key = "a" * 64
+            credential.write_text(api_key + "\n", encoding="ascii")
+            credential.chmod(0o600)
+            self.assertEqual(_load_anthropic_api_key(credential), api_key)
+            credential.chmod(0o440)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValidationError):
+                    _load_anthropic_api_key(credential)
+            with mock.patch.dict(
+                os.environ,
+                {"CREDENTIALS_DIRECTORY": str(root)},
+                clear=True,
+            ):
+                self.assertEqual(_load_anthropic_api_key(credential), api_key)
+                credential.chmod(0o640)
+                with self.assertRaises(ValidationError):
+                    _load_anthropic_api_key(credential)
+
+    def test_claude_failure_does_not_echo_stderr_or_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            api_key = "sk-ant-" + "t" * 32
+            paths = {
+                name: root / name
+                for name in ("claude", "prompt", "schema", "anthropic-api-key")
+            }
+            for name, path in paths.items():
+                path.write_bytes(
+                    api_key.encode("ascii")
+                    if name == "anthropic-api-key"
+                    else b"{}"
+                    if name == "schema"
+                    else b"x"
+                )
                 path.chmod(0o600)
             paths["claude"].chmod(0o700)
             completed = ProcessOutput(returncode=7, stdout=b"")
@@ -319,10 +558,12 @@ class ClaudeBoundaryTests(unittest.TestCase):
                         claude_binary=paths["claude"],
                         prompt_path=paths["prompt"],
                         schema_path=paths["schema"],
-                        claude_token_path=paths["token"],
+                        auth_mode="api-key",
+                        anthropic_api_key_path=paths["anthropic-api-key"],
                         state_home=root / "home",
                     )
             self.assertNotIn("secret diagnostics", str(raised.exception))
+            self.assertNotIn(api_key, str(raised.exception))
 
     def test_process_output_pipe_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -336,6 +577,18 @@ class ClaudeBoundaryTests(unittest.TestCase):
                     cwd=Path(directory),
                     environment={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
                     timeout_seconds=5,
+                    stdin_data=b"bounded input",
+                )
+
+    def test_process_input_pipe_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValidationError, "input.*96 KiB"):
+                _run_bounded_command(
+                    [sys.executable, "-c", "raise SystemExit(0)"],
+                    cwd=Path(directory),
+                    environment={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                    timeout_seconds=5,
+                    stdin_data=b"x" * (MAX_CLAUDE_STDIN_BYTES + 1),
                 )
 
 

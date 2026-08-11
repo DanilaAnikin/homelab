@@ -8,8 +8,8 @@ Tento worker připravuje influencer/ambassador kandidáty pro Freio, ale sám ni
 
 ## Bezpečnostní hranice
 
-- Discovery služba nikdy nemá submit HMAC klíč. Má případně jen vlastní Claude credential a nemůže zapisovat do `processing`, `processed` ani submit quarantine.
-- Submit služba nedostává Claude credential a nikdy nespouští LLM.
+- Discovery služba nikdy nemá submit HMAC klíč. Pro Claude CLI má pouze discovery-only Anthropic API key a nemůže zapisovat do `processing`, `processed` ani submit quarantine.
+- Submit služba nedostává Anthropic API key a nikdy nespouští LLM.
 - Transportní HMAC a stabilní `identity-index-hmac` jsou dva různé 64znakové lowercase-hex secrety. Discovery nemá ani jeden; submit housekeeping dostane pouze identity credential přes `LoadCredential`, discovery housekeeping žádný credential.
 - LLM výstup je nedůvěryhodný: parser odmítá neznámá pole, více než 30 kandidátů, ne-HTTPS URL, neplatné typy i nekonzistentní handle/channel.
 - Discovery preview nikdy nevytváří autorizující receipt. Submit identita ignoruje veškerá případná tvrzení discovery procesu a bezprostředně před HMAC podpisem provede vlastní deterministický refetch každého kandidáta.
@@ -22,6 +22,8 @@ Tento worker připravuje influencer/ambassador kandidáty pro Freio, ale sám ni
 - Spool používá atomické přechody `ready -> processing -> processed hash-only receipt` nebo per-candidate quarantine. Canonical request bytes se uloží před prvním POSTem. Timeout/DNS/network/408/425/429/5xx mají exponenciální, nejvýše pět pokusů a 24hodinové okno; request retry je byte-for-byte stejný se stejným `Idempotency-Key`. Po nejasném vyčerpání vznikne hash-only `uncertain` tombstone a vyžaduje DB/operator reconciliation. Nikdy se tiše nesmaže request, který mohl commitnout vzdáleně.
 - Dlouhodobý index neobsahuje handle, e-mail ani URL. Obsahuje jen domain-separated keyed HMAC identity (social channel+normalizovaný handle, normalizovaný e-mail; source URL jen fallback bez social/e-mailu), receipt/research hash a stav. První přijatá identita vyhrává; rediscovery se před POSTem přeskočí a změny se dělají ručně v dashboardu. Transport secret lze rotovat samostatně, identity secret musí zůstat stabilní. Jeho rotace vyžaduje vypnout submit a DB-backed rebuild celého indexu; automatický rekey z hashů není možný.
 - Po 2xx se raw manifest i request smažou a zůstane jen omezený hash-only receipt s explicitní 30denní expirací. `ready`, deferred a terminal quarantine raw data i opuštěné atomic temp soubory mají 72hodinovou TTL. Dva nezávislé housekeeping timery ji vymáhají i při vypnuté discovery/submit službě. Jedinou záměrnou výjimkou je aktivní nejasný request za otevřeným global circuit/journalem, který se zachová do explicitního operator rozhodnutí.
+- Claude CLI je vždy spouštěn s explicitní lokální hranicí `--claude-auth-mode api-key`; jediný credential se do minimálního allowlistu prostředí procesu mapuje jako oficiální `ANTHROPIC_API_KEY`. Worker neodvozuje typ credentialu z hodnoty, nepodporuje v této službě OAuth token a key nikdy nevkládá do argv, promptu ani vlastního logu.
+- Claude běží v auditované neinteraktivní konfiguraci shodné s B2B discovery: přesný model `claude-sonnet-5`, maximálně `1.00` USD na běh, `--permission-mode dontAsk`, `--safe-mode`, explicitní allowlist pouze `WebSearch,WebFetch` a strukturovaný JSON schema output. Prompt jde bounded stdin pipe, nikoli argv; plný schema kontrakt se po návratu znovu vynucuje lokálně.
 - Claude CLI dostává `HOME` pouze v privátním systemd `RuntimeDirectory`; po každém ukončení discovery unitu systemd celý adresář odstraní (`RuntimeDirectoryPreserve=no`). Cache, logy ani metadata Claude CLI proto nezůstávají mimo 72h spool retention.
 - 400/401/403/404/405/413/415, redirect/protocol drift nebo nevalidní 2xx otevřou hash-only global circuit, zastaví celý běh a zachovají aktuální i sousední kandidáty. `409` přesune jen jeden kandidát do `uncertain` a také zastaví běh.
 - Textové limity používají stejné UTF-16 code units jako Zod/JavaScript; lone surrogate selže jako validace, nikoli runtime crash.
@@ -88,7 +90,7 @@ sudo systemctl daemon-reload
 
 Do tohoto okamžiku se nevytváří žádný soubor v `/etc/freio-prospecting/enabled/`, nevolá se `systemctl enable` a neukládají se credentials. Root spool musí zůstat přesně bez group/other write; `Spool.ensure()` konfiguraci 0770 fail-closed odmítne.
 
-Pro budoucí Claude discovery se uloží samostatný token do `/etc/freio-prospecting/claude-token` s režimem `0600`. Transport a identity klíče jsou doslovné ASCII výstupy dvou samostatných `openssl rand -hex 32`; Freio env obsahuje stejných 64 znaků transport klíče bez newline. Soubory mají režim `0600` a nikdy nepatří do Gitu:
+Influencer discovery bezpečně znovupoužívá existující discovery-only Anthropic API key v `/etc/freio-b2b-discovery/anthropic-api-key` s vlastníkem `root:root` a režimem `0600`; nevytváří druhou kopii ani OAuth token. PID 1 ho zpřístupní pouze discovery procesu jako privátní systemd credential `anthropic-api-key`. Obsah se nesmí vypisovat do shellu, journalu ani validačních výstupů. Transport a identity klíče jsou doslovné ASCII výstupy dvou samostatných `openssl rand -hex 32`; Freio env obsahuje stejných 64 znaků transport klíče bez newline. Soubory mají režim `0600` a nikdy nepatří do Gitu:
 
 ```bash
 openssl rand -hex 32 | sudo tee /etc/freio-prospecting/submit-hmac >/dev/null
@@ -112,7 +114,7 @@ Po nasazení a otestování HMAC receiveru se každá vrstva zapíná zvlášť:
 4. Vytvořit marker `enabled/submit`, ručně spustit submit service a ověřit hash-only receipt v `processed` a nulový raw obsah po 2xx.
 5. Teprve po acceptance checks lze zapnout discovery/submit timers. Master switch skutečného outreach odesílání zůstává mimo tento worker a vypnutý do samostatného schválení.
 
-Oba housekeeping procesy běží pod existujícími oddělenými identitami: discovery cleanup nevidí submit `0700` adresáře ani credentialy, submit cleanup nevidí Claude credential ani discovery private adresáře. Žádný housekeeping proces neběží jako root a oba mají zakázanou IP síť (`RestrictAddressFamilies=AF_UNIX`).
+Oba housekeeping procesy běží pod existujícími oddělenými identitami: discovery cleanup nevidí submit `0700` adresáře ani credentialy, submit cleanup nevidí Anthropic API key ani discovery private adresáře. Žádný housekeeping proces neběží jako root a oba mají zakázanou IP síť (`RestrictAddressFamilies=AF_UNIX`).
 
 ## Operator reconciliation a global circuit
 

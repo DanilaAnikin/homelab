@@ -33,9 +33,17 @@ def parse_arguments() -> argparse.Namespace:
         "--claude-bin", type=Path, default=Path("/usr/local/bin/claude")
     )
     parser.add_argument(
-        "--claude-token-file",
+        "--claude-auth-mode",
+        choices=("api-key",),
+        help="Explicit Claude authentication mode. Only api-key is supported.",
+    )
+    parser.add_argument(
+        "--anthropic-api-key-file",
         type=Path,
-        help="A discovery-only Claude credential. Never use the submit HMAC credential here.",
+        help=(
+            "A discovery-only Anthropic API key file. Never use a submit HMAC "
+            "credential here."
+        ),
     )
     parser.add_argument(
         "--prompt",
@@ -66,12 +74,28 @@ def read_input(path: Path) -> bytes:
     return raw
 
 
+def validate_claude_auth_arguments(arguments: argparse.Namespace) -> None:
+    has_auth_mode = arguments.claude_auth_mode is not None
+    has_api_key_file = arguments.anthropic_api_key_file is not None
+    if not arguments.claude:
+        if has_auth_mode or has_api_key_file:
+            raise ValidationError("Claude authentication options require --claude")
+        return
+    if arguments.claude_auth_mode != "api-key":
+        raise ValidationError("--claude requires --claude-auth-mode api-key")
+    if not has_api_key_file:
+        raise ValidationError(
+            "--claude-auth-mode api-key requires --anthropic-api-key-file"
+        )
+
+
 def main() -> int:
     arguments = parse_arguments()
     spool = Spool(arguments.spool)
     started = time.monotonic()
     deadline = started + DISCOVERY_OVERALL_BUDGET_SECONDS
     try:
+        validate_claude_auth_arguments(arguments)
         if arguments.housekeeping:
             purged = spool.purge_expired(scope="discovery")
             print(
@@ -91,8 +115,6 @@ def main() -> int:
         if arguments.input_json:
             raw = read_input(arguments.input_json)
         else:
-            if not arguments.claude_token_file:
-                raise ValidationError("--claude requires --claude-token-file")
             remaining = deadline - time.monotonic()
             claude_timeout = min(240, int(remaining - 30))
             if claude_timeout < 1:
@@ -103,7 +125,8 @@ def main() -> int:
                 claude_binary=arguments.claude_bin,
                 prompt_path=arguments.prompt,
                 schema_path=arguments.schema,
-                claude_token_path=arguments.claude_token_file,
+                auth_mode=arguments.claude_auth_mode,
+                anthropic_api_key_path=arguments.anthropic_api_key_file,
                 state_home=arguments.claude_home,
                 timeout_seconds=claude_timeout,
             )
