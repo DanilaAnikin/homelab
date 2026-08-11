@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICE = ROOT / "scripts/systemd/freio-telegram-handoff.service"
+CANARY_SERVICE = ROOT / "scripts/systemd/freio-telegram-handoff-canary.service"
 TIMER = ROOT / "scripts/systemd/freio-telegram-handoff.timer"
 HEALTH_SERVICE = ROOT / "scripts/systemd/freio-telegram-handoff-health.service"
 HEALTH_TIMER = ROOT / "scripts/systemd/freio-telegram-handoff-health.timer"
@@ -17,6 +18,7 @@ class SystemdContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.service = SERVICE.read_text(encoding="utf-8")
+        cls.canary_service = CANARY_SERVICE.read_text(encoding="utf-8")
         cls.timer = TIMER.read_text(encoding="utf-8")
         cls.health_service = HEALTH_SERVICE.read_text(encoding="utf-8")
         cls.health_timer = HEALTH_TIMER.read_text(encoding="utf-8")
@@ -87,6 +89,41 @@ class SystemdContractTests(unittest.TestCase):
         self.assertIn("Persistent=false", self.timer)
         self.assertNotIn("Persistent=true", self.timer)
 
+    def test_canary_is_a_static_explicitly_marked_one_shot(self) -> None:
+        self.assertIn(
+            "ConditionPathExists=/etc/freio-telegram-handoff/canary-enabled",
+            self.canary_service,
+        )
+        self.assertIn(
+            "ConditionPathExists=!/etc/freio-telegram-handoff/enabled",
+            self.canary_service,
+        )
+        self.assertIn(
+            "ExecStart=/usr/local/libexec/freio-telegram-handoff --canary",
+            self.canary_service,
+        )
+        self.assertNotIn("[Install]", self.canary_service)
+        self.assertNotIn("WantedBy=", self.canary_service)
+        for credential in (
+            "telegram-token:/etc/homelab-telegram/telegram-token",
+            "telegram-chat-id:/etc/homelab-telegram/telegram-chat-id",
+            "freio-machine-secret:/etc/freio-telegram-handoff/freio-machine-secret",
+        ):
+            self.assertIn(f"LoadCredential={credential}", self.canary_service)
+        for hardening in (
+            "DynamicUser=true",
+            "StateDirectory=freio-telegram-handoff",
+            "NoNewPrivileges=true",
+            "ProtectSystem=strict",
+            "ProtectHome=true",
+            "MemoryDenyWriteExecute=true",
+            "CapabilityBoundingSet=",
+            "AmbientCapabilities=",
+        ):
+            self.assertIn(hardening, self.canary_service)
+        self.assertNotIn("Environment=", self.canary_service)
+        self.assertNotIn("EnvironmentFile=", self.canary_service)
+
     def test_health_service_is_root_private_and_uses_existing_failure_transport(
         self,
     ) -> None:
@@ -154,6 +191,12 @@ class SystemdContractTests(unittest.TestCase):
         self.assertIn("`priority` je přesně jeden z enumů", lowered)
         self.assertIn("heartbeat-v1.json", lowered)
         self.assertIn("freio-telegram-handoff-health.timer", lowered)
+        self.assertIn("authorize_b2b_telegram_handoff_canary", lowered)
+        self.assertIn("authorize_pii_free_telegram_handoff_canary_v1", lowered)
+        self.assertIn("syntetickou inquiry", lowered)
+        self.assertIn("nikdy neresetovat existující `dead`", lowered)
+        self.assertIn("canary-enabled", lowered)
+        self.assertIn("hlavní gate", lowered)
         self.assertIn("10 minut", lowered)
         self.assertIn("raw e-mail", lowered)
         self.assertIn("llm shrnutí", lowered)

@@ -42,11 +42,12 @@ NETWORK_RETRY_SECONDS = 120
 MIN_RETRY_SECONDS = 30
 MAX_RETRY_SECONDS = 86_400
 MESSAGE_HEADING = "Freio outreach"
+CANARY_DEEP_LINK = "https://outreach.freio.cz/?section=overview"
+CANARY_KIND = "system_canary"
 HEARTBEAT_STATUSES = frozenset({"idle", "sent", "retry", "error"})
 
 UUID_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
-    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-" r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
 ERROR_CODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,119}$")
@@ -147,10 +148,12 @@ class InvalidClaimPayload(DispatcherFailure):
         self,
         notification_id: str | None = None,
         claim_id: str | None = None,
+        is_canary: bool = False,
     ) -> None:
         super().__init__("invalid claim payload")
         self.notification_id = notification_id
         self.claim_id = claim_id
+        self.is_canary = is_canary
 
 
 @dataclass(frozen=True)
@@ -303,6 +306,7 @@ class Notification:
     priority: str
     action_summary: ActionSummary
     deep_link: str
+    is_canary: bool = False
 
 
 @dataclass(frozen=True)
@@ -314,6 +318,7 @@ class Finalization:
     error_code: str | None = None
     retry_after_seconds: int | None = None
     open_circuit: bool = False
+    is_canary: bool = False
 
     def api_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -327,6 +332,8 @@ class Finalization:
             payload["errorCode"] = self.error_code
         if self.retry_after_seconds is not None:
             payload["retryAfterSeconds"] = self.retry_after_seconds
+        if self.is_canary:
+            payload["canary"] = True
         return payload
 
     def state_payload(self) -> dict[str, Any]:
@@ -356,10 +363,13 @@ class Finalization:
             "providerMessageId",
             "errorCode",
             "retryAfterSeconds",
+            "canary",
         }
         if not {"notificationId", "claimId", "outcome"}.issubset(payload):
             raise ConfigurationFailure()
         if not set(payload).issubset(allowed):
+            raise ConfigurationFailure()
+        if "canary" in payload and payload["canary"] is not True:
             raise ConfigurationFailure()
         finalization = cls(
             notification_id=_strict_uuid(payload["notificationId"]),
@@ -369,6 +379,7 @@ class Finalization:
             error_code=payload.get("errorCode"),
             retry_after_seconds=payload.get("retryAfterSeconds"),
             open_circuit=raw["openCircuit"],
+            is_canary=payload.get("canary", False),
         )
         _validate_finalization(finalization)
         return finalization
@@ -416,6 +427,8 @@ def _strict_uuid(value: Any) -> str:
 
 
 def _validate_finalization(finalization: Finalization) -> None:
+    if not isinstance(finalization.is_canary, bool):
+        raise ConfigurationFailure()
     if not isinstance(finalization.outcome, str) or finalization.outcome not in {
         "sent",
         "retry",
@@ -513,7 +526,7 @@ def _parse_action_summary(value: Any) -> ActionSummary:
 
 
 def _parse_notification(value: Any) -> Notification:
-    if not isinstance(value, dict) or set(value) != {
+    base_keys = {
         "id",
         "claimId",
         "eventId",
@@ -521,8 +534,13 @@ def _parse_notification(value: Any) -> Notification:
         "priority",
         "actionSummary",
         "deepLink",
-    }:
+    }
+    if not isinstance(value, dict):
         raise InvalidClaimPayload()
+    is_canary = value.get("canary") is True
+    expected_keys = base_keys | ({"canary"} if is_canary else set())
+    if set(value) != expected_keys:
+        raise InvalidClaimPayload(is_canary=is_canary)
 
     notification_id: str | None = None
     claim_id: str | None = None
@@ -530,22 +548,33 @@ def _parse_notification(value: Any) -> Notification:
         notification_id = _strict_uuid(value["id"])
         claim_id = _strict_uuid(value["claimId"])
     except ConfigurationFailure:
-        raise InvalidClaimPayload() from None
+        raise InvalidClaimPayload(is_canary=is_canary) from None
 
     try:
         event_id = _strict_uuid(value["eventId"])
         kind = value["kind"]
-        if not isinstance(kind, str) or kind not in EVENT_KINDS:
-            raise ConfigurationFailure()
         priority = value["priority"]
-        if not isinstance(priority, str) or priority not in PRIORITIES:
-            raise ConfigurationFailure()
         action_summary = _parse_action_summary(value["actionSummary"])
-        expected_link = _canonical_deep_link(event_id)
+        if is_canary:
+            if (
+                event_id != notification_id
+                or kind != CANARY_KIND
+                or priority != "normal"
+                or action_summary
+                != ActionSummary(intent=None, offer_count=0, latest_offer=None)
+            ):
+                raise ConfigurationFailure()
+            expected_link = CANARY_DEEP_LINK
+        else:
+            if not isinstance(kind, str) or kind not in EVENT_KINDS:
+                raise ConfigurationFailure()
+            if not isinstance(priority, str) or priority not in PRIORITIES:
+                raise ConfigurationFailure()
+            expected_link = _canonical_deep_link(event_id)
         if value["deepLink"] != expected_link:
             raise ConfigurationFailure()
     except ConfigurationFailure:
-        raise InvalidClaimPayload(notification_id, claim_id) from None
+        raise InvalidClaimPayload(notification_id, claim_id, is_canary) from None
 
     return Notification(
         notification_id=notification_id,
@@ -555,6 +584,7 @@ def _parse_notification(value: Any) -> Notification:
         priority=priority,
         action_summary=action_summary,
         deep_link=expected_link,
+        is_canary=is_canary,
     )
 
 
@@ -793,8 +823,15 @@ class StateStore:
 
 
 class FreioClient:
-    def __init__(self, transport: Transport, machine_secret: str) -> None:
+    def __init__(
+        self,
+        transport: Transport,
+        machine_secret: str,
+        *,
+        canary: bool = False,
+    ) -> None:
         self.transport = transport
+        self.canary = canary
         self.headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {machine_secret}",
@@ -806,7 +843,7 @@ class FreioClient:
         # The machine route uses the same bounded JSON boundary as finalize.
         # Send the one canonical representation of its strict empty object
         # schema; a zero-byte POST is correctly rejected as unsupported input.
-        body = b"{}"
+        body = _canonical_json({"canary": True} if self.canary else {})
         return self.transport.request(
             "POST",
             CLAIM_URL,
@@ -839,6 +876,16 @@ def _format_czk(value: int) -> str:
 
 
 def build_telegram_text(notification: Notification) -> str:
+    if notification.is_canary:
+        return "\n".join(
+            [
+                MESSAGE_HEADING,
+                "Akce: Ověřit interní Telegram handoff.",
+                "Priorita: běžná",
+                "Kontext: systémový canary bez zákaznických dat.",
+                f"Freio přehled: {notification.deep_link}",
+            ]
+        )
     lines = [
         MESSAGE_HEADING,
         f"Akce: {ACTION_LABELS[notification.kind]}",
@@ -975,6 +1022,7 @@ def _telegram_http_finalization(
             error_code=error_code,
             retry_after_seconds=retry_after_seconds,
             open_circuit=open_circuit,
+            is_canary=notification.is_canary,
         )
 
     if response.status == 200:
@@ -1037,10 +1085,13 @@ class Dispatcher:
         state: StateStore,
         freio: FreioClient,
         telegram: TelegramClient,
+        *,
+        canary_mode: bool = False,
     ) -> None:
         self.state = state
         self.freio = freio
         self.telegram = telegram
+        self.canary_mode = canary_mode
         self.last_run_status = "error"
 
     def _finish(self, status: str, exit_code: int) -> int:
@@ -1109,6 +1160,10 @@ class Dispatcher:
         return self._finish(self._finalization_status(finalization), 0)
 
     def _invalid_claim(self, error: InvalidClaimPayload) -> int:
+        if error.is_canary != self.canary_mode:
+            self.state.open_circuit("freio_claim_mode_mismatch")
+            _log("claim_circuit_open")
+            return self._finish("error", 78)
         if error.notification_id and error.claim_id:
             return self._persist_and_finalize(
                 Finalization(
@@ -1117,6 +1172,7 @@ class Dispatcher:
                     outcome="dead",
                     error_code="freio_invalid_claim_payload",
                     open_circuit=True,
+                    is_canary=error.is_canary,
                 )
             )
         self.state.open_circuit("freio_invalid_claim_envelope")
@@ -1130,6 +1186,10 @@ class Dispatcher:
 
         pending = self.state.load_pending()
         if pending is not None:
+            if pending.is_canary != self.canary_mode:
+                self.state.open_circuit("freio_pending_mode_mismatch")
+                _log("finalize_recovery_circuit_open")
+                return self._finish("error", 78)
             if not self._finalize_pending(pending):
                 if self.state.circuit_open():
                     _log("finalize_recovery_circuit_open")
@@ -1169,9 +1229,17 @@ class Dispatcher:
             _log("claim_circuit_open")
             return self._finish("error", 78)
 
+        if notification is None and self.canary_mode:
+            self.state.open_circuit("freio_canary_claim_missing")
+            _log("claim_circuit_open")
+            return self._finish("error", 78)
         if notification is None:
             _log("idle")
             return self._finish("idle", 0)
+        if notification.is_canary != self.canary_mode:
+            self.state.open_circuit("freio_claim_mode_mismatch")
+            _log("claim_circuit_open")
+            return self._finish("error", 78)
 
         # Persist a conservative terminal decision before entering the network
         # call. If the process dies anywhere around sendMessage, recovery can
@@ -1183,6 +1251,7 @@ class Dispatcher:
                 outcome="uncertain",
                 error_code="telegram_attempt_interrupted",
                 open_circuit=True,
+                is_canary=notification.is_canary,
             )
         )
 
@@ -1196,6 +1265,7 @@ class Dispatcher:
                     outcome="uncertain",
                     error_code="telegram_timeout_ambiguous",
                     open_circuit=True,
+                    is_canary=notification.is_canary,
                 )
             )
         except AmbiguousTransport:
@@ -1206,6 +1276,7 @@ class Dispatcher:
                     outcome="uncertain",
                     error_code="telegram_transport_ambiguous",
                     open_circuit=True,
+                    is_canary=notification.is_canary,
                 )
             )
         except NetworkUnavailable:
@@ -1216,6 +1287,7 @@ class Dispatcher:
                     outcome="retry",
                     error_code="telegram_network_unavailable",
                     retry_after_seconds=NETWORK_RETRY_SECONDS,
+                    is_canary=notification.is_canary,
                 )
             )
         except TlsValidationFailure:
@@ -1226,6 +1298,7 @@ class Dispatcher:
                     outcome="dead",
                     error_code="telegram_tls_failure",
                     open_circuit=True,
+                    is_canary=notification.is_canary,
                 )
             )
         except Exception:
@@ -1236,6 +1309,7 @@ class Dispatcher:
                     outcome="uncertain",
                     error_code="telegram_internal_ambiguous",
                     open_circuit=True,
+                    is_canary=notification.is_canary,
                 )
             )
 
@@ -1259,8 +1333,17 @@ def _best_effort_error_heartbeat(state: StateStore) -> None:
         pass
 
 
-def main() -> int:
+def _parse_canary_mode(arguments: list[str]) -> bool:
+    if not arguments:
+        return False
+    if arguments == ["--canary"]:
+        return True
+    raise ConfigurationFailure()
+
+
+def main(arguments: list[str] | None = None) -> int:
     try:
+        canary = _parse_canary_mode(sys.argv[1:] if arguments is None else arguments)
         state = StateStore()
         with state.lock():
             try:
@@ -1268,12 +1351,17 @@ def main() -> int:
                 transport = UrllibTransport()
                 dispatcher = Dispatcher(
                     state=state,
-                    freio=FreioClient(transport, credentials.freio_machine_secret),
+                    freio=FreioClient(
+                        transport,
+                        credentials.freio_machine_secret,
+                        canary=canary,
+                    ),
                     telegram=TelegramClient(
                         transport,
                         credentials.telegram_token,
                         credentials.telegram_chat_id,
                     ),
+                    canary_mode=canary,
                 )
                 return run_and_record_heartbeat(dispatcher)
             except ConfigurationFailure:

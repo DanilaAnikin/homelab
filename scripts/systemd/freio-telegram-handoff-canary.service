@@ -1,0 +1,60 @@
+[Unit]
+Description=One-shot Freio Telegram owner handoff acceptance canary
+Documentation=file:/srv/homelab/docs/freio-telegram-handoff.md
+Wants=network-online.target
+After=network-online.target tailscaled.service
+ConditionPathExists=/etc/freio-telegram-handoff/canary-enabled
+ConditionPathExists=!/etc/freio-telegram-handoff/enabled
+ConditionFileIsExecutable=/usr/local/libexec/freio-telegram-handoff
+OnFailure=notify-failure@freio-telegram-handoff-canary.service
+
+[Service]
+Type=oneshot
+DynamicUser=true
+UMask=0077
+StateDirectory=freio-telegram-handoff
+StateDirectoryMode=0700
+RuntimeDirectory=freio-telegram-handoff
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+
+LoadCredential=telegram-token:/etc/homelab-telegram/telegram-token
+LoadCredential=telegram-chat-id:/etc/homelab-telegram/telegram-chat-id
+LoadCredential=freio-machine-secret:/etc/freio-telegram-handoff/freio-machine-secret
+
+ExecStart=/usr/local/libexec/freio-telegram-handoff --canary
+TimeoutStartSec=70s
+LimitCORE=0
+Restart=no
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=-/etc/homelab-telegram -/srv/frem/telegram-token -/srv/homelab/secrets
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+KeyringMode=private
+RemoveIPC=true
+TasksMax=32
+MemoryMax=128M

@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.freio_telegram_handoff.dispatcher import (
+    CANARY_DEEP_LINK,
     CLAIM_URL,
     FINALIZE_URL,
     MESSAGE_HEADING,
@@ -30,6 +31,7 @@ from scripts.freio_telegram_handoff.dispatcher import (
     UrllibTransport,
     load_credentials,
     main as dispatcher_main,
+    _parse_canary_mode,
     parse_claim_response,
     run_and_record_heartbeat,
 )
@@ -91,6 +93,25 @@ def claim_response(
             }
         },
     )
+
+
+def canary_claim_response(**overrides: object) -> HttpResponse:
+    notification: dict[str, object] = {
+        "id": NOTIFICATION_ID,
+        "claimId": CLAIM_ID,
+        "eventId": NOTIFICATION_ID,
+        "kind": "system_canary",
+        "priority": "normal",
+        "actionSummary": {
+            "intent": None,
+            "offerCount": 0,
+            "latestOffer": None,
+        },
+        "deepLink": CANARY_DEEP_LINK,
+        "canary": True,
+    }
+    notification.update(overrides)
+    return response(200, {"notification": notification})
 
 
 def finalize_success() -> HttpResponse:
@@ -164,10 +185,17 @@ class DispatcherTests(unittest.TestCase):
         claim_effect: object,
         telegram_effect: object,
         finalize_effects: list[object] | None = None,
+        *,
+        canary_mode: bool = False,
     ) -> tuple[int, FakeFreio, FakeTelegram, str]:
         freio = FakeFreio(claim_effect, finalize_effects)
         telegram = FakeTelegram(telegram_effect)
-        dispatcher = Dispatcher(self.state, freio, telegram)
+        dispatcher = Dispatcher(
+            self.state,
+            freio,
+            telegram,
+            canary_mode=canary_mode,
+        )
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             result = dispatcher.run()
@@ -203,6 +231,75 @@ class DispatcherTests(unittest.TestCase):
         self.assertNotIn(NOTIFICATION_ID, output)
         self.assertNotIn(EVENT_ID, output)
         self.assertNotIn("outreach.freio.cz", output)
+
+    def test_one_shot_canary_uses_only_the_canary_finalize_path(self) -> None:
+        result, freio, telegram, output = self.run_dispatcher(
+            canary_claim_response(),
+            telegram_success(777),
+            canary_mode=True,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(telegram.links, [CANARY_DEEP_LINK])
+        self.assertEqual(len(freio.finalizations), 1)
+        finalization = freio.finalizations[0]
+        self.assertTrue(finalization.is_canary)
+        self.assertEqual(finalization.outcome, "sent")
+        self.assertEqual(finalization.provider_message_id, "777")
+        self.assertFalse(self.state.pending_path.exists())
+        self.assertNotIn(NOTIFICATION_ID, output)
+        self.assertNotIn(CANARY_DEEP_LINK, output)
+
+    def test_canary_mode_rejects_null_instead_of_reporting_idle(self) -> None:
+        result, freio, telegram, output = self.run_dispatcher(
+            response(200, {"notification": None}),
+            telegram_success(),
+            canary_mode=True,
+        )
+
+        self.assertEqual(result, 78)
+        self.assertEqual(telegram.links, [])
+        self.assertEqual(freio.finalizations, [])
+        self.assertTrue(self.state.circuit_path.exists())
+        self.assertEqual(self.last_run_status, "error")
+        self.assertIn('"event":"claim_circuit_open"', output)
+
+    def test_canary_mode_never_sends_or_finalizes_a_customer_claim(self) -> None:
+        result, freio, telegram, output = self.run_dispatcher(
+            claim_response(),
+            telegram_success(),
+            canary_mode=True,
+        )
+
+        self.assertEqual(result, 78)
+        self.assertEqual(telegram.links, [])
+        self.assertEqual(freio.finalizations, [])
+        self.assertTrue(self.state.circuit_path.exists())
+        self.assertNotIn(NOTIFICATION_ID, output)
+        self.assertNotIn(EVENT_ID, output)
+
+    def test_regular_mode_never_sends_or_finalizes_a_canary_claim(self) -> None:
+        result, freio, telegram, _ = self.run_dispatcher(
+            canary_claim_response(),
+            telegram_success(),
+        )
+
+        self.assertEqual(result, 78)
+        self.assertEqual(telegram.links, [])
+        self.assertEqual(freio.finalizations, [])
+        self.assertTrue(self.state.circuit_path.exists())
+
+    def test_canary_mode_does_not_dead_finalize_malformed_customer_claim(self) -> None:
+        result, freio, telegram, _ = self.run_dispatcher(
+            claim_response(priority="unsupported"),
+            telegram_success(),
+            canary_mode=True,
+        )
+
+        self.assertEqual(result, 78)
+        self.assertEqual(telegram.links, [])
+        self.assertEqual(freio.finalizations, [])
+        self.assertTrue(self.state.circuit_path.exists())
 
     def test_conversation_link_is_allowed_for_new_inquiry(self) -> None:
         result, freio, telegram, _ = self.run_dispatcher(
@@ -406,6 +503,43 @@ class DispatcherTests(unittest.TestCase):
         )
         self.assertFalse(self.state.pending_path.exists())
 
+    def test_lost_canary_finalize_retains_canary_identity_without_resend(self) -> None:
+        first, first_freio, first_telegram, _ = self.run_dispatcher(
+            canary_claim_response(),
+            telegram_success(702),
+            [AmbiguousTransport()],
+            canary_mode=True,
+        )
+        self.assertEqual(first, 1)
+        self.assertEqual(first_telegram.links, [CANARY_DEEP_LINK])
+        self.assertTrue(first_freio.finalizations[0].is_canary)
+        self.assertTrue(self.state.pending_path.exists())
+
+        recovery_freio = FakeFreio(
+            AssertionError("claim must wait for canary finalize recovery"),
+            [finalize_success()],
+        )
+        recovery_telegram = FakeTelegram(
+            AssertionError("canary must never be resent during recovery")
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            recovered = Dispatcher(
+                self.state,
+                recovery_freio,
+                recovery_telegram,
+                canary_mode=True,
+            ).run()
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(recovery_freio.claim_calls, 0)
+        self.assertEqual(recovery_telegram.links, [])
+        self.assertTrue(recovery_freio.finalizations[0].is_canary)
+        self.assertEqual(
+            recovery_freio.finalizations[0].provider_message_id,
+            "702",
+        )
+        self.assertFalse(self.state.pending_path.exists())
+
     def test_permanent_finalize_failure_stops_until_manual_recovery(self) -> None:
         first, first_freio, first_telegram, _ = self.run_dispatcher(
             claim_response(),
@@ -545,6 +679,41 @@ class ProtocolAndCredentialTests(unittest.TestCase):
             },
         )
 
+    def test_canary_claim_and_finalize_are_explicit_exact_contracts(self) -> None:
+        transport = RecordingTransport(
+            [response(200, {"notification": None}), finalize_success()]
+        )
+        client = FreioClient(
+            transport,
+            "machine-secret-value-for-tests-123456789",
+            canary=True,
+        )
+
+        client.claim()
+        client.finalize(
+            Finalization(
+                notification_id=NOTIFICATION_ID,
+                claim_id=CLAIM_ID,
+                outcome="sent",
+                provider_message_id="501",
+                is_canary=True,
+            )
+        )
+
+        claim_call, finalize_call = transport.calls
+        self.assertEqual(json.loads(claim_call[3]), {"canary": True})
+        self.assertEqual(claim_call[2]["Content-Type"], "application/json")
+        self.assertEqual(
+            json.loads(finalize_call[3]),
+            {
+                "notificationId": NOTIFICATION_ID,
+                "claimId": CLAIM_ID,
+                "outcome": "sent",
+                "providerMessageId": "501",
+                "canary": True,
+            },
+        )
+
     def test_telegram_body_contains_only_structured_copy_and_one_allowlisted_url(
         self,
     ) -> None:
@@ -578,6 +747,44 @@ class ProtocolAndCredentialTests(unittest.TestCase):
         self.assertEqual(form["disable_web_page_preview"], ["true"])
         self.assertEqual(form["text"][0].count("https://"), 1)
         self.assertNotIn("email", form["text"][0].lower())
+
+    def test_canary_telegram_body_is_fixed_and_contains_no_customer_context(
+        self,
+    ) -> None:
+        transport = RecordingTransport([telegram_success()])
+        client = TelegramClient(
+            transport,
+            "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijk",
+            "-123456789",
+        )
+        notification = parse_claim_response(canary_claim_response())
+        self.assertIsNotNone(notification)
+
+        client.send(notification)
+
+        form = urllib.parse.parse_qs(
+            transport.calls[0][3].decode("ascii"),
+            strict_parsing=True,
+        )
+        text = form["text"][0]
+        self.assertEqual(
+            text,
+            f"{MESSAGE_HEADING}\n"
+            "Akce: Ověřit interní Telegram handoff.\n"
+            "Priorita: běžná\n"
+            "Kontext: systémový canary bez zákaznických dat.\n"
+            f"Freio přehled: {CANARY_DEEP_LINK}",
+        )
+        self.assertEqual(text.count("https://"), 1)
+        for forbidden in (
+            "klient",
+            "email",
+            "telefon",
+            "subject",
+            "conversation",
+            "nabídk",
+        ):
+            self.assertNotIn(forbidden, text.lower())
 
     def test_demo_intent_is_mapped_without_model_or_mail_text(self) -> None:
         transport = RecordingTransport([telegram_success()])
@@ -642,6 +849,27 @@ class ProtocolAndCredentialTests(unittest.TestCase):
                     deep_link=CONVERSATION_LINK,
                 )
             )
+
+        canary = parse_claim_response(canary_claim_response())
+        self.assertIsNotNone(canary)
+        self.assertTrue(canary.is_canary)
+        for overrides in (
+            {"eventId": EVENT_ID},
+            {"kind": "reply_review"},
+            {"priority": "urgent"},
+            {"deepLink": CONVERSATION_LINK},
+            {
+                "actionSummary": {
+                    "intent": "pricing",
+                    "offerCount": 0,
+                    "latestOffer": None,
+                }
+            },
+            {"canary": False},
+        ):
+            with self.subTest(canary_overrides=overrides):
+                with self.assertRaises(Exception):
+                    parse_claim_response(canary_claim_response(**overrides))
         for bad_summary in (
             {},
             {
@@ -787,7 +1015,7 @@ class ProtocolAndCredentialTests(unittest.TestCase):
                 ),
                 contextlib.redirect_stdout(output),
             ):
-                result = dispatcher_main()
+                result = dispatcher_main([])
 
             self.assertEqual(result, 78)
             self.assertEqual(
@@ -798,6 +1026,16 @@ class ProtocolAndCredentialTests(unittest.TestCase):
                 json.loads(output.getvalue()),
                 {"event": "configuration_failure"},
             )
+
+    def test_canary_mode_is_explicit_and_rejects_every_other_argument(self) -> None:
+        self.assertFalse(_parse_canary_mode([]))
+        self.assertTrue(_parse_canary_mode(["--canary"]))
+        for arguments in (["canary"], ["--canary", "extra"], ["--help"]):
+            with (
+                self.subTest(arguments=arguments),
+                self.assertRaises(ConfigurationFailure),
+            ):
+                _parse_canary_mode(arguments)
 
     def test_heartbeat_rejects_unknown_status_and_naive_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

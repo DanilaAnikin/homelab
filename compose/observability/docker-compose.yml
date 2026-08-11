@@ -63,6 +63,15 @@ services:
   obs-cadvisor:
     image: gcr.io/cadvisor/cadvisor:latest
     container_name: obs-cadvisor
+    # cAdvisor otherwise recalculates every container every second even though
+    # Prometheus scrapes at a much lower frequency. Keep the live CPU guardrails
+    # while the secure Alertmanager service is managed from this compose file.
+    command:
+      - --housekeeping_interval=30s
+      - --docker_only=true
+      - --store_container_labels=false
+      - --disable_metrics=percpu,sched,tcp,udp,advtcp,process,hugetlb,referenced_memory,cpu_topology,resctrl
+    cpu_shares: 256
     privileged: true
     devices: ["/dev/kmsg"]
     volumes:
@@ -134,5 +143,8 @@ networks:
 volumes:
   obs-prometheus-data:
   obs-alertmanager-data:
+    # Reuse the volume owned by the historical observability compose project so
+    # silences and notification state survive the credential-safe replacement.
+    name: observability_alertmanager-data
   obs-loki-data:
   obs-grafana-data:

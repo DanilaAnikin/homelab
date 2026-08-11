@@ -42,6 +42,8 @@ sudo install -D -m 0755 scripts/freio_telegram_handoff/health.py \
   /usr/local/libexec/freio-telegram-handoff-health
 sudo install -D -m 0644 scripts/systemd/freio-telegram-handoff.service \
   /etc/systemd/system/freio-telegram-handoff.service
+sudo install -D -m 0644 scripts/systemd/freio-telegram-handoff-canary.service \
+  /etc/systemd/system/freio-telegram-handoff-canary.service
 sudo install -D -m 0644 scripts/systemd/freio-telegram-handoff.timer \
   /etc/systemd/system/freio-telegram-handoff.timer
 sudo install -D -m 0644 scripts/systemd/freio-telegram-handoff-health.service \
@@ -68,6 +70,7 @@ sudo install -o root -g root -m 0600 /dev/null \
 sudoedit /etc/freio-telegram-handoff/freio-machine-secret
 sudo systemd-analyze verify \
   /etc/systemd/system/freio-telegram-handoff.service \
+  /etc/systemd/system/freio-telegram-handoff-canary.service \
   /etc/systemd/system/freio-telegram-handoff.timer \
   /etc/systemd/system/freio-telegram-handoff-health.service \
   /etc/systemd/system/freio-telegram-handoff-health.timer
@@ -131,6 +134,19 @@ Obsahuje `notificationId`, `claimId`, `outcome` a jen relevantní volitelné pol
 Úspěch je HTTP 200 `application/json` s `{"success":true}`. Opakování stejného
 finalize po ztracené odpovědi musí vrátit stejný úspěch.
 
+Předprodukční acceptance používá oddělený one-shot kontrakt. Dispatcher
+spuštěný s jediným argumentem `--canary` pošle claim tělo
+`{"canary":true}`. API smí odpovědět jen syntetickou notifikací s
+`kind=system_canary`, `priority=normal`, prázdným strukturovaným kontextem,
+`canary=true` a přesným odkazem
+`https://outreach.freio.cz/?section=overview`. Canary UUID je současně
+`id` i `eventId`; není to UUID zákazníka, konverzace ani eskalace. Finalize nese
+stejný literál `canary=true`, takže nikdy nemůže změnit produkční outbox.
+Canary proces navíc striktně vyžaduje `notification.canary=true`: odpověď
+`notification=null`, běžná customer notifikace, malformed běžný payload nebo
+pending finalize z běžného režimu otevře circuit bez Telegram send a bez
+finalize. Běžný proces stejným způsobem odmítne canary claim/pending finalize.
+
 Telegram zpráva neobsahuje PII. Dispatcher mapuje `kind` na krátkou akci,
 `priority` na český allowlistovaný štítek a `intent` na deterministický popis
 potřeby klienta. Dále zobrazí jen počet nabídek, případnou poslední cenu v CZK a
@@ -167,23 +183,106 @@ StateDirectory dynamického uživatele. Nemá síťové address family, credenti
 ani zápis do systému. Health timer je stejně jako dispatcher timer po instalaci
 vypnutý a nesmí se zapnout před úspěšným interním canary.
 
-## Řízená aktivace
+## One-shot acceptance a řízená aktivace
 
-Nejprve vytvořit marker bez obsahu a spustit jediný canary běh:
+Canary nepoužívá `contact_inquiries`, konverzaci, owner escalation,
+`b2b_notification_outbox`, e-mailový outbox ani outreach message. Nevytvářet
+syntetickou inquiry a nikdy neresetovat existující `dead` notification. Canary
+má vlastní immutable singleton ledger; všechny jiné výsledky než `sent` jsou
+terminální a druhý send vyžaduje novou forward migraci a nové owner rozhodnutí.
+
+Před autorizací musí být hlavní gate i oba timery vypnuté a produkční fronta
+bez claimu. Následující SQL musí vrátit jediný řádek `f|0|0`:
+
+```sql
+SELECT settings.telegram_handoff_enabled,
+       COUNT(*) FILTER (WHERE outbox.status IN ('pending', 'retry')),
+       COUNT(*) FILTER (WHERE outbox.status = 'claimed')
+FROM public.b2b_autonomy_settings AS settings
+LEFT JOIN public.b2b_notification_outbox AS outbox ON TRUE
+WHERE settings.id = 1
+GROUP BY settings.telegram_handoff_enabled;
+```
+
+Postgres operátor pak jednou a nevratně zapíše explicitní autorizaci. Actor ani
+reference nesmějí obsahovat jméno, e-mail nebo jiná customer data:
+
+```sql
+SELECT public.authorize_b2b_telegram_handoff_canary(
+  'operator:freio-owner',
+  'telegram-cutover-20260811',
+  'AUTHORIZE_PII_FREE_TELEGRAM_HANDOFF_CANARY_V1'
+);
+```
+
+Očekávání je přesně `{"success":true,"status":"authorized"}`. RPC není
+dostupné roli `service_role`; opakování vrátí `canary_already_authorized` a
+nikdy singleton znovu neodemkne.
+
+Teprve potom vytvořit oddělený canary marker a spustit statickou službu. Hlavní
+marker `/etc/freio-telegram-handoff/enabled` stále nesmí existovat:
+
+```bash
+test ! -e /etc/freio-telegram-handoff/enabled
+test "$(systemctl is-enabled freio-telegram-handoff.timer)" = disabled
+test "$(systemctl is-enabled freio-telegram-handoff-health.timer)" = disabled
+sudo install -o root -g root -m 000 /dev/null \
+  /etc/freio-telegram-handoff/canary-enabled
+sudo systemctl start freio-telegram-handoff-canary.service
+sudo systemctl status freio-telegram-handoff-canary.service --no-pager
+sudo journalctl -u freio-telegram-handoff-canary.service -n 50 --no-pager
+```
+
+Canary zpracuje přesně jeden autorizovaný canary claim; `notification=null`
+je fail-closed chyba, nikoli idle úspěch. Log musí obsahovat jen obecný
+`delivery_finalized` s `outcome=sent`, žádný token, chat ID, UUID, URL, e-mail
+ani HTTP body. Databázová acceptance musí vrátit přesně `t|t|t|t|t|0|0`:
+
+```sql
+SELECT
+  canary.status = 'sent',
+  canary.attempt_count = 1,
+  canary.provider_message_id IS NOT NULL,
+  canary.final_claim_token IS NOT NULL,
+  canary.finalization_hash ~ '^[0-9a-f]{64}$',
+  COUNT(*) FILTER (WHERE canary.status = 'authorized'),
+  COUNT(*) FILTER (WHERE canary.status = 'claimed')
+FROM public.b2b_telegram_handoff_canaries AS canary
+GROUP BY canary.status, canary.attempt_count, canary.provider_message_id,
+         canary.final_claim_token, canary.finalization_hash;
+```
+
+Současně ověřit `telegram_handoff_enabled=false`, nulový produkční ready/claimed
+outbox a absenci `pending-finalize-v1.json` i circuit markeru. Canary marker
+potom pouze archivovat; nemaže se durable DB ledger:
+
+```bash
+sudo mv /etc/freio-telegram-handoff/canary-enabled \
+  /etc/freio-telegram-handoff/canary-enabled.used
+sudo test ! -e /var/lib/private/freio-telegram-handoff/pending-finalize-v1.json
+sudo test ! -e /var/lib/private/freio-telegram-handoff/circuit-open-v1.json
+```
+
+Teprve po této acceptance zapnout DB gate. Forward migrace obsahuje trigger,
+který tento update odmítne, není-li singleton durable `sent`:
+
+```sql
+UPDATE public.b2b_autonomy_settings
+SET telegram_handoff_enabled = TRUE
+WHERE id = 1
+  AND approval_status = 'approved'
+  AND telegram_handoff_enabled IS FALSE
+  AND telegram_handoff_daily_cap > 0
+RETURNING telegram_handoff_enabled, telegram_handoff_daily_cap;
+```
+
+Nakonec vytvořit hlavní marker, provést jeden idle/produkční běh a zapnout oba
+timery:
 
 ```bash
 sudo install -o root -g root -m 000 /dev/null \
   /etc/freio-telegram-handoff/enabled
 sudo systemctl start freio-telegram-handoff.service
-sudo systemctl status freio-telegram-handoff.service --no-pager
-sudo journalctl -u freio-telegram-handoff.service -n 50 --no-pager
-```
-
-Canary zpracuje nanejvýš jeden claim. Log musí obsahovat pouze obecné JSON
-události, žádný token, chat ID, UUID, URL, e-mail ani HTTP body. Teprve po
-ověření canary zapnout timer:
-
-```bash
 sudo systemctl enable --now freio-telegram-handoff.timer
 sudo systemctl start freio-telegram-handoff-health.service
 sudo systemctl enable --now freio-telegram-handoff-health.timer
@@ -191,6 +290,11 @@ systemctl list-timers \
   freio-telegram-handoff.timer \
   freio-telegram-handoff-health.timer --no-pager
 ```
+
+Pokud canary neskončí `sent`, ponechat hlavní gate `false`, oba timery vypnuté,
+archivovat canary marker a zachovat pending/circuit i DB ledger pro
+reconciliation. Singleton, claim ani starý `dead` řádek se nikdy ručně
+neresetují.
 
 ## Chování chyb
 
