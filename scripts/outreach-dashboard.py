@@ -270,11 +270,14 @@ def health():
             SELECT coalesce(extract(epoch FROM now() - max(sent_at))/3600, 999)::int
             FROM outreach_prospects WHERE status='sent'
          """, lambda v: num(v) > 24),
+        # A `benchmark` key holding JSON null is what a lookup that found no
+        # neighbours writes. Counting the key alone reported the queue as ready
+        # while those emails still had no competitor to name.
         ("Fronta bez srovnání s konkurencí", APP_DB, """
             SELECT count(*) FROM outreach_prospects p
             WHERE p.status='pending' AND NOT EXISTS (
               SELECT 1 FROM audits a WHERE a.prospect_place_id = p.place_id
-                AND a.payload ? 'benchmark')
+                AND jsonb_typeof(a.payload -> 'benchmark') = 'object')
          """, lambda v: num(v) > 0),
         # `seen` is not a reliable signal: LaunchMail leaves it false on messages
         # the bot archived after replying. What actually matters is whether a
