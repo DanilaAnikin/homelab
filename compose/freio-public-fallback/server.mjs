@@ -12,6 +12,7 @@ const hopByHopHeaders = new Set([
   "keep-alive",
   "proxy-authenticate",
   "proxy-authorization",
+  "proxy-connection",
   "te",
   "trailer",
   "transfer-encoding",
@@ -90,7 +91,11 @@ function withoutHopByHopHeaders(headers) {
     .split(",")
     .map((value) => value.trim().toLowerCase())
     .filter(Boolean);
-  const excluded = new Set([...hopByHopHeaders, ...connectionTokens]);
+  const excluded = new Set([
+    ...hopByHopHeaders,
+    ...connectionTokens,
+    "x-freio-fallback",
+  ]);
   return Object.fromEntries(
     Object.entries(headers).filter(
       ([name]) => !excluded.has(name.toLowerCase()),
@@ -98,7 +103,24 @@ function withoutHopByHopHeaders(headers) {
   );
 }
 
-function isPrivatePath(pathname) {
+function isPrivatePath(rawTarget) {
+  const rawPath = rawTarget.split(/[?#]/u, 1)[0];
+  if (!rawPath.startsWith("/") || rawPath.startsWith("//") || rawPath.includes("\\")) {
+    return true;
+  }
+
+  let pathname;
+  try {
+    const parsed = new URL(rawTarget, "http://gateway.invalid");
+    pathname = decodeURIComponent(parsed.pathname);
+  } catch {
+    return true;
+  }
+
+  if (pathname.startsWith("//") || pathname.includes("\\")) {
+    return true;
+  }
+
   return (
     pathname === "/api" ||
     pathname.startsWith("/api/") ||
@@ -109,9 +131,9 @@ function isPrivatePath(pathname) {
 
 function sendFallback(req, res) {
   const method = req.method ?? "GET";
-  const url = new URL(req.url ?? "/", "http://fallback.invalid");
+  const rawTarget = req.url ?? "/";
   const isReadOnlyPage =
-    (method === "GET" || method === "HEAD") && !isPrivatePath(url.pathname);
+    (method === "GET" || method === "HEAD") && !isPrivatePath(rawTarget);
 
   if (isReadOnlyPage) {
     send(
@@ -136,11 +158,12 @@ function sendFallback(req, res) {
 function proxyToPrimary(req, res) {
   let responseStarted = false;
   let settled = false;
+  let upstreamResponse;
 
   const method = req.method ?? "GET";
-  const url = new URL(req.url ?? "/", "http://gateway.invalid");
+  const rawTarget = req.url ?? "/";
   const responseHeaderTimeoutMs =
-    (method === "GET" || method === "HEAD") && !isPrivatePath(url.pathname)
+    (method === "GET" || method === "HEAD") && !isPrivatePath(rawTarget)
       ? readOnlyHeaderTimeoutMs
       : writeHeaderTimeoutMs;
 
@@ -169,22 +192,23 @@ function proxyToPrimary(req, res) {
     }
   });
 
-  upstream.once("response", (upstreamResponse) => {
+  upstream.once("response", (response) => {
+    upstreamResponse = response;
     settled = true;
     clearTimeout(connectionTimer);
     clearTimeout(headerTimer);
 
-    const status = upstreamResponse.statusCode ?? 502;
+    const status = response.statusCode ?? 502;
     if (status >= 500 && status <= 504) {
-      upstreamResponse.resume();
+      response.resume();
       sendFallback(req, res);
       return;
     }
 
     responseStarted = true;
-    res.writeHead(status, withoutHopByHopHeaders(upstreamResponse.headers));
-    upstreamResponse.on("error", () => res.destroy());
-    upstreamResponse.pipe(res);
+    res.writeHead(status, withoutHopByHopHeaders(response.headers));
+    response.on("error", () => res.destroy());
+    response.pipe(res);
   });
 
   upstream.once("error", () => {
@@ -196,12 +220,34 @@ function proxyToPrimary(req, res) {
 
   req.once("aborted", () => upstream.destroy());
   req.once("error", () => upstream.destroy());
+  res.once("close", () => {
+    if (!res.writableEnded) {
+      upstreamResponse?.destroy();
+      upstream.destroy();
+    }
+  });
   req.pipe(upstream);
 }
 
 function handleRequest(req, res) {
   const method = req.method ?? "GET";
-  const url = new URL(req.url ?? "/", "http://gateway.invalid");
+  let url;
+  try {
+    url = new URL(req.url ?? "/", "http://gateway.invalid");
+  } catch {
+    send(
+      res,
+      400,
+      {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+      },
+      '{"error":"invalid_request_target"}\n',
+      method,
+    );
+    return;
+  }
 
   if ((method === "GET" || method === "HEAD") && url.pathname === "/healthz") {
     send(

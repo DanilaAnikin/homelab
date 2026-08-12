@@ -28,20 +28,38 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         routers = config["http"]["routers"]
         services = config["http"]["services"]
 
-        self.assertEqual(set(routers), {"freio-public-gateway"})
-        router = routers["freio-public-gateway"]
         self.assertEqual(
-            router["rule"], "Host(`freio.cz`) || Host(`www.freio.cz`)"
+            set(routers),
+            {"freio-public-read-gateway", "freio-public-write-gateway"},
         )
-        self.assertEqual(router["priority"], 30000)
-        self.assertEqual(router["entryPoints"], ["web"])
-        self.assertEqual(router["service"], "freio-public-gateway")
-        self.assertNotIn("middlewares", router)
+        read_router = routers["freio-public-read-gateway"]
+        write_router = routers["freio-public-write-gateway"]
+        self.assertEqual(
+            write_router["rule"], "Host(`freio.cz`) || Host(`www.freio.cz`)"
+        )
+        self.assertIn("Method(`GET`)", read_router["rule"])
+        self.assertEqual(read_router["priority"], 31000)
+        self.assertEqual(write_router["priority"], 30000)
+        self.assertTrue(
+            all(router["entryPoints"] == ["web"] for router in routers.values())
+        )
+        self.assertTrue(
+            all(router["service"] == "freio-public-gateway" for router in routers.values())
+        )
+        self.assertEqual(read_router["middlewares"], ["freio-public-read-retry"])
+        self.assertNotIn("middlewares", write_router)
+
+        retry = config["http"]["middlewares"]["freio-public-read-retry"]["retry"]
+        self.assertEqual(retry, {"attempts": 2, "initialInterval": "50ms"})
 
         self.assertEqual(set(services), {"freio-public-gateway"})
         gateway = services["freio-public-gateway"]["loadBalancer"]
         self.assertEqual(
-            gateway["servers"], [{"url": "http://freio-public-fallback:8080"}]
+            gateway["servers"],
+            [
+                {"url": "http://freio-public-gateway-a:8080"},
+                {"url": "http://freio-public-gateway-b:8080"},
+            ],
         )
         self.assertTrue(gateway["passHostHeader"])
         self.assertEqual(gateway["healthCheck"]["path"], "/healthz")
@@ -52,21 +70,25 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         compose = yaml.safe_load(
             (COMPOSE_DIR / "docker-compose.yml").read_text(encoding="utf-8")
         )
-        service = compose["services"]["web"]
-        self.assertEqual(service["container_name"], "freio-public-fallback")
-        self.assertTrue(service["read_only"])
-        self.assertEqual(service["user"], "10001:10001")
-        self.assertEqual(service["cap_drop"], ["ALL"])
-        self.assertEqual(service["security_opt"], ["no-new-privileges:true"])
-        self.assertNotIn("ports", service)
+        self.assertEqual(set(compose["services"]), {"gateway-a", "gateway-b"})
         self.assertEqual(
-            service["environment"],
-            {"PRIMARY_HOST": "freio-xkgrrq", "PRIMARY_PORT": "3000"},
+            {service["container_name"] for service in compose["services"].values()},
+            {"freio-public-gateway-a", "freio-public-gateway-b"},
         )
-        self.assertNotIn("env_file", service)
-        self.assertNotIn("secrets", service)
-        self.assertNotIn("volumes", service)
-        self.assertEqual(service["networks"], ["dokploy-network"])
+        for service in compose["services"].values():
+            self.assertTrue(service["read_only"])
+            self.assertEqual(service["user"], "10001:10001")
+            self.assertEqual(service["cap_drop"], ["ALL"])
+            self.assertEqual(service["security_opt"], ["no-new-privileges:true"])
+            self.assertNotIn("ports", service)
+            self.assertEqual(
+                service["environment"],
+                {"PRIMARY_HOST": "freio-xkgrrq", "PRIMARY_PORT": "3000"},
+            )
+            self.assertNotIn("env_file", service)
+            self.assertNotIn("secrets", service)
+            self.assertNotIn("volumes", service)
+            self.assertEqual(service["networks"], ["dokploy-network"])
         self.assertTrue(compose["networks"]["dokploy-network"]["external"])
 
     def test_server_is_self_contained_and_write_paths_fail_closed(self) -> None:
@@ -79,8 +101,8 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertIn('pathname === "/_next"', source)
         self.assertIn('(method === "GET" || method === "HEAD")', source)
         self.assertIn('"error":"service_temporarily_unavailable"', source)
-        self.assertIn("upstreamResponse.statusCode", source)
-        self.assertIn("upstreamResponse.pipe(res)", source)
+        self.assertIn("response.statusCode", source)
+        self.assertIn("response.pipe(res)", source)
         self.assertIn("req.pipe(upstream)", source)
         self.assertNotIn("fetch(", source)
         self.assertNotIn("SUPABASE", source)
@@ -94,6 +116,7 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertIn("x-freio-fallback", script.lower())
         self.assertIn("previous_route", script)
         self.assertIn("persist_route fallback", script)
+        self.assertIn("freio-public-gateway-a freio-public-gateway-b", script)
         self.assertIn("exit 2", script)
 
         service = SERVICE.read_text(encoding="utf-8")
@@ -230,6 +253,12 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertTrue(expectation_response.startswith(b"HTTP/1.1 417"))
         self.assertEqual(calls.count(("POST", "/api/expect")), 0)
 
+        with socket.create_connection(("127.0.0.1", gateway_port), timeout=3) as raw:
+            raw.sendall(b"GET http://[ HTTP/1.1\r\nHost: freio.cz\r\nConnection: close\r\n\r\n")
+            malformed_response = raw.recv(4096)
+        self.assertTrue(malformed_response.startswith(b"HTTP/1.1 400"))
+        self.assertIsNone(process.poll())
+
         status, headers, body = request("GET", "/primary-5xx")
         self.assertEqual(status, 200)
         self.assertEqual(headers.get("x-freio-fallback"), "static-v1")
@@ -252,8 +281,14 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         for method, path in (
             ("GET", "/api"),
             ("GET", "/api/test"),
+            ("GET", "/%61pi"),
+            ("GET", "/api%2Ftest"),
+            ("GET", "//api"),
+            ("GET", "/api%ZZ"),
             ("GET", "/_next"),
             ("GET", "/_next/static/app.js"),
+            ("GET", "/%5fnext"),
+            ("GET", "/_next%2Fstatic/app.js"),
             ("POST", "/"),
             ("POST", "/api/write"),
         ):
@@ -294,12 +329,13 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
             text=True,
         )
         rendered = json.loads(result.stdout)
-        service = rendered["services"]["web"]
-        self.assertEqual(
-            service["environment"],
-            {"PRIMARY_HOST": "freio-xkgrrq", "PRIMARY_PORT": "3000"},
-        )
-        self.assertNotIn("ports", service)
+        self.assertEqual(set(rendered["services"]), {"gateway-a", "gateway-b"})
+        for service in rendered["services"].values():
+            self.assertEqual(
+                service["environment"],
+                {"PRIMARY_HOST": "freio-xkgrrq", "PRIMARY_PORT": "3000"},
+            )
+            self.assertNotIn("ports", service)
 
 
 if __name__ == "__main__":

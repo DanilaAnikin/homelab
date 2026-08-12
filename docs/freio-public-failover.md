@@ -1,7 +1,7 @@
 # Freio public automatic failover
 
-`freio.cz` a `www.freio.cz` procházejí přes malou bezsecretovou gateway na
-společném Traefiku:
+`freio.cz` a `www.freio.cz` procházejí přes dvě stejné bezsecretové gateway
+instance na společném Traefiku:
 
 1. gateway předá požadavek na `freio-xkgrrq:3000`, pokud primary odpoví bez
    serverové chyby;
@@ -10,6 +10,8 @@ společném Traefiku:
 
 File-provider konfigurace `compose/traefik/freio-public-failover.yml` má vyšší
 prioritu než Dokployem generovaný router a vede provoz pouze do gateway.
+Traefik obě instance aktivně kontroluje; u GET/HEAD smí při dial chybě jednou
+zkusit druhou instanci, zápisový požadavek nikdy neopakuje.
 Request-aware gateway zachytí už první odpověď `5xx`: veřejné GET/HEAD stránky
 převede na statický web s HTTP 200, zatímco API, Next asset požadavky a všechny
 zápisové metody vrátí `503`. Zápisový požadavek se nikdy neopakuje. Gateway
@@ -49,7 +51,8 @@ Hlavní službu nikdy neškáluj na nulu, dokud neprojde:
 
 ```bash
 systemctl start --wait freio-public-failover-check.service
-docker inspect freio-public-fallback --format '{{.State.Health.Status}}'
+docker inspect freio-public-gateway-a --format '{{.State.Health.Status}}'
+docker inspect freio-public-gateway-b --format '{{.State.Health.Status}}'
 ```
 
 Při plánovaném testu škáluj primary na nulu až po tomto preflightu. Hned první

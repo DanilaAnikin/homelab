@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly PRIMARY_SERVICE=freio-xkgrrq
-readonly FALLBACK_CONTAINER=freio-public-fallback
+readonly FALLBACK_CONTAINERS=(freio-public-gateway-a freio-public-gateway-b)
 readonly SOURCE_CONFIG=/srv/homelab/compose/traefik/freio-public-failover.yml
 readonly RUNTIME_CONFIG=/etc/dokploy/traefik/dynamic/freio-public-failover.yml
 readonly STATE_DIR=${STATE_DIRECTORY:-/var/lib/freio-public-failover}
@@ -20,12 +20,14 @@ source_sha=$(/usr/bin/sha256sum -- "$SOURCE_CONFIG" | /usr/bin/awk '{print $1}')
 runtime_sha=$(/usr/bin/sha256sum -- "$RUNTIME_CONFIG" | /usr/bin/awk '{print $1}')
 [[ "$source_sha" == "$runtime_sha" ]] || fail runtime_config_drift
 
-fallback_health=$(
-  /usr/bin/docker inspect "$FALLBACK_CONTAINER" \
-    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' \
-    2>/dev/null || true
-)
-[[ "$fallback_health" == healthy ]] || fail fallback_unhealthy
+for fallback_container in "${FALLBACK_CONTAINERS[@]}"; do
+  fallback_health=$(
+    /usr/bin/docker inspect "$fallback_container" \
+      --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' \
+      2>/dev/null || true
+  )
+  [[ "$fallback_health" == healthy ]] || fail fallback_unhealthy
+done
 
 [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || fail state_directory_missing
 
