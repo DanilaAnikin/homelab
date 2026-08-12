@@ -1,10 +1,33 @@
 import http from "node:http";
 
 const host = "0.0.0.0";
-const port = Number.parseInt(process.env.PORT ?? "8080", 10);
+const port = parsePort(process.env.PORT ?? "8080", "PORT");
+const primaryHost = process.env.PRIMARY_HOST ?? "freio-xkgrrq";
+const primaryPort = parsePort(process.env.PRIMARY_PORT ?? "3000", "PRIMARY_PORT");
+const connectTimeoutMs = 900;
+const readOnlyHeaderTimeoutMs = 4_000;
+const writeHeaderTimeoutMs = 30_000;
+const hopByHopHeaders = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 
-if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
-  throw new Error("invalid PORT");
+if (!/^[a-z0-9.-]+$/u.test(primaryHost)) {
+  throw new Error("invalid PRIMARY_HOST");
+}
+
+function parsePort(value, name) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error(`invalid ${name}`);
+  }
+  return parsed;
 }
 
 const fallbackHeaders = Object.freeze({
@@ -57,47 +80,38 @@ const html = `<!doctype html>
 </html>`;
 
 function send(res, status, headers, body, method) {
+  if (res.headersSent || res.destroyed) return;
   res.writeHead(status, headers);
   res.end(method === "HEAD" ? undefined : body);
 }
 
-const server = http.createServer((req, res) => {
+function withoutHopByHopHeaders(headers) {
+  const connectionTokens = String(headers.connection ?? "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  const excluded = new Set([...hopByHopHeaders, ...connectionTokens]);
+  return Object.fromEntries(
+    Object.entries(headers).filter(
+      ([name]) => !excluded.has(name.toLowerCase()),
+    ),
+  );
+}
+
+function isPrivatePath(pathname) {
+  return (
+    pathname === "/api" ||
+    pathname.startsWith("/api/") ||
+    pathname === "/_next" ||
+    pathname.startsWith("/_next/")
+  );
+}
+
+function sendFallback(req, res) {
   const method = req.method ?? "GET";
   const url = new URL(req.url ?? "/", "http://fallback.invalid");
-
-  if (
-    (method === "GET" || method === "HEAD") &&
-    url.pathname === "/healthz"
-  ) {
-    send(
-      res,
-      200,
-      {
-        "Cache-Control": "no-store",
-        "Content-Type": "application/json; charset=utf-8",
-        "X-Content-Type-Options": "nosniff",
-      },
-      '{"status":"ok","mode":"static_fallback"}\n',
-      method,
-    );
-    return;
-  }
-
-  if (url.pathname === "/robots.txt" && (method === "GET" || method === "HEAD")) {
-    send(
-      res,
-      200,
-      { ...fallbackHeaders, "Content-Type": "text/plain; charset=utf-8" },
-      "User-agent: *\nDisallow: /\n",
-      method,
-    );
-    return;
-  }
-
   const isReadOnlyPage =
-    (method === "GET" || method === "HEAD") &&
-    !url.pathname.startsWith("/api/") &&
-    !url.pathname.startsWith("/_next/");
+    (method === "GET" || method === "HEAD") && !isPrivatePath(url.pathname);
 
   if (isReadOnlyPage) {
     send(
@@ -117,16 +131,109 @@ const server = http.createServer((req, res) => {
     '{"error":"service_temporarily_unavailable","fallback":true}\n',
     method,
   );
+}
+
+function proxyToPrimary(req, res) {
+  let responseStarted = false;
+  let settled = false;
+
+  const method = req.method ?? "GET";
+  const url = new URL(req.url ?? "/", "http://gateway.invalid");
+  const responseHeaderTimeoutMs =
+    (method === "GET" || method === "HEAD") && !isPrivatePath(url.pathname)
+      ? readOnlyHeaderTimeoutMs
+      : writeHeaderTimeoutMs;
+
+  const upstream = http.request({
+    host: primaryHost,
+    port: primaryPort,
+    method,
+    path: req.url,
+    headers: withoutHopByHopHeaders(req.headers),
+    agent: false,
+  });
+
+  const connectionTimer = setTimeout(() => {
+    if (!settled) upstream.destroy(new Error("primary_connect_timeout"));
+  }, connectTimeoutMs);
+
+  const headerTimer = setTimeout(() => {
+    if (!settled) upstream.destroy(new Error("primary_header_timeout"));
+  }, responseHeaderTimeoutMs);
+
+  upstream.once("socket", (socket) => {
+    if (socket.connecting) {
+      socket.once("connect", () => clearTimeout(connectionTimer));
+    } else {
+      clearTimeout(connectionTimer);
+    }
+  });
+
+  upstream.once("response", (upstreamResponse) => {
+    settled = true;
+    clearTimeout(connectionTimer);
+    clearTimeout(headerTimer);
+
+    const status = upstreamResponse.statusCode ?? 502;
+    if (status >= 500 && status <= 504) {
+      upstreamResponse.resume();
+      sendFallback(req, res);
+      return;
+    }
+
+    responseStarted = true;
+    res.writeHead(status, withoutHopByHopHeaders(upstreamResponse.headers));
+    upstreamResponse.on("error", () => res.destroy());
+    upstreamResponse.pipe(res);
+  });
+
+  upstream.once("error", () => {
+    settled = true;
+    clearTimeout(connectionTimer);
+    clearTimeout(headerTimer);
+    if (!responseStarted) sendFallback(req, res);
+  });
+
+  req.once("aborted", () => upstream.destroy());
+  req.once("error", () => upstream.destroy());
+  req.pipe(upstream);
+}
+
+function handleRequest(req, res) {
+  const method = req.method ?? "GET";
+  const url = new URL(req.url ?? "/", "http://gateway.invalid");
+
+  if ((method === "GET" || method === "HEAD") && url.pathname === "/healthz") {
+    send(
+      res,
+      200,
+      {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+      },
+      '{"status":"ok","mode":"request_aware_gateway"}\n',
+      method,
+    );
+    return;
+  }
+
+  proxyToPrimary(req, res);
+}
+
+const server = http.createServer(handleRequest);
+server.on("checkContinue", (req, res) => {
+  proxyToPrimary(req, res);
 });
 
-server.requestTimeout = 10_000;
+server.requestTimeout = 35_000;
 server.headersTimeout = 5_000;
 server.keepAliveTimeout = 5_000;
 server.maxRequestsPerSocket = 100;
 
 server.listen(port, host, () => {
   process.stdout.write(
-    JSON.stringify({ event: "fallback_listening", host, port }) + "\n",
+    JSON.stringify({ event: "fallback_gateway_listening", host, port }) + "\n",
   );
 });
 

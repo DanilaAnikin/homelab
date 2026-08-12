@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import json
+import http.client
+import http.server
+import os
+import socket
 import subprocess
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -22,30 +28,25 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         routers = config["http"]["routers"]
         services = config["http"]["services"]
 
-        self.assertEqual(set(routers), {
-            "freio-public-failover-apex",
-            "freio-public-failover-www",
-        })
+        self.assertEqual(set(routers), {"freio-public-gateway"})
+        router = routers["freio-public-gateway"]
         self.assertEqual(
-            {router["rule"] for router in routers.values()},
-            {"Host(`freio.cz`)", "Host(`www.freio.cz`)"},
+            router["rule"], "Host(`freio.cz`) || Host(`www.freio.cz`)"
         )
-        self.assertTrue(all(router["priority"] == 30000 for router in routers.values()))
-        self.assertTrue(all(router["entryPoints"] == ["web"] for router in routers.values()))
+        self.assertEqual(router["priority"], 30000)
+        self.assertEqual(router["entryPoints"], ["web"])
+        self.assertEqual(router["service"], "freio-public-gateway")
+        self.assertNotIn("middlewares", router)
 
-        failover = services["freio-public-failover"]["failover"]
-        self.assertEqual(failover["service"], "freio-public-primary")
-        self.assertEqual(failover["fallback"], "freio-public-static")
-        self.assertEqual(failover["healthCheck"], {})
-
-        primary = services["freio-public-primary"]["loadBalancer"]
-        backup = services["freio-public-static"]["loadBalancer"]
-        self.assertEqual(primary["servers"], [{"url": "http://freio-xkgrrq:3000"}])
-        self.assertEqual(backup["servers"], [{"url": "http://freio-public-fallback:8080"}])
-        self.assertEqual(primary["healthCheck"]["path"], "/")
-        self.assertEqual(backup["healthCheck"]["path"], "/healthz")
-        self.assertEqual(primary["healthCheck"]["interval"], "2s")
-        self.assertEqual(backup["healthCheck"]["interval"], "2s")
+        self.assertEqual(set(services), {"freio-public-gateway"})
+        gateway = services["freio-public-gateway"]["loadBalancer"]
+        self.assertEqual(
+            gateway["servers"], [{"url": "http://freio-public-fallback:8080"}]
+        )
+        self.assertTrue(gateway["passHostHeader"])
+        self.assertEqual(gateway["healthCheck"]["path"], "/healthz")
+        self.assertEqual(gateway["healthCheck"]["interval"], "2s")
+        self.assertEqual(gateway["healthCheck"]["timeout"], "1s")
 
     def test_fallback_container_is_secretless_read_only_and_unpublished(self) -> None:
         compose = yaml.safe_load(
@@ -58,8 +59,12 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertEqual(service["cap_drop"], ["ALL"])
         self.assertEqual(service["security_opt"], ["no-new-privileges:true"])
         self.assertNotIn("ports", service)
-        self.assertNotIn("environment", service)
+        self.assertEqual(
+            service["environment"],
+            {"PRIMARY_HOST": "freio-xkgrrq", "PRIMARY_PORT": "3000"},
+        )
         self.assertNotIn("env_file", service)
+        self.assertNotIn("secrets", service)
         self.assertNotIn("volumes", service)
         self.assertEqual(service["networks"], ["dokploy-network"])
         self.assertTrue(compose["networks"]["dokploy-network"]["external"])
@@ -68,10 +73,15 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         source = (COMPOSE_DIR / "server.mjs").read_text(encoding="utf-8")
         self.assertIn('"X-Freio-Fallback": "static-v1"', source)
         self.assertIn("Záložní režim je aktivní", source)
-        self.assertIn('url.pathname.startsWith("/api/")', source)
-        self.assertIn('url.pathname.startsWith("/_next/")', source)
+        self.assertIn('pathname.startsWith("/api/")', source)
+        self.assertIn('pathname.startsWith("/_next/")', source)
+        self.assertIn('pathname === "/api"', source)
+        self.assertIn('pathname === "/_next"', source)
         self.assertIn('(method === "GET" || method === "HEAD")', source)
         self.assertIn('"error":"service_temporarily_unavailable"', source)
+        self.assertIn("upstreamResponse.statusCode", source)
+        self.assertIn("upstreamResponse.pipe(res)", source)
+        self.assertIn("req.pipe(upstream)", source)
         self.assertNotIn("fetch(", source)
         self.assertNotIn("SUPABASE", source)
         self.assertNotIn("STRIPE", source)
@@ -82,6 +92,8 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertIn("runtime_config_drift", script)
         self.assertIn("fallback_unhealthy", script)
         self.assertIn("x-freio-fallback", script.lower())
+        self.assertIn("previous_route", script)
+        self.assertIn("persist_route fallback", script)
         self.assertIn("exit 2", script)
 
         service = SERVICE.read_text(encoding="utf-8")
@@ -91,6 +103,7 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
             service,
         )
         self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("StateDirectory=freio-public-failover", service)
         self.assertIn("InaccessiblePaths=-/srv/homelab/secrets", service)
         self.assertIn("OnUnitActiveSec=1min", timer)
         self.assertIn("Persistent=false", timer)
@@ -100,6 +113,171 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
             ["node", "--check", str(COMPOSE_DIR / "server.mjs")],
             check=True,
         )
+
+    def test_gateway_runtime_intercepts_first_failure_without_replaying_writes(self) -> None:
+        class ReusableThreadingHTTPServer(http.server.ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        calls: list[tuple[str, str]] = []
+
+        class PrimaryHandler(http.server.BaseHTTPRequestHandler):
+            def handle_request(self) -> None:
+                calls.append((self.command, self.path))
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length:
+                    self.rfile.read(content_length)
+                if self.path == "/primary-5xx":
+                    self.send_response(502)
+                    self.end_headers()
+                    self.wfile.write(b"primary error")
+                    return
+                if self.command == "POST":
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                body = b"primary ok"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Freio-Primary-Test", "true")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            do_GET = handle_request
+            do_HEAD = handle_request
+            do_POST = handle_request
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            primary_port = probe.getsockname()[1]
+
+        primary = ReusableThreadingHTTPServer(
+            ("127.0.0.1", primary_port), PrimaryHandler
+        )
+        primary_thread = threading.Thread(target=primary.serve_forever, daemon=True)
+        primary_thread.start()
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            gateway_port = probe.getsockname()[1]
+
+        process = subprocess.Popen(
+            ["node", str(COMPOSE_DIR / "server.mjs")],
+            env={
+                **os.environ,
+                "PORT": str(gateway_port),
+                "PRIMARY_HOST": "127.0.0.1",
+                "PRIMARY_PORT": str(primary_port),
+            },
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(process.kill)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", gateway_port, timeout=1
+                )
+                connection.request("GET", "/healthz")
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+                if response.status == 200:
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            stderr = process.stderr.read() if process.stderr else ""
+            self.fail(f"fallback server did not start: {stderr}")
+
+        def request(method: str, path: str) -> tuple[int, dict[str, str], str]:
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", gateway_port, timeout=3
+            )
+            connection.request(method, path, body=b"test" if method == "POST" else None)
+            response = connection.getresponse()
+            body = response.read().decode("utf-8")
+            headers = {name.lower(): value for name, value in response.getheaders()}
+            connection.close()
+            return response.status, headers, body
+
+        def expect_continue_request(path: str) -> tuple[int, str]:
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", gateway_port, timeout=3
+            )
+            connection.putrequest("POST", path)
+            connection.putheader("Content-Length", "4")
+            connection.putheader("Expect", "100-continue")
+            connection.endheaders(b"test")
+            response = connection.getresponse()
+            body = response.read().decode("utf-8")
+            status = response.status
+            connection.close()
+            return status, body
+
+        status, headers, body = request("GET", "/pricing")
+        self.assertEqual((status, headers.get("x-freio-primary-test"), body), (200, "true", "primary ok"))
+        status, _headers, _body = request("POST", "/api/write")
+        self.assertEqual(status, 204)
+        self.assertEqual(calls.count(("POST", "/api/write")), 1)
+        status, _body = expect_continue_request("/api/expect")
+        self.assertEqual(status, 204)
+        self.assertEqual(calls.count(("POST", "/api/expect")), 1)
+
+        status, headers, body = request("GET", "/primary-5xx")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("x-freio-fallback"), "static-v1")
+        self.assertIn("Záložní režim je aktivní", body)
+        status, headers, body = request("POST", "/primary-5xx")
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("x-freio-fallback"), "static-v1")
+        self.assertIn("service_temporarily_unavailable", body)
+        self.assertEqual(calls.count(("POST", "/primary-5xx")), 1)
+
+        primary.shutdown()
+        primary.server_close()
+        primary_thread.join(timeout=5)
+
+        for path in ("/", "/pricing", "/robots.txt"):
+            status, headers, body = request("GET", path)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("x-freio-fallback"), "static-v1")
+            self.assertIn("Záložní režim je aktivní", body)
+        for method, path in (
+            ("GET", "/api"),
+            ("GET", "/api/test"),
+            ("GET", "/_next"),
+            ("GET", "/_next/static/app.js"),
+            ("POST", "/"),
+            ("POST", "/api/write"),
+        ):
+            status, headers, body = request(method, path)
+            self.assertEqual(status, 503)
+            self.assertEqual(headers.get("x-freio-fallback"), "static-v1")
+            self.assertIn("service_temporarily_unavailable", body)
+
+        primary = ReusableThreadingHTTPServer(
+            ("127.0.0.1", primary_port), PrimaryHandler
+        )
+        primary_thread = threading.Thread(target=primary.serve_forever, daemon=True)
+        primary_thread.start()
+        status, headers, body = request("GET", "/restored")
+        self.assertEqual((status, headers.get("x-freio-primary-test"), body), (200, "true", "primary ok"))
+        primary.shutdown()
+        primary.server_close()
+        primary_thread.join(timeout=5)
+
+        process.terminate()
+        process.wait(timeout=5)
+        if process.stderr:
+            process.stderr.close()
 
     def test_compose_renders_without_environment(self) -> None:
         result = subprocess.run(
@@ -118,7 +296,10 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         )
         rendered = json.loads(result.stdout)
         service = rendered["services"]["web"]
-        self.assertNotIn("environment", service)
+        self.assertEqual(
+            service["environment"],
+            {"PRIMARY_HOST": "freio-xkgrrq", "PRIMARY_PORT": "3000"},
+        )
         self.assertNotIn("ports", service)
 
 

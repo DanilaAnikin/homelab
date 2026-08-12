@@ -1,41 +1,16 @@
-# Public Freio apex/www fail over to a secretless, read-only static service.
-# This file deliberately has higher router priority than Dokploy's managed
-# freio-xkgrrq.yml and therefore survives ordinary Dokploy rewrites.
+# The high-priority router sends apex/www through a secretless request-aware
+# gateway. The gateway proxies the primary and synthesizes a safe response
+# before any primary 5xx/connection failure can reach the visitor.
 http:
   routers:
-    freio-public-failover-apex:
-      rule: Host(`freio.cz`)
+    freio-public-gateway:
+      rule: Host(`freio.cz`) || Host(`www.freio.cz`)
       priority: 30000
-      service: freio-public-failover
-      entryPoints: [web]
-    freio-public-failover-www:
-      rule: Host(`www.freio.cz`)
-      priority: 30000
-      service: freio-public-failover
+      service: freio-public-gateway
       entryPoints: [web]
 
   services:
-    freio-public-failover:
-      failover:
-        healthCheck: {}
-        service: freio-public-primary
-        fallback: freio-public-static
-
-    freio-public-primary:
-      loadBalancer:
-        passHostHeader: true
-        healthCheck:
-          path: /
-          interval: 2s
-          timeout: 1s
-          hostname: freio.cz
-        passiveHealthCheck:
-          failureWindow: 3s
-          maxFailedAttempts: 1
-        servers:
-          - url: http://freio-xkgrrq:3000
-
-    freio-public-static:
+    freio-public-gateway:
       loadBalancer:
         passHostHeader: true
         healthCheck:
