@@ -7,6 +7,7 @@ const primaryPort = parsePort(process.env.PRIMARY_PORT ?? "3000", "PRIMARY_PORT"
 const connectTimeoutMs = 900;
 const readOnlyHeaderTimeoutMs = 4_000;
 const writeHeaderTimeoutMs = 30_000;
+const publicHosts = new Set(["freio.cz", "www.freio.cz"]);
 const hopByHopHeaders = new Set([
   "connection",
   "keep-alive",
@@ -126,6 +127,74 @@ function isPrivatePath(rawTarget) {
     pathname.startsWith("/api/") ||
     pathname === "/_next" ||
     pathname.startsWith("/_next/")
+  );
+}
+
+function originalScheme(headers) {
+  const cfVisitor = headers["cf-visitor"];
+  if (typeof cfVisitor === "string") {
+    try {
+      const parsed = JSON.parse(cfVisitor);
+      if (parsed?.scheme === "http" || parsed?.scheme === "https") {
+        return parsed.scheme;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const forwardedProto = headers["x-forwarded-proto"];
+  if (typeof forwardedProto !== "string") return null;
+  const scheme = forwardedProto.split(",", 1)[0].trim().toLowerCase();
+  return scheme === "http" || scheme === "https" ? scheme : null;
+}
+
+function publicHost(headers) {
+  const value = headers.host;
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (publicHosts.has(normalized)) return normalized;
+  if (normalized.endsWith(":80")) {
+    const withoutPort = normalized.slice(0, -3);
+    if (publicHosts.has(withoutPort)) return withoutPort;
+  }
+  return null;
+}
+
+function sendHttpsRedirect(req, res, hostName) {
+  const method = req.method ?? "GET";
+  const rawTarget = req.url ?? "/";
+  if (
+    !rawTarget.startsWith("/") ||
+    rawTarget.startsWith("//") ||
+    rawTarget.includes("\\") ||
+    /[\r\n]/u.test(rawTarget)
+  ) {
+    send(
+      res,
+      400,
+      {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+      },
+      '{"error":"invalid_request_target"}\n',
+      method,
+    );
+    return;
+  }
+
+  send(
+    res,
+    308,
+    {
+      "Cache-Control": "no-store",
+      Location: `https://${hostName}${rawTarget}`,
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+    "",
+    method,
   );
 }
 
@@ -261,6 +330,26 @@ function handleRequest(req, res) {
       '{"status":"ok","mode":"request_aware_gateway"}\n',
       method,
     );
+    return;
+  }
+
+  if (originalScheme(req.headers) === "http") {
+    const hostName = publicHost(req.headers);
+    if (!hostName) {
+      send(
+        res,
+        400,
+        {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+        },
+        '{"error":"invalid_public_host"}\n',
+        method,
+      );
+      return;
+    }
+    sendHttpsRedirect(req, res, hostName);
     return;
   }
 

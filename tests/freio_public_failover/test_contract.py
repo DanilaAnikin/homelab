@@ -100,6 +100,9 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertIn('pathname === "/api"', source)
         self.assertIn('pathname === "/_next"', source)
         self.assertIn('(method === "GET" || method === "HEAD")', source)
+        self.assertIn('parsed?.scheme === "http"', source)
+        self.assertIn('Location: `https://${hostName}${rawTarget}`', source)
+        self.assertIn("publicHosts", source)
         self.assertIn('"error":"service_temporarily_unavailable"', source)
         self.assertIn("response.statusCode", source)
         self.assertIn("response.pipe(res)", source)
@@ -220,11 +223,20 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
             stderr = process.stderr.read() if process.stderr else ""
             self.fail(f"fallback server did not start: {stderr}")
 
-        def request(method: str, path: str) -> tuple[int, dict[str, str], str]:
+        def request(
+            method: str,
+            path: str,
+            headers: dict[str, str] | None = None,
+        ) -> tuple[int, dict[str, str], str]:
             connection = http.client.HTTPConnection(
                 "127.0.0.1", gateway_port, timeout=3
             )
-            connection.request(method, path, body=b"test" if method == "POST" else None)
+            connection.request(
+                method,
+                path,
+                body=b"test" if method == "POST" else None,
+                headers=headers or {},
+            )
             response = connection.getresponse()
             body = response.read().decode("utf-8")
             headers = {name.lower(): value for name, value in response.getheaders()}
@@ -246,6 +258,99 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
 
         status, headers, body = request("GET", "/pricing")
         self.assertEqual((status, headers.get("x-freio-primary-test"), body), (200, "true", "primary ok"))
+        origin_calls = len(calls)
+        status, headers, body = request(
+            "GET",
+            "/pricing?source=plain-http",
+            {
+                "Host": "www.freio.cz",
+                "CF-Visitor": '{"scheme":"http"}',
+                "X-Forwarded-Proto": "http",
+            },
+        )
+        self.assertEqual(status, 308)
+        self.assertEqual(
+            headers.get("location"),
+            "https://www.freio.cz/pricing?source=plain-http",
+        )
+        self.assertEqual(body, "")
+        self.assertEqual(len(calls), origin_calls)
+        status, headers, body = request(
+            "POST",
+            "/api/write",
+            {
+                "Host": "freio.cz",
+                "CF-Visitor": '{"scheme":"http"}',
+                "X-Forwarded-Proto": "http",
+            },
+        )
+        self.assertEqual(status, 308)
+        self.assertEqual(headers.get("location"), "https://freio.cz/api/write")
+        self.assertEqual(body, "")
+        self.assertEqual(len(calls), origin_calls)
+        status, headers, body = request(
+            "GET",
+            "/xfp-only",
+            {"Host": "freio.cz", "X-Forwarded-Proto": "http"},
+        )
+        self.assertEqual(status, 308)
+        self.assertEqual(headers.get("location"), "https://freio.cz/xfp-only")
+        self.assertEqual(body, "")
+        self.assertEqual(len(calls), origin_calls)
+        status, headers, body = request(
+            "GET",
+            "/invalid-host",
+            {
+                "Host": "attacker.invalid",
+                "CF-Visitor": '{"scheme":"http"}',
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("invalid_public_host", body)
+        self.assertEqual(len(calls), origin_calls)
+        status, headers, body = request(
+            "GET",
+            "//attacker.invalid/path",
+            {
+                "Host": "freio.cz",
+                "CF-Visitor": '{"scheme":"http"}',
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("invalid_request_target", body)
+        self.assertEqual(len(calls), origin_calls)
+        status, headers, body = request(
+            "GET",
+            "/invalid-cf-visitor",
+            {
+                "Host": "freio.cz",
+                "CF-Visitor": "not-json",
+                "X-Forwarded-Proto": "http",
+            },
+        )
+        self.assertEqual((status, headers.get("x-freio-primary-test"), body), (200, "true", "primary ok"))
+        status, headers, body = request(
+            "GET",
+            "/https-precedence",
+            {
+                "Host": "freio.cz",
+                "CF-Visitor": '{"scheme":"https"}',
+                "X-Forwarded-Proto": "http",
+            },
+        )
+        self.assertEqual((status, headers.get("x-freio-primary-test"), body), (200, "true", "primary ok"))
+        status, headers, body = request(
+            "GET",
+            "/http-precedence",
+            {
+                "Host": "freio.cz",
+                "CF-Visitor": '{"scheme":"http"}',
+                "X-Forwarded-Proto": "https",
+            },
+        )
+        self.assertEqual(status, 308)
+        self.assertEqual(headers.get("location"), "https://freio.cz/http-precedence")
+        self.assertEqual(body, "")
         status, _headers, _body = request("POST", "/api/write")
         self.assertEqual(status, 204)
         self.assertEqual(calls.count(("POST", "/api/write")), 1)

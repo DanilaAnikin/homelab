@@ -18,6 +18,15 @@ zápisové metody vrátí `503`. Zápisový požadavek se nikdy neopakuje. Gatew
 nemá žádný aplikační secret, databázové ani Stripe spojení a nic z požadavků
 neloguje.
 
+Cloudflare hlavička `CF-Visitor` je autoritativní pro původní schéma. Běžný
+veřejný HTTP požadavek na allowlistovaný apex nebo `www` gateway ukončí `308`
+na stejnou HTTPS cestu ještě před kontaktem s primary; nepodporovaný
+`Expect: 100-continue` zůstává fail-closed `417`. `X-Forwarded-Proto` je jen
+fallback pro jiný důvěryhodný proxy vstup; `CF-Visitor=https` má přednost,
+aby interní HTTP spojení Cloudflare Tunnelu nevytvořilo redirect loop. Toto je
+transportní ochrana za Cloudflare Tunnel ingress, nikoli náhrada firewallu;
+přímý neautentizovaný přístup k origin portu nesmí být veřejně dostupný.
+
 U zápisu po timeoutu znamená `503` výsledek „stav není bezpečně potvrzen“:
 gateway požadavek nikdy sama neopakuje, ale upstream jej mohl přijmout ještě
 před ztrátou odpovědi. Klient nebo operátor proto musí použít původní
