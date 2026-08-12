@@ -1,0 +1,10 @@
+[Unit]
+Description=Denni mereni vykonu postu (dosah roste jeste dny po publikaci)
+
+[Timer]
+OnCalendar=*-*-* 05:40:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

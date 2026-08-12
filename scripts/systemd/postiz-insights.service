@@ -1,0 +1,6 @@
+[Unit]
+Description=Stahovani vykonu postu z Meta Graph API do DB insights
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/postiz-insights.py 30
