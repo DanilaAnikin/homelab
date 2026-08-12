@@ -120,6 +120,9 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertIn("previous_route", script)
         self.assertIn("persist_route fallback", script)
         self.assertIn("freio-public-gateway-a freio-public-gateway-b", script)
+        self.assertIn("http://${public_host}/", script)
+        self.assertIn("public_http_redirect_status", script)
+        self.assertIn("public_http_redirect_location", script)
         self.assertIn("exit 2", script)
 
         service = SERVICE.read_text(encoding="utf-8")

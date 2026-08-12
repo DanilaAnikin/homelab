@@ -58,6 +58,21 @@ running=$(
 )
 
 route=primary
+for public_host in freio.cz www.freio.cz; do
+  redirect_headers=$(/usr/bin/mktemp)
+  trap 'rm -f -- "$redirect_headers"' EXIT
+  redirect_status=$(
+    /usr/bin/curl --silent --show-error --max-time 15 \
+      --dump-header "$redirect_headers" --output /dev/null \
+      --write-out '%{http_code}' "http://${public_host}/"
+  ) || fail public_http_request_failed
+  [[ "$redirect_status" == 308 ]] || fail public_http_redirect_status
+  /usr/bin/grep -Fqi "location: https://${public_host}/" "$redirect_headers" \
+    || fail public_http_redirect_location
+  /usr/bin/rm -f -- "$redirect_headers"
+  trap - EXIT
+done
+
 for origin in https://freio.cz/ https://www.freio.cz/; do
   headers=$(/usr/bin/mktemp)
   body=$(/usr/bin/mktemp)

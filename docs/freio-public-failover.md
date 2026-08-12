@@ -73,7 +73,9 @@ zmizení fallback hlavičky.
 
 ## Monitoring a incident
 
-Timer běží každou minutu. Exit 1 znamená rozbitou konfiguraci/zálohu nebo
+Timer běží každou minutu. Kromě konfigurace, obou gateway a HTTPS route
+ověřuje pro apex i `www` přesnou odpověď `HTTP 308` se stejnou HTTPS
+`Location`. Exit 1 znamená rozbitou konfiguraci/zálohu, redirect nebo
 nedostupný public edge. Exit 2 vznikne pouze na hraně `primary → fallback`, aby
 spustil jediný Telegram alert; další minuty fallbacku se zapisují do journalu
 bez opakovaného spamu. Návrat na primary se rovněž zapíše do strukturovaného
