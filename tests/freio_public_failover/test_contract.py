@@ -208,28 +208,27 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
             connection.close()
             return response.status, headers, body
 
-        def expect_continue_request(path: str) -> tuple[int, str]:
-            connection = http.client.HTTPConnection(
-                "127.0.0.1", gateway_port, timeout=3
-            )
-            connection.putrequest("POST", path)
-            connection.putheader("Content-Length", "4")
-            connection.putheader("Expect", "100-continue")
-            connection.endheaders(b"test")
-            response = connection.getresponse()
-            body = response.read().decode("utf-8")
-            status = response.status
-            connection.close()
-            return status, body
+        def expect_continue_request(path: str) -> bytes:
+            with socket.create_connection(("127.0.0.1", gateway_port), timeout=3) as raw:
+                raw.sendall(
+                    (
+                        f"POST {path} HTTP/1.1\r\n"
+                        "Host: freio.cz\r\n"
+                        "Content-Length: 4\r\n"
+                        "Expect: 100-continue\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                )
+                return raw.recv(4096)
 
         status, headers, body = request("GET", "/pricing")
         self.assertEqual((status, headers.get("x-freio-primary-test"), body), (200, "true", "primary ok"))
         status, _headers, _body = request("POST", "/api/write")
         self.assertEqual(status, 204)
         self.assertEqual(calls.count(("POST", "/api/write")), 1)
-        status, _body = expect_continue_request("/api/expect")
-        self.assertEqual(status, 204)
-        self.assertEqual(calls.count(("POST", "/api/expect")), 1)
+        expectation_response = expect_continue_request("/api/expect")
+        self.assertTrue(expectation_response.startswith(b"HTTP/1.1 417"))
+        self.assertEqual(calls.count(("POST", "/api/expect")), 0)
 
         status, headers, body = request("GET", "/primary-5xx")
         self.assertEqual(status, 200)

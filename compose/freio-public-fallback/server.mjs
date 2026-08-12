@@ -223,7 +223,13 @@ function handleRequest(req, res) {
 
 const server = http.createServer(handleRequest);
 server.on("checkContinue", (req, res) => {
-  proxyToPrimary(req, res);
+  send(
+    res,
+    417,
+    { ...fallbackHeaders, "Content-Type": "application/json; charset=utf-8" },
+    '{"error":"expectation_failed"}\n',
+    req.method ?? "POST",
+  );
 });
 
 server.requestTimeout = 35_000;
