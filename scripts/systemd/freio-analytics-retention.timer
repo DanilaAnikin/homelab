@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Freio raw analytics retention before nightly backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=freio-analytics-retention.service
+
+[Install]
+WantedBy=timers.target

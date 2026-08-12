@@ -88,21 +88,33 @@ done
 # ── 3) Config bundle (reprodukovatelnost serveru) — šifrovaně ────────────────
 # POZOR: --exclude MUSÍ být PŘED cestami (GNU tar je pozicní), jinak se ignoruje.
 CFG_TAR="$WORK/config_$TS.tar.gz"
-tar --exclude='*/data' --exclude='*.log' --exclude='*/node_modules' \
-    --exclude='*/__pycache__' --exclude='*/.git' --exclude='*/repo/node_modules' \
-    -czf "$CFG_TAR" \
-    -C / etc/dokploy \
-    -C / srv/homelab/compose srv/homelab/self-healing srv/homelab/email-bot \
-    -C / usr/local/bin/homelab-backup.sh \
-    -C / etc/systemd/system/backup.service etc/systemd/system/backup.timer \
-         etc/systemd/system/self-healing.service etc/systemd/system/email-bot.service \
-         etc/systemd/system/freio-email-outbox.service \
-         etc/systemd/system/freio-email-outbox.timer \
-    2>/dev/null || echo "!! config tar částečně selhal (pokračuji)"
-if [[ -s "$CFG_TAR" ]]; then
-  enc "$CFG_TAR" "$CFG_TAR.enc" && rm -f "$CFG_TAR"
+if tar --exclude='*/data' --exclude='*.log' --exclude='*/node_modules' \
+       --exclude='*/__pycache__' --exclude='*/.git' --exclude='*/repo/node_modules' \
+       -czf "$CFG_TAR" \
+       -C / etc/dokploy \
+       -C / srv/homelab/compose srv/homelab/self-healing srv/homelab/email-bot \
+       -C / usr/local/bin/homelab-backup.sh \
+       -C / usr/local/sbin/freio-analytics-retention \
+       -C / etc/systemd/system/backup.service etc/systemd/system/backup.timer \
+            etc/systemd/system/freio-analytics-retention.service \
+            etc/systemd/system/freio-analytics-retention.timer \
+            etc/systemd/system/self-healing.service etc/systemd/system/email-bot.service \
+            etc/systemd/system/freio-email-outbox.service \
+            etc/systemd/system/freio-email-outbox.timer \
+       2>/dev/null; then
+  if [[ -s "$CFG_TAR" ]]; then
+    if enc "$CFG_TAR" "$CFG_TAR.enc"; then
+      rm -f "$CFG_TAR"
+    else
+      echo "!! šifrování config bundle selhalo"; FAIL=1
+      rm -f "$CFG_TAR" "$CFG_TAR.enc"
+    fi
+  else
+    echo "!! config bundle prázdný"; FAIL=1
+  fi
 else
-  echo "!! config bundle prázdný"; FAIL=1
+  echo "!! config tar selhal"; FAIL=1
+  rm -f "$CFG_TAR" "$CFG_TAR.enc"
 fi
 
 # ── 4) Secrets bundle (nejcitlivější) — šifrovaně ────────────────────────────
