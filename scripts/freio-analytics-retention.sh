@@ -16,6 +16,7 @@ readonly BATCH_SIZE=1000
 readonly MAX_BATCHES=60
 readonly MAX_NO_PROGRESS=5
 readonly STATE_DIR=${STATE_DIRECTORY:-/var/lib/freio-analytics-retention}
+readonly DOCKER_CONFIG_DIR=${STATE_DIR}/docker-config
 readonly LOCK_FILE=${STATE_DIR}/run.lock
 readonly SUCCESS_FILE=${STATE_DIR}/last-success.json
 
@@ -26,6 +27,10 @@ fail() {
 
 [[ "$(/usr/bin/id -u)" == 0 ]] || fail root_required
 [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || fail state_directory_invalid
+[[ ! -e "$DOCKER_CONFIG_DIR" || ( -d "$DOCKER_CONFIG_DIR" && ! -L "$DOCKER_CONFIG_DIR" ) ]] \
+  || fail docker_config_directory_invalid
+/usr/bin/install -d -m 0700 "$DOCKER_CONFIG_DIR"
+export DOCKER_CONFIG="$DOCKER_CONFIG_DIR"
 
 exec 9>"$LOCK_FILE"
 "$FLOCK_BIN" -n 9 || fail already_running
@@ -91,7 +96,7 @@ while (( batch_count < MAX_BATCHES )); do
   fi
 
   (( batch_count += 1 ))
-  (( total_deleted += deleted ))
+  total_deleted=$(( total_deleted + deleted ))
 
   if [[ "$has_more" == f ]]; then
     temporary=$("$MKTEMP_BIN" "${STATE_DIR}/.last-success.XXXXXX")

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import stat
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -38,11 +42,83 @@ class FreioAnalyticsRetentionContractTests(unittest.TestCase):
         for forbidden in ("curl", "wget", "http://", "https://", "token", "secret"):
             self.assertNotIn(forbidden, self.script.lower())
 
+    def test_zero_row_rpc_completes_and_writes_private_success_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+
+            mock_id = root / "id"
+            mock_id.write_text("#!/bin/sh\nprintf '0\\n'\n", encoding="utf-8")
+            mock_id.chmod(0o700)
+
+            mock_docker = root / "docker"
+            mock_docker.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = inspect ]; then printf 'true\\n'; exit 0; fi\n"
+                "if [ \"$1\" = exec ]; then\n"
+                "  cat >/dev/null\n"
+                "  printf '0|f|2026-07-13 14:32:21.325991+00\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 64\n",
+                encoding="utf-8",
+            )
+            mock_docker.chmod(0o700)
+
+            executable = root / "retention-under-test.sh"
+            executable.write_text(
+                self.script.replace(
+                    "readonly DOCKER_BIN=/usr/bin/docker",
+                    f"readonly DOCKER_BIN={mock_docker}",
+                ).replace("/usr/bin/id -u", f"{mock_id} -u"),
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+
+            environment = os.environ.copy()
+            environment["STATE_DIRECTORY"] = str(state)
+            completed = subprocess.run(
+                ["bash", str(executable)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            output = json.loads(completed.stdout)
+            self.assertEqual(
+                {
+                    "ok": True,
+                    "component": "freio-analytics-retention",
+                    "cutoff": "2026-07-13 14:32:21.325991+00",
+                    "deleted": 0,
+                    "batches": 1,
+                    "has_more": False,
+                },
+                output,
+            )
+
+            success = state / "last-success.json"
+            persisted = json.loads(success.read_text(encoding="utf-8"))
+            self.assertEqual(0, persisted["deleted"])
+            self.assertEqual(1, persisted["batches"])
+            self.assertEqual(0o600, stat.S_IMODE(success.stat().st_mode))
+            docker_config = state / "docker-config"
+            self.assertTrue(docker_config.is_dir())
+            self.assertFalse(docker_config.is_symlink())
+            self.assertEqual(0o700, stat.S_IMODE(docker_config.stat().st_mode))
+
     def test_script_reuses_cutoff_and_fails_on_bounded_backlog(self) -> None:
         self.assertIn("readonly BATCH_SIZE=1000", self.script)
         self.assertIn("readonly MAX_BATCHES=60", self.script)
         self.assertIn("readonly MAX_NO_PROGRESS=5", self.script)
         self.assertIn('returned_cutoff" != "$fixed_cutoff', self.script)
+        self.assertIn(
+            "total_deleted=$(( total_deleted + deleted ))", self.script
+        )
+        self.assertNotIn("(( total_deleted += deleted ))", self.script)
         self.assertIn("locked_or_nonprogressing_backlog", self.script)
         self.assertIn("safety_cap_backlog_remaining", self.script)
         self.assertIn('"has_more":false', self.script)
