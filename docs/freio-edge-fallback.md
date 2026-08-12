@@ -7,13 +7,38 @@ nebo HTTP `500`–`504` vrátí jen pro HTML navigaci secretless statickou strá
 API, Next assety, nejednoznačně kódované cesty a zápisové metody vždy selžou
 uzavřeně s JSON `503`. Worker nikdy neopakuje origin request.
 
-## Aktuální stav: default-off
+## Aktuální stav: live od 12. 8. 2026
 
-Soubor `wrangler.toml` záměrně nemá žádnou route a vypíná `workers.dev` i
-preview URL. Samotné `wrangler deploy` tedy nesmí připojit veřejný hostname.
-Tento repozitář neobsahuje Cloudflare account ID, zone ID, token, bindings ani
-jiný secret. Produkční route se připojuje až samostatně po preflightu a
-schváleném failure drillu.
+Worker `freio-edge-fallback` je v produkci na jediné verzi
+`cc9c3b10-e0b4-48f6-8bd6-71381e2c0606` se 100 % trafficu. Stažený live modul
+má SHA-256
+`068a073b66daa52ea7925c976c848749057f3627b96aca167368058375e538a9`, tedy
+přesně stejný hash jako verzovaný `worker.mjs`. `workers.dev` i preview URL
+jsou vypnuté, Worker nemá bindings a drží compatibility flag
+`global_fetch_private_origin`.
+
+Aktivní jsou přesně dvě route bez DNS změny:
+
+- `freio.cz/*` → route ID `c02122f4a1dd491ca60b32c6d6d8fd26`;
+- `www.freio.cz/*` → route ID `779faf323c654921984f044e2f560bc8`.
+
+Obě mají `request_limit_fail_open=true`: při vyčerpání denního Workers Free
+limitu zdravý origin zůstane dostupný napřímo. Edge health pak ztratí svou
+hlavičku a minutový host monitor vyvolá
+`notify-failure@freio-public-failover-check.service`. Root-owned marker
+`/etc/freio-public-failover/edge-enabled` je aktivní a monitor je ve stavu
+`primary`.
+
+Live canary na obou hostnamech ověřil zdravý passthrough, HTML fallback pro
+origin `502`, API fail-closed `503`, POST fail-closed bez replaye, čtyřsekundový
+timeout a automatický recovery. Každý drill request vytvořil přesně jeden
+origin attempt. Počáteční Workers metriky po release byly 176 requests,
+0 runtime errors, 130 subrequests a CPU p99 1,683 ms.
+
+Soubor `wrangler.toml` nadále záměrně nemá route a vypíná `workers.dev` i
+preview URL. Samotné nahrání zdroje proto nemůže připojit další hostname.
+Repozitář neobsahuje Cloudflare account ID, zone ID, token, bindings ani jiný
+secret; live route zůstávají samostatný provozní stav Cloudflare.
 
 `global_fetch_private_origin` je explicitně připnutý: origin `fetch(request)`
 musí obejít Worker route a jít k DNS/Tunnel originu. Bez tohoto interlocku by
@@ -107,15 +132,15 @@ gitu. Všechny read kroky musí projít před prvním zápisem.
 
    ```text
    POST /client/v4/zones/{zone_id}/workers/routes
-   {"pattern":"www.freio.cz/*","script":"freio-edge-fallback"}
+   {"pattern":"www.freio.cz/*","script":"freio-edge-fallback","request_limit_fail_open":true}
    ```
 
    Proveď zdravý passthrough smoke a řízený origin-failure drill. Ověř HTML
    `200` s fallback hlavičkou, API `503`, jeden origin attempt a automatický
    návrat na primary.
 6. Teprve po úspěšném drillu připoj apex stejným endpointem a tělem
-   `{"pattern":"freio.cz/*","script":"freio-edge-fallback"}`. Ulož druhé
-   route ID a zopakuj stejné kontroly.
+   `{"pattern":"freio.cz/*","script":"freio-edge-fallback","request_limit_fail_open":true}`.
+   Ulož druhé route ID a zopakuj stejné kontroly.
 7. Po úspěšném postflightu obou routes zapni připravený host monitor a hned ho
    spusť. Marker vytvoř až po nasazení apexu, protože vyžaduje health endpoint
    na obou hostnamech:
@@ -129,8 +154,10 @@ gitu. Všechny read kroky musí projít před prvním zápisem.
 
    Monitor ověří `X-Freio-Edge-Fallback: health-v1` na secretless endpointu a
    výskyt `X-Freio-Edge-Fallback: static-v1` změní na alertovaný stav
-   `edge-fallback`. Cloudflare-side alert musí navíc hlídat Worker exception a
-   spotřebu Workers kvóty.
+   `edge-fallback`. Nasazovací token nemá Billing ani Notifications oprávnění
+   a nevytvořil placený závazek. Cloudflare-side usage policy proto není
+   součástí tohoto release; minutový host monitor hlídá Worker health,
+   runtime chyby i vyčerpání kvóty zvenčí.
 
 ## Rollback
 
@@ -151,8 +178,10 @@ systemctl start --wait freio-public-failover-check.service
 
 ## Provozní hranice
 
-Workers Free má denní limit požadavků; fallback route musí mít před produkcí
-potvrzenou kapacitu nebo Workers Paid a alert na kvótu. Tento Worker pokrývá
-pád Homelabu, jediného `cloudflared`, Traefiku a origin aplikace. Nepokrývá
-výpadek Cloudflare jako celého poskytovatele; ten vyžaduje druhého DNS/CDN
-vendora.
+Workers Free má denní limit 100 000 požadavků a 10 ms CPU na invocation;
+limit se obnovuje v 00:00 UTC. Obě live route při jeho vyčerpání obejdou
+Worker a zachovají zdravý origin, ale edge fallback pak nebude fungovat, dokud
+se kvóta neobnoví. Minutový monitor tento stav alertuje, ale předem ho
+nepředpovídá. Worker pokrývá pád Homelabu, jediného `cloudflared`, Traefiku a
+origin aplikace. Nepokrývá výpadek Cloudflare jako celého poskytovatele; ten
+vyžaduje druhého DNS/CDN vendora.
