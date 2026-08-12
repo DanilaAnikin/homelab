@@ -101,6 +101,8 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertIn('pathname === "/_next"', source)
         self.assertIn('(method === "GET" || method === "HEAD")', source)
         self.assertIn('parsed?.scheme === "http"', source)
+        self.assertIn('forwarded["x-forwarded-proto"] = scheme', source)
+        self.assertIn('delete forwarded["x-forwarded-proto"]', source)
         self.assertIn('Location: `https://${hostName}${rawTarget}`', source)
         self.assertIn("publicHosts", source)
         self.assertIn('"error":"service_temporarily_unavailable"', source)
@@ -154,10 +156,14 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
             allow_reuse_address = True
 
         calls: list[tuple[str, str]] = []
+        primary_headers: list[dict[str, str]] = []
 
         class PrimaryHandler(http.server.BaseHTTPRequestHandler):
             def handle_request(self) -> None:
                 calls.append((self.command, self.path))
+                primary_headers.append(
+                    {name.lower(): value for name, value in self.headers.items()}
+                )
                 content_length = int(self.headers.get("Content-Length", "0"))
                 if content_length:
                     self.rfile.read(content_length)
@@ -360,6 +366,20 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
             },
         )
         self.assertEqual((status, headers.get("x-freio-primary-test"), body), (200, "true", "primary ok"))
+        self.assertEqual(primary_headers[-1].get("host"), "freio.cz")
+        self.assertEqual(primary_headers[-1].get("x-forwarded-proto"), "https")
+        self.assertEqual(primary_headers[-1].get("cf-visitor"), '{"scheme":"https"}')
+        status, headers, body = request(
+            "GET",
+            "/https-spoof-replaced",
+            {
+                "Host": "freio.cz",
+                "CF-Visitor": '{"scheme":"https"}',
+                "X-Forwarded-Proto": "https,http,attacker.invalid",
+            },
+        )
+        self.assertEqual((status, headers.get("x-freio-primary-test"), body), (200, "true", "primary ok"))
+        self.assertEqual(primary_headers[-1].get("x-forwarded-proto"), "https")
         status, headers, body = request(
             "GET",
             "/http-precedence",
@@ -394,6 +414,29 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertEqual(headers.get("x-freio-fallback"), "static-v1")
         self.assertIn("service_temporarily_unavailable", body)
         self.assertEqual(calls.count(("POST", "/primary-5xx")), 1)
+        private_authorization = "Bearer must-not-appear-in-fallback"
+        private_cookie = "session=must-not-appear-in-fallback"
+        status, headers, body = request(
+            "POST",
+            "/primary-5xx",
+            {
+                "Authorization": private_authorization,
+                "Cookie": private_cookie,
+                "Host": "freio.cz",
+                "CF-Visitor": '{"scheme":"https"}',
+                "X-Forwarded-Proto": "http",
+            },
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("x-freio-fallback"), "static-v1")
+        self.assertEqual(primary_headers[-1].get("x-forwarded-proto"), "https")
+        self.assertEqual(primary_headers[-1].get("authorization"), private_authorization)
+        self.assertEqual(primary_headers[-1].get("cookie"), private_cookie)
+        self.assertNotIn(private_authorization, body)
+        self.assertNotIn(private_cookie, body)
+        self.assertNotIn(private_authorization, json.dumps(headers))
+        self.assertNotIn(private_cookie, json.dumps(headers))
+        self.assertEqual(calls.count(("POST", "/primary-5xx")), 2)
 
         primary.shutdown()
         primary.server_close()

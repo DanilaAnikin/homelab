@@ -149,6 +149,26 @@ function originalScheme(headers) {
   return scheme === "http" || scheme === "https" ? scheme : null;
 }
 
+function primaryRequestHeaders(headers) {
+  const forwarded = withoutHopByHopHeaders(headers);
+  const scheme = originalScheme(headers);
+
+  // cloudflared terminates public TLS before its internal HTTP hop to
+  // Traefik, so Traefik correctly describes that last hop as http. CF-Visitor
+  // is the authoritative public scheme on this Cloudflare-only ingress and
+  // already controls the redirect boundary above. Rebuild X-Forwarded-Proto
+  // from the same parsed value before the secretless gateway reaches Next.js;
+  // never forward a conflicting client value. If CF-Visitor is malformed,
+  // originalScheme deliberately returns null and this function grants no
+  // public-HTTPS authority.
+  if (scheme === null) {
+    delete forwarded["x-forwarded-proto"];
+  } else {
+    forwarded["x-forwarded-proto"] = scheme;
+  }
+  return forwarded;
+}
+
 function publicHost(headers) {
   const value = headers.host;
   if (typeof value !== "string") return null;
@@ -241,7 +261,7 @@ function proxyToPrimary(req, res) {
     port: primaryPort,
     method,
     path: req.url,
-    headers: withoutHopByHopHeaders(req.headers),
+    headers: primaryRequestHeaders(req.headers),
     agent: false,
   });
 

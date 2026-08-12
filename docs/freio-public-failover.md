@@ -27,6 +27,11 @@ fallback pro jiný důvěryhodný proxy vstup; `CF-Visitor=https` má přednost,
 aby interní HTTP spojení Cloudflare Tunnelu nevytvořilo redirect loop. Toto je
 transportní ochrana za Cloudflare Tunnel ingress, nikoli náhrada firewallu;
 přímý neautentizovaný přístup k origin portu nesmí být veřejně dostupný.
+Před proxy na Next.js gateway ze stejného autoritativního schématu znovu
+sestaví jediné `X-Forwarded-Proto`; konfliktní hodnota z posledního interního
+HTTP hopu ani hodnota dodaná klientem se nepředává. Tím exact HTTPS machine
+endpointy dostanou `https`, zatímco poškozený `CF-Visitor` jim HTTPS autoritu
+neudělí.
 
 U zápisu po timeoutu znamená `503` výsledek „stav není bezpečně potvrzen“:
 gateway požadavek nikdy sama neopakuje, ale upstream jej mohl přijmout ještě
