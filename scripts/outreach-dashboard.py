@@ -32,7 +32,10 @@ DAILY_CAP = 5  # must match DAILY_CAP in bot-orchestrator.py
 # Prospects that never got as far as an email are attrition, not breakage:
 # a place with no website or no published address was simply not reachable.
 # Lumping them in with real send failures made 350 look like an outage.
-NOT_REACHABLE = ("no_email_found", "no_website", "placeholder_email")
+# A hard bounce is the mail system telling us the address is dead. Suppressing
+# it is the correct outcome, not a fault to chase, so it belongs with the other
+# attrition rather than in the "something is broken" light.
+NOT_REACHABLE = ("no_email_found", "no_website", "placeholder_email", "hard_bounce")
 
 # LaunchMail is shared with the other projects on this host (Freio, Ripieno), so
 # its tables hold their mail too. Every query against it must be scoped to our
