@@ -75,8 +75,13 @@ zmizení fallback hlavičky.
 
 Timer běží každou minutu. Kromě konfigurace, obou gateway a HTTPS route
 ověřuje pro apex i `www` přesnou odpověď `HTTP 308` se stejnou HTTPS
-`Location`. Exit 1 znamená rozbitou konfiguraci/zálohu, redirect nebo
-nedostupný public edge. Exit 2 vznikne pouze na hraně `primary → fallback`, aby
+`Location`. Po aktivaci Cloudflare edge vrstvy přítomnost root-only markeru
+`/etc/freio-public-failover/edge-enabled` navíc vynutí secretless health check
+Workeru na obou hostnamech. Veřejná hlavička
+`X-Freio-Edge-Fallback: static-v1` se zaznamená jako samostatný stav
+`edge-fallback`, ne jako zdravý primary. Exit 1 znamená rozbitou
+konfiguraci/zálohu, redirect, Worker health nebo nedostupný public edge. Exit 2
+vznikne pouze při přechodu z primary do lokálního nebo edge fallbacku, aby
 spustil jediný Telegram alert; další minuty fallbacku se zapisují do journalu
 bez opakovaného spamu. Návrat na primary se rovněž zapíše do strukturovaného
 výstupu.

@@ -7,6 +7,7 @@ readonly SOURCE_CONFIG=/srv/homelab/compose/traefik/freio-public-failover.yml
 readonly RUNTIME_CONFIG=/etc/dokploy/traefik/dynamic/freio-public-failover.yml
 readonly STATE_DIR=${STATE_DIRECTORY:-/var/lib/freio-public-failover}
 readonly STATE_FILE=${STATE_DIR}/route.state
+readonly EDGE_ENABLED_MARKER=/etc/freio-public-failover/edge-enabled
 
 fail() {
   printf '{"ok":false,"error":"%s"}\n' "$1" >&2
@@ -35,7 +36,8 @@ previous_route=unknown
 if [[ -e "$STATE_FILE" ]]; then
   [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || fail state_file_invalid
   IFS= read -r previous_route < "$STATE_FILE" || true
-  [[ "$previous_route" == primary || "$previous_route" == fallback ]] \
+  [[ "$previous_route" == primary || "$previous_route" == fallback \
+    || "$previous_route" == edge-fallback ]] \
     || fail state_value_invalid
 fi
 
@@ -73,6 +75,32 @@ for public_host in freio.cz www.freio.cz; do
   trap - EXIT
 done
 
+if [[ -e "$EDGE_ENABLED_MARKER" ]]; then
+  [[ -f "$EDGE_ENABLED_MARKER" && ! -L "$EDGE_ENABLED_MARKER" ]] \
+    || fail edge_marker_invalid
+  for public_host in freio.cz www.freio.cz; do
+    edge_headers=$(/usr/bin/mktemp)
+    edge_body=$(/usr/bin/mktemp)
+    trap 'rm -f -- "$edge_headers" "$edge_body"' EXIT
+    edge_status=$(
+      /usr/bin/curl --silent --show-error --max-time 15 \
+        --header 'Accept: application/json' \
+        --dump-header "$edge_headers" --output "$edge_body" \
+        --write-out '%{http_code}' \
+        "https://${public_host}/__freio-edge-health"
+    ) || fail edge_health_request_failed
+    [[ "$edge_status" == 200 ]] || fail edge_health_status
+    /usr/bin/grep -Fqi 'x-freio-edge-fallback: health-v1' "$edge_headers" \
+      || fail edge_health_header_mismatch
+    /usr/bin/grep -Fq '"component":"freio-edge-fallback"' "$edge_body" \
+      || fail edge_health_body_mismatch
+    /usr/bin/grep -Fq '"mode":"standby"' "$edge_body" \
+      || fail edge_health_body_mismatch
+    /usr/bin/rm -f -- "$edge_headers" "$edge_body"
+    trap - EXIT
+  done
+fi
+
 for origin in https://freio.cz/ https://www.freio.cz/; do
   headers=$(/usr/bin/mktemp)
   body=$(/usr/bin/mktemp)
@@ -83,7 +111,11 @@ for origin in https://freio.cz/ https://www.freio.cz/; do
       "$origin"
   ) || fail public_request_failed
   [[ "$status" == 200 ]] || fail public_status_not_200
-  if /usr/bin/grep -qi '^x-freio-fallback: static-v1' "$headers"; then
+  if /usr/bin/grep -Fqi 'x-freio-edge-fallback: static-v1' "$headers"; then
+    route=edge-fallback
+    /usr/bin/grep -Fq 'Záložní režim je aktivní' "$body" \
+      || fail edge_fallback_body_mismatch
+  elif /usr/bin/grep -Fqi 'x-freio-fallback: static-v1' "$headers"; then
     route=fallback
     /usr/bin/grep -Fq 'Záložní režim je aktivní' "$body" \
       || fail fallback_body_mismatch
@@ -93,10 +125,12 @@ for origin in https://freio.cz/ https://www.freio.cz/; do
 done
 
 if [[ "$desired" != 1 || "$running" -lt 1 || "$route" != primary ]]; then
-  persist_route fallback
+  incident_state=fallback
+  [[ "$route" == edge-fallback ]] && incident_state=edge-fallback
+  persist_route "$incident_state"
   printf '{"ok":false,"public":true,"route":"%s","primary_desired":"%s","primary_running":%s,"fallback":"healthy"}\n' \
     "$route" "${desired:-unknown}" "${running:-0}" >&2
-  if [[ "$previous_route" != fallback ]]; then
+  if [[ "$previous_route" != "$incident_state" ]]; then
     exit 2
   fi
   exit 0

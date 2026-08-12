@@ -116,8 +116,21 @@ gitu. Všechny read kroky musí projít před prvním zápisem.
 6. Teprve po úspěšném drillu připoj apex stejným endpointem a tělem
    `{"pattern":"freio.cz/*","script":"freio-edge-fallback"}`. Ulož druhé
    route ID a zopakuj stejné kontroly.
-7. Nastav alert na výskyt `X-Freio-Edge-Fallback: static-v1`, origin `5xx`,
-   Worker exception a spotřebu Workers kvóty.
+7. Po úspěšném postflightu obou routes zapni připravený host monitor a hned ho
+   spusť. Marker vytvoř až po nasazení apexu, protože vyžaduje health endpoint
+   na obou hostnamech:
+
+   ```bash
+   install -d -o root -g root -m 0755 /etc/freio-public-failover
+   install -o root -g root -m 0644 /dev/null \
+     /etc/freio-public-failover/edge-enabled
+   systemctl start --wait freio-public-failover-check.service
+   ```
+
+   Monitor ověří `X-Freio-Edge-Fallback: health-v1` na secretless endpointu a
+   výskyt `X-Freio-Edge-Fallback: static-v1` změní na alertovaný stav
+   `edge-fallback`. Cloudflare-side alert musí navíc hlídat Worker exception a
+   spotřebu Workers kvóty.
 
 ## Rollback
 
@@ -127,6 +140,14 @@ DNS: smaž nejprve apex route a potom www route přes
 ukazuje na původní Tunnel, oba hosty vracejí primary bez fallback hlavičky a
 žádná překrývající route nezůstala. Script smaž až později po retenčním okně;
 odpojení routes je rychlejší a bezpečnější incident rollback.
+
+Po odpojení obou routes odstraň přesný marker a spusť monitor; bez tohoto kroku
+by správně hlásil chybějící Worker health jako incident:
+
+```bash
+rm -f -- /etc/freio-public-failover/edge-enabled
+systemctl start --wait freio-public-failover-check.service
+```
 
 ## Provozní hranice
 
