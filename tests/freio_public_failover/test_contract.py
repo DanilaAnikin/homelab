@@ -276,6 +276,18 @@ class FreioPublicFailoverContractTest(unittest.TestCase):
         self.assertEqual(body, "")
         self.assertEqual(len(calls), origin_calls)
         status, headers, body = request(
+            "GET",
+            "/healthz",
+            {
+                "Host": "freio.cz",
+                "CF-Visitor": '{"scheme":"http"}',
+            },
+        )
+        self.assertEqual(status, 308)
+        self.assertEqual(headers.get("location"), "https://freio.cz/healthz")
+        self.assertEqual(body, "")
+        self.assertEqual(len(calls), origin_calls)
+        status, headers, body = request(
             "POST",
             "/api/write",
             {

@@ -19,7 +19,8 @@ nemá žádný aplikační secret, databázové ani Stripe spojení a nic z pož
 neloguje.
 
 Cloudflare hlavička `CF-Visitor` je autoritativní pro původní schéma. Běžný
-veřejný HTTP požadavek na allowlistovaný apex nebo `www` gateway ukončí `308`
+veřejný HTTP požadavek na allowlistovaný apex nebo `www`, včetně veřejného
+`/healthz`, gateway ukončí `308`
 na stejnou HTTPS cestu ještě před kontaktem s primary; nepodporovaný
 `Expect: 100-continue` zůstává fail-closed `417`. `X-Forwarded-Proto` je jen
 fallback pro jiný důvěryhodný proxy vstup; `CF-Visitor=https` má přednost,

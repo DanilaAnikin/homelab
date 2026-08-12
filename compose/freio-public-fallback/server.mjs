@@ -318,21 +318,6 @@ function handleRequest(req, res) {
     return;
   }
 
-  if ((method === "GET" || method === "HEAD") && url.pathname === "/healthz") {
-    send(
-      res,
-      200,
-      {
-        "Cache-Control": "no-store",
-        "Content-Type": "application/json; charset=utf-8",
-        "X-Content-Type-Options": "nosniff",
-      },
-      '{"status":"ok","mode":"request_aware_gateway"}\n',
-      method,
-    );
-    return;
-  }
-
   if (originalScheme(req.headers) === "http") {
     const hostName = publicHost(req.headers);
     if (!hostName) {
@@ -350,6 +335,21 @@ function handleRequest(req, res) {
       return;
     }
     sendHttpsRedirect(req, res, hostName);
+    return;
+  }
+
+  if ((method === "GET" || method === "HEAD") && url.pathname === "/healthz") {
+    send(
+      res,
+      200,
+      {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+      },
+      '{"status":"ok","mode":"request_aware_gateway"}\n',
+      method,
+    );
     return;
   }
 
