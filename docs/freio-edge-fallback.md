@@ -22,9 +22,9 @@ Aktivní jsou přesně dvě route bez DNS změny:
 - `freio.cz/*` → route ID `c02122f4a1dd491ca60b32c6d6d8fd26`;
 - `www.freio.cz/*` → route ID `779faf323c654921984f044e2f560bc8`.
 
-Obě mají `request_limit_fail_open=true`: při vyčerpání denního Workers Free
-limitu zdravý origin zůstane dostupný napřímo. Edge health pak ztratí svou
-hlavičku a minutový host monitor vyvolá
+Obě mají `request_limit_fail_open=true`: pokud účet běží na Workers Free,
+při vyčerpání denního limitu zdravý origin zůstane dostupný napřímo. Edge
+health pak ztratí svou hlavičku a minutový host monitor vyvolá
 `notify-failure@freio-public-failover-check.service`. Root-owned marker
 `/etc/freio-public-failover/edge-enabled` je aktivní a monitor je ve stavu
 `primary`.
@@ -34,6 +34,12 @@ origin `502`, API fail-closed `503`, POST fail-closed bez replaye, čtyřsekundo
 timeout a automatický recovery. Každý drill request vytvořil přesně jeden
 origin attempt. Počáteční Workers metriky po release byly 176 requests,
 0 runtime errors, 130 subrequests a CPU p99 1,683 ms.
+
+Workers API hlásí `usage_model=standard`, ale deployment token záměrně nemá
+Billing oprávnění a subscription endpoint vrací `403`. Aktivace nevolala
+žádný billing ani subscription write endpoint, takže nevytvořila nový placený
+závazek; z API dostupného tomuto tokenu však nelze dokázat, zda účet neměl
+Workers Paid už před releasem.
 
 Soubor `wrangler.toml` nadále záměrně nemá route a vypíná `workers.dev` i
 preview URL. Samotné nahrání zdroje proto nemůže připojit další hostname.
@@ -155,7 +161,7 @@ gitu. Všechny read kroky musí projít před prvním zápisem.
    Monitor ověří `X-Freio-Edge-Fallback: health-v1` na secretless endpointu a
    výskyt `X-Freio-Edge-Fallback: static-v1` změní na alertovaný stav
    `edge-fallback`. Nasazovací token nemá Billing ani Notifications oprávnění
-   a nevytvořil placený závazek. Cloudflare-side usage policy proto není
+   a nemůže vytvořit placený závazek. Cloudflare-side usage policy proto není
    součástí tohoto release; minutový host monitor hlídá Worker health,
    runtime chyby i vyčerpání kvóty zvenčí.
 
@@ -178,10 +184,16 @@ systemctl start --wait freio-public-failover-check.service
 
 ## Provozní hranice
 
-Workers Free má denní limit 100 000 požadavků a 10 ms CPU na invocation;
+Na Workers Free je denní limit 100 000 požadavků a 10 ms CPU na invocation;
 limit se obnovuje v 00:00 UTC. Obě live route při jeho vyčerpání obejdou
 Worker a zachovají zdravý origin, ale edge fallback pak nebude fungovat, dokud
-se kvóta neobnoví. Minutový monitor tento stav alertuje, ale předem ho
-nepředpovídá. Worker pokrývá pád Homelabu, jediného `cloudflared`, Traefiku a
-origin aplikace. Nepokrývá výpadek Cloudflare jako celého poskytovatele; ten
-vyžaduje druhého DNS/CDN vendora.
+se kvóta neobnoví. Na Workers Paid/Standard je v ceně 10 milionů requestů a
+30 milionů CPU ms za měsíc; nad limit je cena 0,30 USD za milion requestů a
+0,02 USD za milion CPU ms. Počáteční live provoz je hluboko pod oběma
+envelopes, provider-side usage alert ale tento token neumí ověřit ani
+vytvořit.
+
+Minutový monitor chybu alertuje, ale spotřebu předem nepředpovídá. Worker
+pokrývá pád Homelabu, jediného `cloudflared`, Traefiku a origin aplikace.
+Nepokrývá výpadek Cloudflare jako celého poskytovatele; ten vyžaduje druhého
+DNS/CDN vendora.
