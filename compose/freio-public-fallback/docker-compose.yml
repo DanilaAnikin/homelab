@@ -1,0 +1,40 @@
+name: freio-public-fallback
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: freio-public-fallback:v1
+    container_name: freio-public-fallback
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=0700,uid=10001,gid=10001
+    networks:
+      - dokploy-network
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 96M
+
+networks:
+  dokploy-network:
+    external: true

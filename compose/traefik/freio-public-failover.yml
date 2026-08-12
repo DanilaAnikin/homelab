@@ -1,0 +1,47 @@
+# Public Freio apex/www fail over to a secretless, read-only static service.
+# This file deliberately has higher router priority than Dokploy's managed
+# freio-xkgrrq.yml and therefore survives ordinary Dokploy rewrites.
+http:
+  routers:
+    freio-public-failover-apex:
+      rule: Host(`freio.cz`)
+      priority: 30000
+      service: freio-public-failover
+      entryPoints: [web]
+    freio-public-failover-www:
+      rule: Host(`www.freio.cz`)
+      priority: 30000
+      service: freio-public-failover
+      entryPoints: [web]
+
+  services:
+    freio-public-failover:
+      failover:
+        healthCheck: {}
+        service: freio-public-primary
+        fallback: freio-public-static
+
+    freio-public-primary:
+      loadBalancer:
+        passHostHeader: true
+        healthCheck:
+          path: /
+          interval: 2s
+          timeout: 1s
+          hostname: freio.cz
+        passiveHealthCheck:
+          failureWindow: 3s
+          maxFailedAttempts: 1
+        servers:
+          - url: http://freio-xkgrrq:3000
+
+    freio-public-static:
+      loadBalancer:
+        passHostHeader: true
+        healthCheck:
+          path: /healthz
+          interval: 2s
+          timeout: 1s
+          hostname: freio.cz
+        servers:
+          - url: http://freio-public-fallback:8080

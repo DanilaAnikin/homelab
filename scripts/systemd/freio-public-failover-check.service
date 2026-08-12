@@ -1,0 +1,44 @@
+[Unit]
+Description=Verify Freio public primary and automatic static failover
+Documentation=file:/srv/homelab/docs/freio-public-failover.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+OnFailure=notify-failure@freio-public-failover-check.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/sbin/freio-public-failover-check
+TimeoutStartSec=45s
+Restart=no
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=-/srv/homelab/secrets -/etc/freio -/etc/homelab-telegram
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+DevicePolicy=closed
+KeyringMode=private
+RemoveIPC=true
+TasksMax=32
+MemoryMax=96M
