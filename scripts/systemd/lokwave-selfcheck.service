@@ -1,0 +1,13 @@
+[Unit]
+Description=Lokwave daily self-check (payment, webhooks, login, GBP quota)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root only because it reads the Stripe key out of a running app
+# container; Dokploy keeps the env in its own database, not on disk.
+ExecStart=/usr/bin/python3 /srv/homelab/scripts/lokwave-selfcheck.py
+TimeoutStartSec=600
+# The Stripe probe creates and cancels a subscription, so never let two run at
+# once — a second run would find the first one's leftovers.
