@@ -220,6 +220,24 @@ def inbound(limit=300, search=None):
     return rows, num(total)
 
 
+SELFCHECK_STATE = "/srv/homelab/state/selfcheck.json"
+
+
+def selfcheck():
+    """Last result of the daily money-path self-check.
+
+    Kept on the page because the four failures found on 2026-08-12 — undelivered
+    Stripe webhooks, a checkout that threw for every paying customer, a refused
+    login and a rate limiter keyed on the proxy — were all silent. The outreach
+    numbers were healthy throughout.
+    """
+    try:
+        with open(SELFCHECK_STATE) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
 def subject_variants():
     """Which subject-line strategy earns the open, and the click.
 
@@ -595,6 +613,23 @@ def render_home():
         if total < 100:
             b.append(f'<p class="note">Zatím {total} e-mailů — na závěr je to málo. '
                      "Rozdíl pod několika stovkami odeslaných je šum, ne výsledek.</p>")
+
+    sc = selfcheck()
+    b.append("<h2>Denní kontrola peněžní cesty</h2>")
+    if not sc:
+        b.append('<div class="empty">Kontrola zatím neproběhla.</div>')
+    else:
+        stale = fmt_dt(sc.get("checkedAt"))
+        b.append('<dl class="grid">')
+        for name, r in (sc.get("results") or {}).items():
+            ok = r.get("ok")
+            cls = "good" if ok is True else "bad" if ok is False else ""
+            value = "OK" if ok is True else "chyba" if ok is False else "—"
+            b.append(cell(name, value, "", cls))
+        b.append("</dl>")
+        b.append(f'<p class="note">Naposledy {E(stale)} UTC. Běží každé ráno; '
+                 "při selhání odejde e-mail. " + E("; ".join(
+                     f"{k}: {v.get('msg','')}" for k, v in (sc.get("results") or {}).items())) + "</p>")
 
     b.append("<h2>Kontrolky</h2><dl class='grid'>")
     for label, value, bad in health():

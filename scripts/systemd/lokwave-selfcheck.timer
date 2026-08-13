@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Lokwave self-check every morning
+
+[Timer]
+# Early enough that a broken payment path is known before the day's outreach
+# lands in anyone's inbox.
+OnCalendar=*-*-* 06:40:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
