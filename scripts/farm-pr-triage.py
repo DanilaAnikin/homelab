@@ -44,11 +44,16 @@ MAX_MERGES = int(next((a.split("=")[1] for a in sys.argv if a.startswith("--max-
 DIFF_CHARS = 60000
 CLAUDE_TIMEOUT = 900
 
-# Cesty, na které autonomní merge nesahá. Deploy, CI a závislosti mají dopad mimo
+# Cesty, na které autonomní merge nesahá: deploy, CI a git hooky mají dopad mimo
 # repozitář (spuštěné pipeline, běžící služby), takže je pouští jen člověk.
+#
+# Lockfiles tu SCHVÁLNĚ NEJSOU, i když je to lákavé. Přidání závislosti mění
+# lockfile vždycky, takže by pravidlo zablokovalo skoro každé legitimní PR —
+# poprvé to zavřelo i dobrý Sentry PR napojený na reálnou aplikaci. Riziko
+# závislostí patří do posudku modelu (vidí celý diff), ne do plošného zákazu.
 PROTECTED = re.compile(
     r"^(\.github/|\.gitlab-ci|Dockerfile|docker-compose|infra/|deploy/|\.env|"
-    r"pnpm-lock\.yaml|package-lock\.json|yarn\.lock|\.husky/|Makefile$)")
+    r"\.husky/|Makefile$)")
 
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -258,15 +263,32 @@ def ask_claude(dossier):
     except subprocess.TimeoutExpired:
         print("    ⚠️ Claude timeout"); return None
     finally:
-        os.unlink(path)
+        # Agent má Bash, takže si dossier někdy po sobě sám smaže — na tom se nesmí
+        # spadnout (jinak se běh utne uprostřed repa, jak se stalo u contentgenu).
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
     m = re.search(r"\{.*\}", out, re.S)
     if not m:
         print(f"    ⚠️ Claude nevrátil JSON: {out[:150]}"); return None
+    raw = m.group(0)
     try:
-        return json.loads(m.group(0))
-    except Exception as e:
-        print(f"    ⚠️ nečitelný JSON: {str(e)[:60]}"); return None
+        return json.loads(raw)
+    except Exception:
+        pass
+    # Model občas obalí odpověď ```json blokem nebo použije jednoduché uvozovky /
+    # koncovou čárku. Jedno PR se tím ztratilo, tak to radši zkusíme narovnat,
+    # než ho celé zahodit.
+    for fix in (lambda t: re.sub(r",\s*([}\]])", r"\1", t),
+                lambda t: re.sub(r",\s*([}\]])", r"\1", t.replace("\n", " "))):
+        try:
+            return json.loads(fix(raw))
+        except Exception:
+            continue
+    print(f"    ⚠️ nečitelný JSON: {raw[:120]}")
+    return None
 
 
 # --- guardraily ------------------------------------------------------------
@@ -283,12 +305,30 @@ def gate_merge(dossier):
     return None
 
 
-def failing_checks(repo, sha):
+def _failed_names(repo, sha):
     runs = gh(f"/repos/{OWNER}/{repo}/commits/{sha}/check-runs")
     if not runs:
+        return set()
+    return {c["name"] for c in runs.get("check_runs", [])
+            if c.get("status") == "completed" and c.get("conclusion") in ("failure", "timed_out")}
+
+
+_baseline_cache = {}
+
+
+def failing_checks(repo, sha):
+    """Jen checky, které rozbil TENHLE PR — ne ty, co jsou červené i na main.
+
+    Ripieno má `verify` failující přímo na main, takže původní verze pravidla
+    blokovala všechny jeho PR napořád, i ty bezvadné. Rozbitá CI je problém repa,
+    ne důvod zamrznout sklizeň; blokovat se má ten, kdo breakage způsobil."""
+    pr_failed = _failed_names(repo, sha)
+    if not pr_failed:
         return []
-    return [c["name"] for c in runs.get("check_runs", [])
-            if c.get("status") == "completed" and c.get("conclusion") in ("failure", "timed_out")]
+    if repo not in _baseline_cache:
+        head = gh(f"/repos/{OWNER}/{repo}/commits/main")
+        _baseline_cache[repo] = _failed_names(repo, head["sha"]) if head else set()
+    return sorted(pr_failed - _baseline_cache[repo])
 
 
 # --- provedení -------------------------------------------------------------
@@ -374,6 +414,9 @@ for repo in ([ONLY] if ONLY else REPOS):
     decided = []
 
     for p in prs[:LIMIT]:
+      # Jedno rozbité PR nesmí shodit zbytek běhu — ostatní repozitáře by zůstaly
+      # nevyřízené a příště by se začínalo znovu od začátku.
+      try:
         num = p["number"]
         detail = gh(f"/repos/{OWNER}/{repo}/pulls/{num}")
         if not detail:
@@ -457,6 +500,9 @@ for repo in ([ONLY] if ONLY else REPOS):
           values ('{esc(repo)}', {num}, '{esc(p['title'])[:400]}', '{esc(decision)}',
                   '{esc(conf)}', '{esc(reason)[:600]}', {str(executed).lower()},
                   '{esc(gate_note)[:300]}', {f"'{fu_id}'" if fu_id else 'null'});""")
+      except Exception as e:
+        print(f"    ⚠️ PR #{p.get('number')} přeskočen kvůli chybě: {str(e)[:110]}")
+        summary["skip"] += 1
 
 head = (f"🤖 Vyřízení PR farmy: {summary['merge']}× merge, {summary['revise']}× vráceno "
         f"k dodělání, {summary['close']}× zavřeno" + (f", {summary['skip']}× přeskočeno" if summary["skip"] else ""))
