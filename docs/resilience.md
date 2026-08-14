@@ -11,11 +11,16 @@ timers, and version-controlled in this repo.
 ### Nightly full backup — `scripts/backup.sh` (`backup.timer`, 03:30)
 Encrypted (OpenSSL AES-256) to Cloudflare R2 under `nightly/YYYY-MM/`:
 - **Databases** — every production DB dumped individually (`pg_dump -Fc`): freio, lokwave,
-  inngest, ripieno, launchmail, dokploy metadata, plus each cluster's role globals.
+  inngest, ripieno, launchmail, **Postiz**, dokploy metadata, plus each cluster's role globals.
   Rehearsal/system DBs are excluded. Dump filenames are namespaced per container so
   same-named DBs (e.g. two `postgres`) never collide.
 - **Config bundle** — `/etc/dokploy` + `compose/` + `self-healing/` + systemd units.
 - **Secrets bundle** — `/srv/homelab/secrets`, encrypted.
+- **Postiz recovery set** — one bounded writer fence captures a WAL-consistent PG17
+  cluster, globals + four strict logical DB fallbacks, Redis, runtime/config volume,
+  uploads, seasonal rollback state and all four exact Docker images. CAS objects and
+  timestamped sets are independently copied to primary and DR under dynamically attested
+  Bucket Locks; `--immutable` is only a client collision guard. The HMAC commit is last.
 - **Secondary DR copy** — mirrored through the independent `r2dr` remote to the
   separate `homelab-backups-dr` bucket (90-day retention). The copy is followed by
   a one-way size verification. Copy, verification, or retention failure makes the
@@ -23,8 +28,9 @@ Encrypted (OpenSSL AES-256) to Cloudflare R2 under `nightly/YYYY-MM/`:
   successfully uploaded primary copy is never removed.
 
 ### Frequent DB snapshots — `scripts/frequent-db-backup.sh` (`frequent-db-backup.timer`, every 10 min)
-All production DBs, encrypted → R2 `frequent/` (48 h retention). Brings **RPO down to ~10 min**
-with zero changes to the live databases (plain `pg_dump`, just more often).
+Production DBs, including the exact four Postiz/Temporal application DBs, are encrypted to
+primary R2 `frequent/`. These are independent per-DB PIT aids, not a cross-DB Postiz
+snapshot and not a 10-minute full-service RPO. Complete heartbeat staleness alerts at 45 min.
 
 ### Off-box key
 The AES key (`freio-backup-key.txt`) lives on the server **and** on the workstation
@@ -37,8 +43,11 @@ an Uptime Kuma push monitor (25 h window) — so even a *no-run* surfaces as DOW
 
 ### Tested recovery — `self-healing/restore-drill.sh` (`restore-drill.timer`, Sat 05:00)
 Weekly: pulls the latest encrypted dumps, decrypts, restores into an **isolated throwaway**
-Postgres container, asserts schema (table count) + data (largest table > 0 rows), cleans up,
-reports to Telegram. *An untested backup is not a backup.*
+Postgres container, asserts schema + data, cleans up, and reports to Telegram. All database
+drill containers use `--network none`. The Postiz leg additionally restores its committed
+DB/config/uploads/image set independently from primary and DR, verifies every upload hash,
+uses strict `pg_restore --exit-on-error`, and validates files in a read-only network-none
+container. See [`postiz-backup-restore.md`](postiz-backup-restore.md).
 
 ---
 
@@ -120,6 +129,6 @@ to absorb transient blips.
 
 - **Container memory limits** — intentionally not set (plenty of free RAM; risk of spurious
   OOM-kills outweighs the benefit). Memory pressure is caught by Prometheus alerts → agent.
-- **WAL / point-in-time recovery** — evaluated, then chose **10-min encrypted dumps** instead:
-  RPO ~10 min with *zero* configuration change to the live customer database, versus adding a
-  replication slot + auth changes to a paying-customer DB. The safe trade for this workload.
+- **Continuous WAL archiving** — not currently enabled. Ten-minute logical dumps remain
+  useful per-DB PIT aids, while the nightly Postiz full-recovery authority is the
+  writer-fenced physical cluster. Do not describe the dump cadence as a service-wide RPO.

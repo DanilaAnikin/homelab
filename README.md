@@ -63,8 +63,8 @@ loudly (Telegram) about the rest. Everything below is live and version-controlle
 | 🧠 **Self-improvement meta-agent** | Weekly: reviews incidents, metrics, config drift → writes postmortems, applies safe preventive fixes, proposes the rest (already caught & fixed an 11h silent crashloop) |
 | 📋 **Daily health review** | Morning LLM digest: disk, certs, backup freshness, DB connections → Telegram |
 | 🧪 **Synthetic checks** | Every 10 min: real auth (apikey health), DB queries, page render — deeper than uptime |
-| 💾 **Backups** | Nightly full (all DBs + config + secrets, AES-256) → R2 + **DR bucket**; **10-min** DB snapshots (RPO ~10 min); key stored off-box |
-| ✅ **Restore drills** | Weekly automated restore into a throwaway DB — an untested backup is not a backup |
+| 💾 **Backups** | Nightly encrypted backup → R2 + DR; Postiz uses one writer-fenced physical cluster, globals + 4 logical DBs, Redis/config/uploads/seasonal state and 4 exact images. Ten-minute Postiz dumps are primary-only per-DB PIT aids, not a full-service RPO. |
+| ✅ **Restore drills** | Weekly network-none restore; the complete authenticated Postiz graph is proven independently from primary and DR |
 | 🛡️ **Security** | Trivy CVE scanning, fail2ban, unattended OS upgrades, secrets never in git |
 | ⬆️ **Safe auto-updates** | Weekly image updates with health-gate + **rollback**; pinned prod images left untouched |
 | ↩️ **Deploy watchdog** | Post-deploy health gate → `docker service rollback` if a fresh deploy fails |
@@ -75,7 +75,8 @@ loudly (Telegram) about the rest. Everything below is live and version-controlle
 | Path | Contents |
 |---|---|
 | `scripts/bootstrap.sh` | One-shot fresh-server setup (hardening, Docker, Dokploy, Tailscale, cloudflared) |
-| `scripts/backup.sh` · `scripts/frequent-db-backup.sh` | Encrypted nightly + 10-min DB backups → R2 |
+| `scripts/backup.sh` · `scripts/frequent-db-backup.sh` | Encrypted nightly → primary+DR R2; 10-min per-DB PIT dumps → primary only |
+| `scripts/postiz-artifact-backup.sh` | Encrypted CAS Postiz uploads + four content-addressed Docker archives under attested R2 Bucket Locks |
 | `scripts/trivy-scan.sh` · `scripts/auto-update.sh` | CVE scanning · health-gated auto-updates with rollback |
 | `scripts/supabase-selfhost/` | Generalized per-app self-hosted Supabase provisioner |
 | `scripts/systemd/` | All timers & services (backups, drills, agents, watchdogs) |

@@ -1,0 +1,1 @@
+"""Postiz backup contract tests."""

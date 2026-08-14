@@ -1,4 +1,6 @@
-FROM ghcr.io/gitroomhq/postiz-app:v2.11.3
+# Multi-arch manifest digest for v2.11.3. The tag is kept for readability; the
+# digest makes a disaster rebuild independent of later registry tag movement.
+FROM ghcr.io/gitroomhq/postiz-app:v2.11.3@sha256:e722aba1b85f299acac5fea2af9acef8363c837dc04a6c3c2ea06cdf74ccca79
 # Fix: nové LinkedIn appky nedostanou legacy r_basicprofile; Postiz ho ale posílá
 # a LinkedIn pak celý OAuth odmítne. Osobní provider omezíme na scopes, co appka má.
 RUN set -e; \

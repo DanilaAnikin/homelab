@@ -1,8 +1,9 @@
 # Zálohy a obnova
 
 Filozofie: **3-2-1** — data na serveru + lokální kopie (USB SSD) + offsite (R2).
-Zálohuje se denně ve 3:30 (`backup.timer`). Netestovaná záloha = žádná záloha →
-kvartální restore drill (dole).
+Zálohuje se denně ve 3:30 (`backup.timer`). Databáze se navíc dumpují každých
+10 minut a automatický restore drill běží týdně. Frequent dump je samostatný
+per-DB PIT bod, ne cross-DB/full-service RPO. Netestovaná záloha = žádná záloha.
 
 ## Jednorázové nastavení
 
@@ -45,10 +46,20 @@ Nainstaluj skript + systemd units, pusť první zálohu ručně, ověř `rclone 
 | `globals_*.sql.gz` | role + hesla (nutné pro funkční conn stringy po obnově) |
 | `db_<projekt>_*.dump` | každá databáze zvlášť (`pg_dump -Fc`) |
 | `etc-dokploy_*.tar.gz` | definice aplikací/domén/env v Dokploy |
+| `db_postiz-postgres_{postiz,temporal,temporal_visibility,insights}_*.dump.enc` | čtyři strict logické fallbacky jednoho writer-fenced setu |
+| `postiz_postgres_cluster_*.tar.gz.enc` | autoritativní WAL-konzistentní physical PG17 cluster |
+| `postiz_config_*.tar.gz.enc` | root-only runtime config + exact recovery tooling/source revision |
+| `postiz_config_volume_*`, `postiz_redis_*` | config volume a stabilní Redis RDB s metadaty |
+| `postiz_artifacts_*.json.enc` | upload CAS manifest + čtyři exact Docker image IDs/archives |
+| `postiz/recovery-sets/.../COMMITTED.hmac.json` | authenticated commit vytvořený poslední na primary i DR |
 
-**Není v záloze:** soubory uvnitř kontejnerů (uploads patří do R2 přímo z appky),
-OS (reprodukovatelný přes `bootstrap.sh`), `data/` adresář Postgresu (zálohou
-jsou logické dumpy, ne raw soubory).
+**Není v záloze:** běžné ephemeral soubory uvnitř kontejnerů. Postiz uploads jsou
+výjimka: zálohují se šifrovaně a inkrementálně do content-addressed primary+DR
+namespace se server-side Bucket Lock retention. Postiz má navíc physical PG17
+cluster; nejde o nekonzistentní raw kopii běžícího volume.
+
+Úplný Postiz kontrakt, rollout, acceptance a rollback jsou v
+[`postiz-backup-restore.md`](postiz-backup-restore.md).
 
 ## Obnova JEDNÉ databáze (nejčastější případ)
 
@@ -61,7 +72,7 @@ sudo docker exec -i shared-postgres pg_restore -U postgres -d hummy \
   --clean --if-exists --no-owner --role=hummy < /tmp/db_hummy_*.dump
 ```
 
-## Obnova VŠEHO (disaster: mrtvý server)
+## Obnova VŠEHO mimo Postiz (disaster: mrtvý server)
 
 Na novém stroji (jakémkoli x86 s Ubuntu):
 ```bash
@@ -80,7 +91,7 @@ done
 #    cloudflared service install <TOKEN> — a jedeš. Conn stringy platí beze změny.
 ```
 
-## Kvartální restore drill (15 min, NEVYNECHÁVAT)
+## Obecný databázový restore drill
 
 ```bash
 sudo docker exec shared-postgres createdb -U postgres -O <projekt> drill_test

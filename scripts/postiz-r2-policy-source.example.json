@@ -1,0 +1,37 @@
+{
+  "schema": "freio.postiz.storage-policy-source.v1",
+  "provider": "cloudflare-r2",
+  "primary": {
+    "account_id": "00000000000000000000000000000000",
+    "bucket": "homelab-backups",
+    "jurisdiction": "default",
+    "bucket_token_resource": "com.cloudflare.edge.r2.bucket.00000000000000000000000000000000_default_homelab-backups",
+    "remote": "r2postiz:homelab-backups/postiz",
+    "policy_token_file": "/srv/homelab/secrets/cloudflare-r2-policy-read-token.txt",
+    "runtime_credential": {
+      "bucket_only": true,
+      "cross_bucket_denied": true,
+      "object_read_write_includes_delete": true,
+      "policy_admin_denied": true
+    }
+  },
+  "dr": {
+    "account_id": "00000000000000000000000000000000",
+    "bucket": "homelab-backups-dr",
+    "jurisdiction": "default",
+    "bucket_token_resource": "com.cloudflare.edge.r2.bucket.00000000000000000000000000000000_default_homelab-backups-dr",
+    "remote": "r2drpostiz:homelab-backups-dr/postiz",
+    "policy_token_file": "/srv/homelab/secrets/cloudflare-r2-policy-read-token.txt",
+    "runtime_credential": {
+      "bucket_only": true,
+      "cross_bucket_denied": true,
+      "object_read_write_includes_delete": true,
+      "policy_admin_denied": true
+    }
+  },
+  "failure_domain": {
+    "provider": "cloudflare-r2",
+    "independent_accounts": false,
+    "accepted_correlated_admin_risk": true
+  }
+}

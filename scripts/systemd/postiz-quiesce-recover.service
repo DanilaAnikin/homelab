@@ -1,9 +1,11 @@
 [Unit]
-Description=Caste sifrovane per-DB PIT dumpy prod DB (primary-only)
-Wants=network-online.target postiz-quiesce-recover.service postiz-backup-workspace-cleanup.service
+Description=Recover an interrupted Postiz writer fence
 Requires=docker.service
-After=network-online.target docker.service postiz-quiesce-recover.service postiz-backup-workspace-cleanup.service
-OnFailure=notify-failure@frequent-db-backup.service
+After=docker.service systemd-tmpfiles-setup.service
+Before=backup.service frequent-db-backup.service
+ConditionFileIsExecutable=/usr/local/sbin/postiz-quiesced-capture.sh
+OnFailure=backup-notify-failure.service
+
 [Service]
 Type=oneshot
 User=root
@@ -14,14 +16,11 @@ RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 StateDirectory=homelab-backup
 StateDirectoryMode=0700
-Nice=10
-IOSchedulingClass=idle
-IOSchedulingPriority=7
+ExecStart=/usr/local/sbin/postiz-quiesced-capture.sh --recover-only
 TimeoutStartSec=9min
-TimeoutStopSec=5min
-ExecStartPre=/usr/local/sbin/postiz-backup-workspace-cleanup.sh --scope frequent
-ExecStart=/usr/local/bin/frequent-db-backup.sh
-ExecStopPost=/usr/local/sbin/postiz-backup-workspace-cleanup.sh --scope frequent
+TimeoutStopSec=8min
+Restart=on-failure
+RestartSec=30s
 NoNewPrivileges=yes
 PrivateDevices=yes
 PrivateTmp=yes
@@ -40,5 +39,8 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 ProtectClock=yes
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX
 ReadWritePaths=/run/homelab-backup /var/lib/homelab-backup
+
+[Install]
+WantedBy=multi-user.target

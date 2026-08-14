@@ -22,7 +22,7 @@ services:
     networks: [dokploy-network, postiz-internal]
     depends_on: [postiz-postgres, postiz-redis]
   postiz-postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     container_name: postiz-postgres
     restart: unless-stopped
     mem_limit: 512m
@@ -39,7 +39,7 @@ services:
       timeout: 5s
       retries: 10
   postiz-redis:
-    image: redis:7.2
+    image: redis:7.2@sha256:6372db89351b00ba0ddca437ff49ce2ed4beed8a961a27d8259060c9603c240d
     container_name: postiz-redis
     restart: unless-stopped
     mem_limit: 256m
@@ -47,7 +47,7 @@ services:
       - postiz-redis:/data
     networks: [postiz-internal]
   postiz-temporal:
-    image: temporalio/auto-setup:1.25.2
+    image: temporalio/auto-setup:1.25.2@sha256:b1edc1e20002d958c8182f2ae08dee877a125083683a627a44917683419ba6a8
     container_name: postiz-temporal
     restart: unless-stopped
     mem_limit: 1024m
