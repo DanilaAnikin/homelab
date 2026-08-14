@@ -3405,26 +3405,30 @@ def _verify_lifecycle_response(path: Path, delete_age: int) -> tuple[dict[str, A
             or len(rule_id) > 256
             or rule_id in ids
             or not isinstance(conditions, dict)
-            or set(conditions) != {"prefix"}
-            or not isinstance(conditions.get("prefix"), str)
             or not isinstance(enabled, bool)
         ):
             _die("invalid or duplicate lifecycle rule")
         ids.add(rule_id)
-        prefix = conditions["prefix"]
+        implicit_default_prefix = conditions == {}
+        if implicit_default_prefix:
+            # Cloudflare serializes the provider-owned default multipart-abort
+            # rule with an empty conditions object.  Only that exact rule may
+            # use the implicit empty prefix; every other rule remains bound to
+            # an explicit string prefix below.
+            prefix = ""
+        elif set(conditions) == {"prefix"} and isinstance(conditions.get("prefix"), str):
+            prefix = conditions["prefix"]
+        else:
+            _die("invalid lifecycle rule conditions")
         abort = _normalize_transition(rule.get("abortMultipartUploadsTransition"), "abort")
         delete = _normalize_transition(rule.get("deleteObjectsTransition"), "delete")
         storage = rule.get("storageClassTransitions", [])
-        if not isinstance(storage, list):
+        if storage is None or storage == []:
+            normalized_storage: list[dict[str, Any]] = []
+        elif not isinstance(storage, list):
             _die("invalid lifecycle storage-class transitions")
-        if storage:
-            normalized_storage = []
-            for transition in storage:
-                if not isinstance(transition, dict):
-                    _die("invalid lifecycle storage-class transition")
-                normalized_storage.append(transition)
         else:
-            normalized_storage = []
+            _die("non-empty lifecycle storage-class transitions are forbidden")
         projection.append(
             {
                 "id": rule_id,
@@ -3443,6 +3447,8 @@ def _verify_lifecycle_response(path: Path, delete_age: int) -> tuple[dict[str, A
             and delete is None
             and not storage
         )
+        if implicit_default_prefix and not is_default_abort:
+            _die("empty lifecycle conditions are valid only for the default abort rule")
         if is_default_abort:
             default_abort += 1
             continue

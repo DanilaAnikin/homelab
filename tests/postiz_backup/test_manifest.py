@@ -970,8 +970,10 @@ fi
                 },
             ]
 
-        def lifecycle_rules(days: int) -> list[dict[str, object]]:
-            return [
+        def lifecycle_rules(
+            days: int, *, cloudflare_live_shape: bool = False
+        ) -> list[dict[str, object]]:
+            rules: list[dict[str, object]] = [
                 {
                     "id": "Default Multipart Abort Rule",
                     "enabled": True,
@@ -997,6 +999,13 @@ fi
                     },
                 },
             ]
+            if cloudflare_live_shape:
+                rules[0]["conditions"] = {}
+                for rule in rules:
+                    rule.setdefault("abortMultipartUploadsTransition", None)
+                    rule.setdefault("deleteObjectsTransition", None)
+                    rule["storageClassTransitions"] = None
+            return rules
 
         paths: dict[str, Path] = {}
         for label, lock_days, lifecycle_days in (("primary", 30, 31), ("dr", 90, 91)):
@@ -1026,6 +1035,27 @@ fi
             Namespace(policy=str(output), historical=False)
         )
         first = json.loads(output.read_text(encoding="utf-8"))
+        for label, lifecycle_days in (("primary", 31), ("dr", 91)):
+            paths[f"{label}_lifecycle"].write_text(
+                json.dumps(
+                    envelope(
+                        lifecycle_rules(
+                            lifecycle_days, cloudflare_live_shape=True
+                        )
+                    )
+                ),
+                encoding="utf-8",
+            )
+        attest()
+        live_shaped = json.loads(output.read_text(encoding="utf-8"))
+        for label in ("primary", "dr"):
+            self.assertEqual(
+                first[label]["admin_evidence"]["lifecycle_semantic_sha256"],
+                live_shaped[label]["admin_evidence"]["lifecycle_semantic_sha256"],
+            )
+        manifest_module.command_verify_storage_policy(
+            Namespace(policy=str(output), historical=False)
+        )
         primary_lock = json.loads(paths["primary_lock"].read_text(encoding="utf-8"))
         primary_lock["result"]["rules"].reverse()
         paths["primary_lock"].write_text(json.dumps(primary_lock), encoding="utf-8")
@@ -1061,6 +1091,43 @@ fi
         )
         paths["primary_lifecycle"].write_text(
             json.dumps(envelope(lifecycle_rules(30))), encoding="utf-8"
+        )
+        with self.assertRaises(manifest_module.ContractError):
+            attest()
+        invalid_empty_conditions = lifecycle_rules(31, cloudflare_live_shape=True)
+        invalid_empty_conditions[1]["conditions"] = {}
+        paths["primary_lifecycle"].write_text(
+            json.dumps(envelope(invalid_empty_conditions)), encoding="utf-8"
+        )
+        with self.assertRaises(manifest_module.ContractError):
+            attest()
+        invalid_explicit_prefix = lifecycle_rules(31, cloudflare_live_shape=True)
+        invalid_explicit_prefix[1]["conditions"] = {"prefix": 7}
+        paths["primary_lifecycle"].write_text(
+            json.dumps(envelope(invalid_explicit_prefix)), encoding="utf-8"
+        )
+        with self.assertRaises(manifest_module.ContractError):
+            attest()
+        nonempty_storage = lifecycle_rules(31, cloudflare_live_shape=True)
+        nonempty_storage.append(
+            {
+                "id": "unrelated-storage-transition",
+                "enabled": True,
+                "conditions": {"prefix": "unrelated/"},
+                "storageClassTransitions": [
+                    {"condition": {"type": "Age", "maxAge": 86400}}
+                ],
+            }
+        )
+        paths["primary_lifecycle"].write_text(
+            json.dumps(envelope(nonempty_storage)), encoding="utf-8"
+        )
+        with self.assertRaises(manifest_module.ContractError):
+            attest()
+        invalid_storage = lifecycle_rules(31, cloudflare_live_shape=True)
+        invalid_storage[1]["storageClassTransitions"] = {}
+        paths["primary_lifecycle"].write_text(
+            json.dumps(envelope(invalid_storage)), encoding="utf-8"
         )
         with self.assertRaises(manifest_module.ContractError):
             attest()
