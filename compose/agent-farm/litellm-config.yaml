@@ -43,6 +43,15 @@ model_list:
       input_cost_per_token: 0.00000014
       output_cost_per_token: 0.00000028
 
+  - model_name: worker-fallback
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+    model_info:
+      input_cost_per_token: 0.00000014
+      output_cost_per_token: 0.00000028
+
   - model_name: judge
     litellm_params:
       model: deepseek/deepseek-v4-flash
@@ -69,6 +78,12 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000014
       output_cost_per_token: 0.00000028
+
+# POZOR: `worker-fallback` NENÍ pozůstatek po druhém poskytovateli — je to třetí
+# příčka eskalačního žebříku v packages/llm/src/models.ts (worker → worker-hard →
+# worker-fallback). Padá na ni každý třetí pokus a těžké úkoly už při druhém, takže
+# kdyby skupina chyběla, volání by končila „model not found". Model je dnes u všech
+# tří příček stejný, žebřík je tedy nominální — cenu hlídá denní strop, ne výběr modelu.
 
 router_settings:
   routing_strategy: simple-shuffle
