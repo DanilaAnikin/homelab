@@ -1,0 +1,98 @@
+# =============================================================================
+# LiteLLM proxy — JEDEN poskytovatel, JEDEN model: DeepSeek V4-Flash napřímo.
+#
+# PROČ zmizel OpenCode Go jako primár: podle účtů za 11.–14. 8. přes něj šlo ~300
+# volání, zatímco přes DeepSeek fallback 4 500 — odbavoval ~6 % práce a zbytek
+# stejně padal na DeepSeek. Platilo se tedy dvakrát za jednu věc a navíc každé
+# vyčerpání jeho kvóty znamenalo 401 a přepínání. Míň vrstev = míň režimů selhání.
+#
+# PROČ zmizel `pro`: byl 58 % účtu za 21 % tokenů. Od 16. 8. 2026 (16:00 UTC)
+# DeepSeek zdražuje a `pro` schytá nejvíc — cache-hit z $0,003625 na $0,022, tedy
+# 6×, zatímco flash jen na $0,007. Manager i judge zvládne flash.
+#
+# Ceny (od 16. 8., mimo špičku) za 1M tokenů: cache-hit $0,007 / cache-miss $0,22
+# / výstup $0,66. Špička (01–04 a 06–10 UTC) je dvojnásobek — proto farma
+# ve špičce vůbec neběží, viz farm-offpeak.py.
+# =============================================================================
+
+model_list:
+  - model_name: manager
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+    model_info:
+      input_cost_per_token: 0.00000014
+      output_cost_per_token: 0.00000028
+
+  - model_name: worker
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+    model_info:
+      input_cost_per_token: 0.00000014
+      output_cost_per_token: 0.00000028
+
+  - model_name: worker-hard
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+    model_info:
+      input_cost_per_token: 0.00000014
+      output_cost_per_token: 0.00000028
+
+  - model_name: judge
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+    model_info:
+      input_cost_per_token: 0.00000014
+      output_cost_per_token: 0.00000028
+
+  - model_name: cheap
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+    model_info:
+      input_cost_per_token: 0.00000014
+      output_cost_per_token: 0.00000028
+
+  - model_name: media-vlm
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com
+    model_info:
+      input_cost_per_token: 0.00000014
+      output_cost_per_token: 0.00000028
+
+router_settings:
+  routing_strategy: simple-shuffle
+  # Fallback skupiny zmizely spolu s druhým poskytovatelem — přepínat není kam.
+  # Výpadek DeepSeeku řeší farm-credit-guard.py: zastaví farmu a sám ji pustí.
+  num_retries: 2
+  request_timeout: 600
+  allowed_fails: 3
+  cooldown_time: 60
+
+litellm_settings:
+  drop_params: true
+  success_callback: ["postgres"]
+  failure_callback: ["postgres"]
+  # ZÁCHRANA PRO NEJHORŠÍ PŘÍPAD, ne brzda. Brzdí aplikační strop ($0,60/den ve
+  # farm_settings.farm_daily_cap_usd), který umí zastavit dispatch, ale nechá
+  # doběhnout judge. Když brzdil tenhle strop, LiteLLM vracel 402 na VŠECHNO
+  # včetně judge a zahazovala se už zaplacená práce (303× "Judge selhal: 402"
+  # za jedno odpoledne). Proto je schválně 3× nad aplikačním stropem.
+  max_budget: 2
+  budget_duration: 1d
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  allow_user_auth: true
+  disable_spend_logs: false
