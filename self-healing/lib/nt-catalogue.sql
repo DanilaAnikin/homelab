@@ -36,6 +36,22 @@
 \pset pager off
 \pset null __NTV_NULL__
 
+-- Fail closed, and say why. Without this the unset-variable case surfaces as a
+-- bare SQL syntax error near ":'ntv_pw_salt'", which is exactly the kind of
+-- diagnostic that gets read as "some psql problem" and retried rather than
+-- understood.
+-- NB: `\quit` exits with status 0, so it is NOT usable as a guard — a missing
+-- salt would produce an empty stream and a successful exit, which is the exact
+-- fail-open shape this whole programme exists to remove. Raising a SQL
+-- exception under ON_ERROR_STOP is what makes psql exit non-zero.
+\if :{?ntv_pw_salt}
+\else
+\warn 'FATAL: nt-catalogue.sql requires -v ntv_pw_salt=<fresh per-run salt>'
+DO $ntvguard$ BEGIN
+  RAISE EXCEPTION 'nt-catalogue.sql invoked without ntv_pw_salt';
+END $ntvguard$;
+\endif
+
 WITH incl AS (
   -- the single shared inclusion rule; `pg\_%` uses a literal underscore so
   -- pg_catalog/pg_toast/pg_temp_* are excluded but pgsodium/pgbouncer/pgtle
@@ -60,10 +76,15 @@ SELECT format('role|%s|super=%s|inherit=%s|createrole=%s|createdb=%s|login=%s|re
               coalesce(r.rolvaliduntil::text, ''))
   FROM pg_roles r
 UNION ALL
--- the verifier itself never appears; this stream stays on the host and only
--- its aggregate digest is published
+-- The verifier itself never appears. Note the salt: with a FIXED domain
+-- separator this line is a deterministic commitment to every role's password
+-- hash, and anything deterministic is offline-attackable by anyone who learns
+-- the format and guesses a password. The caller MUST supply a fresh per-run
+-- salt, and the caller MUST exclude `pwverifier|` lines from any digest it
+-- publishes. Both sides of a comparison use the same salt within one run, so
+-- equality is still exact; nothing stable ever leaves the host.
 SELECT format('pwverifier|%s|%s', a.rolname,
-              encode(sha256(convert_to('ntv2pw:' || a.rolname || ':' || coalesce(a.rolpassword, ''), 'UTF8')), 'hex'))
+              encode(sha256(convert_to('ntv2pw:' || :'ntv_pw_salt' || ':' || a.rolname || ':' || coalesce(a.rolpassword, ''), 'UTF8')), 'hex'))
   FROM pg_authid a
 UNION ALL
 SELECT format('rolemember|%s|%s|admin=%s|grantor=%s',

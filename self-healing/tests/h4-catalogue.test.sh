@@ -41,8 +41,15 @@ legacy_fp(){
   docker exec "$CN" psql -U supabase_admin -d "$1" -X -A -t -q -c \
     "SELECT encode(sha256(convert_to(string_agg(x,'|' ORDER BY x),'UTF8')),'hex') FROM (SELECT n.nspname||'.'||c.relname||':'||c.relkind::text||':'||pg_get_userbyid(c.relowner)::text AS x FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT LIKE 'pg\\_%' AND n.nspname<>'information_schema') s"
 }
+# One salt for the whole run. The catalogue now REQUIRES ntv_pw_salt, because a
+# fixed domain separator over rolpassword is a deterministic, offline-attackable
+# commitment to every role's password hash. Within one mutation suite the salt
+# only has to be constant, since every fingerprint is compared to the baseline
+# taken in the same run.
+H4_SALT="h4-fixed-salt-for-one-run"
 canonical_fp(){
-  docker exec "$CN" psql -U supabase_admin -d "$1" -X -f /tmp/nt-catalogue.sql | sha256sum | cut -d' ' -f1
+  docker exec "$CN" psql -U supabase_admin -d "$1" -X -v "ntv_pw_salt=$H4_SALT" \
+    -f /tmp/nt-catalogue.sql | sha256sum | cut -d' ' -f1
 }
 
 # ── bring up the reference ──────────────────────────────────────────────────

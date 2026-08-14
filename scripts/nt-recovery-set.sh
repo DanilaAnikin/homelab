@@ -38,8 +38,21 @@
 #
 # Exit: 0 = complete verified set published. Non-zero = nothing published.
 # ============================================================================
-set -euo pipefail
+set -Eeuo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
 umask 077
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The builder and the drill share these primitives, and share nt-catalogue.sql
+# byte for byte. Two hand-written fingerprint queries that were supposed to
+# agree is exactly how H-3 (different schema-exclusion escaping) and H-4 (a
+# fingerprint blind to 17 of 18 security mutations) happened.
+SHLIB="${NT_SHLIB:-$HERE/../self-healing/lib}"
+# shellcheck source=../self-healing/lib/nt-verify.sh
+. "$SHLIB/nt-verify.sh"
+# shellcheck source=../self-healing/lib/nt-crypto.sh
+. "$SHLIB/nt-crypto.sh"
+CATSQL="$SHLIB/nt-catalogue.sql"
 
 VERSION=2
 CONTAINER="${NT_DB_CONTAINER:-natetrader-supabase-db-1}"
@@ -96,17 +109,30 @@ WORK="$(mktemp -d /run/nt-recovery.XXXXXX)"
 mount -t tmpfs -o size=8G,mode=0700,noexec,nosuid,nodev tmpfs "$WORK" \
   || die "could not mount tmpfs at $WORK (plaintext must never touch disk)"
 
-encrypt(){ # encrypt <plaintext> <out.gpg> <passfile>
-  gpg --batch --yes --quiet --pinentry-mode loopback --passphrase-file "$3" \
-      --symmetric --cipher-algo AES256 --force-ocb --s2k-mode 3 \
-      --s2k-digest-algo SHA512 --s2k-count 65011712 \
-      -o "$2" "$1"
-}
-verify_decrypts(){ # verify_decrypts <file.gpg> <passfile> <expected_sha256>
-  local got
-  got="$(gpg --batch --yes --quiet --pinentry-mode loopback --passphrase-file "$2" \
-         -d "$1" 2>/dev/null | sha256sum | cut -d' ' -f1)"
-  [[ "$got" == "$3" ]]
+# AUDIT C-1. The previous pair was:
+#
+#   encrypt(){ gpg … -o "$2" "$1"; }
+#   verify_decrypts(){ got="$(gpg … -d "$1" 2>/dev/null | sha256sum | …)"
+#                      [[ "$got" == "$3" ]]; }
+#
+# The verifier discarded gpg's exit status (a pipeline reports only its last
+# command), discarded stderr, and handed the plaintext to sha256sum — a live
+# consumer — while gpg was still writing it, before any authentication verdict
+# existed. Measured at 600477 bytes released on every corruption class, on both
+# OCB and CFB+MDC. Under MDC a tag-region flip and appended bytes were also
+# ACCEPTED outright, because the plaintext is unchanged and the digest matches.
+#
+# ntc_encrypt_and_verify encrypts and then round-trips through the SAME
+# quarantine primitive the drill uses: gpg writes to a mode-0600 file no
+# consumer can name, the exit status is captured from gpg itself, and the file
+# is destroyed unless status, size, digest and packet format all bind.
+#
+# It also fails closed rather than downgrading: GnuPG 2.2.x rejects --force-ocb
+# outright, so a host without AEAD cannot silently produce an MDC set — the one
+# format under which the digest backstop demonstrably does not hold.
+encrypt_and_verify(){ # <plaintext> <out.gpg> <passfile>
+  ntc_encrypt_and_verify "$1" "$2" "$3" ocb \
+    || die "component $1 failed authenticated round trip: $NTC_ERR ${NTC_ERR_DETAIL:-}"
 }
 
 # ── 1+2+3. archive and row counts under ONE held MVCC snapshot ──────────────
@@ -156,40 +182,119 @@ SELECT 'COUNTS='||json_build_object(
 COMMIT;
 SQL
 docker cp "$WORK/capture.sql" "$CONTAINER:/tmp/nt_capture.sql" >/dev/null
-CAPOUT="$(docker exec "$CONTAINER" psql -U "$DBUSER" -d "$DBNAME" -Atq -f /tmp/nt_capture.sql 2>&1 || true)"
 container_cleanup(){ docker exec "$CONTAINER" rm -f /tmp/nt_capture.sql /tmp/nt_db.dump /tmp/nt_db.err >/dev/null 2>&1 || true; }
 
-grep -q 'PGDUMP_RC=0' <<<"$CAPOUT" || { container_cleanup; die "snapshot-bound pg_dump failed: $(grep -v COUNTS= <<<"$CAPOUT" | head -5)"; }
-COUNTS_JSON="$(grep '^COUNTS=' <<<"$CAPOUT" | head -1 | sed 's/^COUNTS=//')"
+# AUDIT (medium, three findings in one line). The previous capture was:
+#
+#   CAPOUT="$(docker exec … psql … -f /tmp/nt_capture.sql 2>&1 || true)"
+#   grep -q 'PGDUMP_RC=0' <<<"$CAPOUT" || die …
+#
+#   * `|| true` discarded psql's exit status outright;
+#   * `2>&1` merged diagnostics into the data stream, so the grep ran over a
+#     mixture of rows and error text;
+#   * the grep was UNANCHORED, so any line merely CONTAINING "PGDUMP_RC=0" —
+#     including a psql error message quoting the failing SQL, which contains
+#     that literal in the heredoc — satisfied it.
+#
+# Status is now kept, streams are separated, ON_ERROR_STOP is on, and the
+# match is anchored to its own line.
+CAPRC=0
+docker exec "$CONTAINER" psql -U "$DBUSER" -d "$DBNAME" -X -A -t -q -v ON_ERROR_STOP=1 \
+  -f /tmp/nt_capture.sql >"$WORK/capture.out" 2>"$WORK/capture.err" || CAPRC=$?
+if [[ $CAPRC -ne 0 ]]; then
+  container_cleanup; die "snapshot capture failed (psql exit $CAPRC): $(head -c 500 "$WORK/capture.err")"
+fi
+grep -qx 'PGDUMP_RC=0' "$WORK/capture.out" \
+  || { container_cleanup; die "snapshot-bound pg_dump did not report success: $(head -c 500 "$WORK/capture.err")"; }
+# pg_dump's own stderr is retained and classified, not deleted unread
+docker exec "$CONTAINER" cat /tmp/nt_db.err > "$WORK/pgdump.err" 2>/dev/null || : > "$WORK/pgdump.err"
+if [[ -s "$WORK/pgdump.err" ]]; then
+  grep -qiE '\b(error|fatal|panic)\b' "$WORK/pgdump.err" \
+    && { container_cleanup; die "pg_dump reported errors: $(head -c 500 "$WORK/pgdump.err")"; }
+  log "pg_dump emitted $(wc -l < "$WORK/pgdump.err") non-error diagnostic line(s), retained"
+fi
+COUNTS_JSON="$(grep '^COUNTS=' "$WORK/capture.out" | head -1 | sed 's/^COUNTS=//')"
 [[ -n "$COUNTS_JSON" ]] || { container_cleanup; die "snapshot-bound count query produced nothing"; }
 python3 -c "import json,sys;json.loads(sys.argv[1])" "$COUNTS_JSON" || { container_cleanup; die "counts are not valid JSON"; }
+rm -f "$WORK/capture.out" "$WORK/capture.err" "$WORK/pgdump.err"
 
-docker cp "$CONTAINER:/tmp/nt_db.dump" "$WORK/db.dump" >/dev/null || { container_cleanup; die "could not retrieve archive"; }
+# AUDIT C-4. The previous code did `docker cp` with no digest round trip, ran
+# container_cleanup immediately — deleting the in-container original and making
+# any later comparison impossible — accepted a one-byte file via `[[ -s ]]`,
+# and then treated `pg_restore -l | grep` as a completeness check.
+#
+# pg_restore -l reads only the header and TOC, both at the FRONT of a custom
+# archive. Measured against the exact production image: an archive truncated to
+# 6% of its length (107224 of 1715590 bytes) still lists a complete TOC
+# including TABLE DATA vault secrets, still passes [[ -s ]], and would be
+# encrypted, uploaded and published as COMPLETE. A strict restore refuses it.
+#
+# So: digest and size are computed INSIDE the producing container, the host copy
+# must match exactly, the in-container original is kept until that succeeds, and
+# the archive is read to the end before anything is published.
+IMAGE_REF_EARLY="$(docker inspect "$CONTAINER" --format '{{.Config.Image}}')"
+ntc_archive_roundtrip "$CONTAINER" /tmp/nt_db.dump "$WORK/db.dump" \
+  || { container_cleanup; die "archive round trip failed: $NTC_ERR ${NTC_ERR_DETAIL:-}"; }
+ARCHIVE_SHA="$NTC_ARCHIVE_SHA"; ARCHIVE_SIZE="$NTC_ARCHIVE_SIZE"
+
+# The archive must DECLARE the Vault data. supabase_vault >=0.3.1 registers
+# vault.secrets via pg_extension_config_dump, so TABLE DATA vault secrets is
+# expected. A declaration is not evidence that the bytes are present, which is
+# why the consumption check below is mandatory and not optional.
+ntc_archive_declares "$IMAGE_REF_EARLY" "$WORK/db.dump" 'TABLE DATA vault secrets' \
+  || { container_cleanup; die "archive TOC gate failed: $NTC_ERR ${NTC_ERR_DETAIL:-}"; }
+TOC_ENTRIES="$NTC_TOC_ENTRIES"
+
+ntc_archive_fully_consumable "$IMAGE_REF_EARLY" "$WORK/db.dump" \
+  || { container_cleanup; die "archive is not fully consumable: $NTC_ERR ${NTC_ERR_DETAIL:-}"; }
+
+# only now is the in-container original expendable
 container_cleanup
 rm -f "$WORK/capture.sql"
-[[ -s "$WORK/db.dump" ]] || die "pg_dump produced an empty archive"
-
-# The archive must contain the Vault data. supabase_vault >=0.3.1 registers
-# vault.secrets via pg_extension_config_dump, so TABLE DATA vault secrets is
-# expected. If a future extension version stops doing that, fail loudly rather
-# than silently shipping a set whose secrets cannot be recovered.
-docker run --rm -i --network none -v "$WORK:/w:ro" \
-  "$(docker inspect "$CONTAINER" --format '{{.Config.Image}}')" \
-  pg_restore -l /w/db.dump > "$WORK/toc.txt" || die "pg_restore -l failed"
-grep -q 'TABLE DATA vault secrets' "$WORK/toc.txt" \
-  || die "archive has no 'TABLE DATA vault secrets' entry — refusing to publish"
-TOC_ENTRIES="$(grep -c '^[0-9]' "$WORK/toc.txt" || true)"
 
 # ── 4. catalogue fingerprints (non-secret) ──────────────────────────────────
 FP_ROLES="$(docker exec "$CONTAINER" psql -U "$DBUSER" -d "$DBNAME" -Atq -c "
 SELECT encode(sha256(convert_to(string_agg(x,'|' ORDER BY x),'UTF8')),'hex') FROM (
  SELECT rolname||':'||rolsuper||rolinherit||rolcreaterole||rolcreatedb||rolcanlogin||rolreplication||rolbypassrls AS x
  FROM pg_roles) s")"
-FP_SCHEMA="$(docker exec "$CONTAINER" psql -U "$DBUSER" -d "$DBNAME" -Atq -c "
-SELECT encode(sha256(convert_to(string_agg(x,'|' ORDER BY x),'UTF8')),'hex') FROM (
- SELECT n.nspname||'.'||c.relname||':'||c.relkind::text||':'||pg_get_userbyid(c.relowner)::text AS x
- FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
- WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname<>'information_schema') s")"
+# AUDIT H-4. The old "schema fingerprint" hashed nspname.relname:relkind:owner
+# — a list of object NAMES. It said nothing about columns, types, defaults,
+# constraints, indexes, triggers, RLS policies, ACLs or default privileges.
+# Measured: it was blind to 17 of 18 one-variable security mutations, including
+# "drop EVERY RLS policy", which left it byte-identical.
+#
+# AUDIT H-3. It also wrote NOT LIKE 'pg_%', where `_` is a LIKE wildcard, so it
+# silently excluded pgsodium, pgbouncer and pgtle — while the drill wrote the
+# escaped 'pg\_%'. The two coincided only because production happens to have
+# none of those schemas today. A landmine, not a current failure.
+#
+# Both are replaced by the one canonical catalogue file, streamed into psql by
+# the same function the drill uses. The salt is fresh per run and pwverifier
+# lines are excluded from the published digest, so nothing here is a stable
+# commitment to anybody's password hash.
+CAT_SALT="$(openssl rand -hex 32)"
+ntv_catalogue "$CONTAINER" "$DBNAME" "$DBUSER" "$CAT_SALT" "$CATSQL" "$WORK/catalogue.txt" \
+  || die "canonical catalogue failed: $NTV_CAT_ERR"
+FP_CATALOGUE="$NTV_CAT_SHA"
+FP_CENSUS="$NTV_CAT_CENSUS"
+# private evidence: never uploaded, removed with the tmpfs
+rm -f "$WORK/catalogue.txt"
+
+# ── source-time Vault commitment, bound to THIS set ─────────────────────────
+# The old drill proved "the clone's Vault plaintexts equal LIVE PRODUCTION's at
+# drill time". That is the wrong property twice over: it does not show the SET
+# restores correctly, and it breaks whenever production legitimately moves on
+# between building a set and rehearsing it. The commitment is therefore taken
+# HERE, at dump time, under a key generated for this set, and recorded in the
+# manifest so the drill can recompute it against the clone alone.
+#
+# The key is passed on stdin, never on the command line: the old code put the
+# HMAC key in `docker exec` argv, where it is visible in the host process list.
+VAULT_MAC_KEY="$(openssl rand -hex 32)"
+VAULT_MAC_DIGEST="$(printf '%s' "SELECT encode(sha256(convert_to(string_agg(encode(hmac(convert_to('ntv2vault:'||id::text||':'||decrypted_secret,'UTF8'),decode('$VAULT_MAC_KEY','hex'),'sha256'),'hex'),'|' ORDER BY id),'UTF8')),'hex') FROM vault.decrypted_secrets" \
+  | docker exec -i "$CONTAINER" psql -U "$DBUSER" -d "$DBNAME" -X -A -t -q -v ON_ERROR_STOP=1 -f -)" \
+  || die "vault commitment failed"
+[[ "$VAULT_MAC_DIGEST" =~ ^[0-9a-f]{64}$ ]] || die "vault commitment is not a sha256"
 EXTENSIONS="$(docker exec "$CONTAINER" psql -U "$DBUSER" -d "$DBNAME" -Atq -c \
   "SELECT string_agg(extname||'='||extversion,',' ORDER BY extname) FROM pg_extension")"
 PGVER="$(docker exec "$CONTAINER" psql -U "$DBUSER" -d "$DBNAME" -Atq -c 'SHOW server_version')"
@@ -236,8 +341,7 @@ declare -A SHA_PLAIN SHA_ENC SIZE_ENC
 for f in "${!PLAIN[@]}"; do
   key="${PLAIN[$f]}"
   SHA_PLAIN[$f]="$(sha256sum "$WORK/$f" | cut -d' ' -f1)"
-  encrypt "$WORK/$f" "$WORK/$f.gpg" "$key" || die "encryption failed for $f"
-  verify_decrypts "$WORK/$f.gpg" "$key" "${SHA_PLAIN[$f]}" || die "decrypt verification failed for $f"
+  encrypt_and_verify "$WORK/$f" "$WORK/$f.gpg" "$key"
   SHA_ENC[$f]="$(sha256sum "$WORK/$f.gpg" | cut -d' ' -f1)"
   SIZE_ENC[$f]="$(stat -c %s "$WORK/$f.gpg")"
   shred -u "$WORK/$f" 2>/dev/null || rm -f "$WORK/$f"   # tmpfs: removal is the guarantee, not shred
@@ -260,8 +364,14 @@ cat > "$WORK/MANIFEST.json" <<JSON
     "image_repo_digest": "$IMAGE_DIGEST",
     "extensions": "$EXTENSIONS"
   },
-  "fingerprints": { "roles_sha256": "$FP_ROLES", "schema_sha256": "$FP_SCHEMA" },
-  "archive": { "toc_entries": $TOC_ENTRIES, "vault_table_data_present": true, "globals_create_role_count": $GLOBALS_ROLES },
+  "fingerprints": { "roles_sha256": "$FP_ROLES",
+                    "catalogue_sha256": "$FP_CATALOGUE",
+                    "catalogue_census": $FP_CENSUS },
+  "vault_commitment": { "key_hex": "$VAULT_MAC_KEY", "digest": "$VAULT_MAC_DIGEST",
+                        "note": "source-time keyed commitment bound to this set; the drill compares the restored clone to THIS, not to live production" },
+  "archive": { "toc_entries": $TOC_ENTRIES, "sha256": "$ARCHIVE_SHA", "size": $ARCHIVE_SIZE,
+               "toc_declares_vault_table_data": true, "fully_consumed": true,
+               "globals_create_role_count": $GLOBALS_ROLES },
   "snapshot_bound_counts": $COUNTS_JSON,
   "root_key": { "path": "$ROOTKEY_PATH", "mode": "$RK_MODE", "owner": "$RK_OWNER", "size": $RK_SIZE, "sha256": "$RK_BEFORE" },
   "encryption": { "format": "gpg-symmetric-aes256-ocb-aead", "key_separation": true,
