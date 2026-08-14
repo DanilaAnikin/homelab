@@ -286,8 +286,8 @@ for lock_fd in 6 7; do
 done
 [[ ! -e "$output_dir" && ! -L "$output_dir" ]] || die 'output directory must not exist'
 
-free_bytes=$(df -PB1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
-free_inodes=$(df -Pi --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+free_bytes=$(df -B1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+free_inodes=$(df --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
 [[ "$free_bytes" =~ ^[0-9]+$ && "$free_inodes" =~ ^[0-9]+$ ]] || die 'cannot measure capture workspace capacity'
 ((free_bytes >= MIN_FREE_BYTES && free_inodes >= MIN_FREE_INODES)) \
   || die 'capture workspace byte/inode preflight failed'
@@ -498,8 +498,8 @@ required_capture_inodes=$((
 ))
 ((required_capture_bytes <= MAX_CAPTURE_WORKSPACE_BYTES)) \
   || die 'declared capture workspace exceeds hard byte ceiling'
-free_bytes=$(df -PB1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
-free_inodes=$(df -Pi --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+free_bytes=$(df -B1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+free_inodes=$(df --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
 ((free_bytes >= required_capture_bytes && free_inodes >= required_capture_inodes)) \
   || die 'capture workspace capacity is insufficient before writer stop'
 

@@ -108,8 +108,8 @@ safe_root_file "$STORAGE_POLICY" 600
 "$HELPER" verify-storage-policy --policy "$STORAGE_POLICY"
 "$HELPER" verify-config-source --archive "$runtime_config_archive"
 
-free_bytes=$(df -PB1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
-free_inodes=$(df -Pi --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+free_bytes=$(df -B1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+free_inodes=$(df --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
 [[ "$free_bytes" =~ ^[0-9]+$ && "$free_inodes" =~ ^[0-9]+$ ]] || die 'cannot measure artifact workspace capacity'
 ((free_bytes >= MIN_FREE_BYTES && free_inodes >= MIN_FREE_INODES)) \
   || die 'artifact workspace byte/inode preflight failed'

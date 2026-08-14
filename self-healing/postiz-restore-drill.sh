@@ -713,15 +713,15 @@ restore_one_remote() {
   ))
   ((peak <= MAX_RESTORE_PEAK_BYTES)) || die 'declared restore peak exceeds hard byte ceiling'
   required_inodes=$((upload_count * 2 + 2200000))
-  free_bytes=$(df -PB1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
-  free_inodes=$(df -Pi --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+  free_bytes=$(df -B1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+  free_inodes=$(df --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
   [[ "$free_bytes" =~ ^[0-9]+$ && "$free_inodes" =~ ^[0-9]+$ ]] \
     || die 'cannot measure restore workspace capacity'
   docker_root=$(docker info --format '{{.DockerRootDir}}')
   [[ "$docker_root" == /* && -d "$docker_root" && ! -L "$docker_root" ]] \
     || die 'Docker data root is unsafe'
-  docker_free_bytes=$(df -PB1 --output=avail "$docker_root" | tail -1 | tr -d '[:space:]')
-  docker_free_inodes=$(df -Pi --output=iavail "$docker_root" | tail -1 | tr -d '[:space:]')
+  docker_free_bytes=$(df -B1 --output=avail "$docker_root" | tail -1 | tr -d '[:space:]')
+  docker_free_inodes=$(df --output=iavail "$docker_root" | tail -1 | tr -d '[:space:]')
   [[ "$docker_free_bytes" =~ ^[0-9]+$ && "$docker_free_inodes" =~ ^[0-9]+$ ]] \
     || die 'cannot measure Docker image-store capacity'
   if [[ "$(stat -Lc '%d' "$STATE_ROOT")" == "$(stat -Lc '%d' "$docker_root")" ]]; then

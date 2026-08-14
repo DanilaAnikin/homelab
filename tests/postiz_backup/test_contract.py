@@ -487,9 +487,17 @@ esac
         self.assertIn("etc/systemd/system/postiz-restore-cleanup.service", self.offline)
 
     def test_capacity_preflights_cover_bytes_and_inodes(self) -> None:
-        for script in (self.capture, self.artifacts, self.restore):
-            self.assertIn("df -PB1", script)
-            self.assertIn("df -Pi", script)
+        capacity_scripts = (
+            self.capture,
+            self.artifacts,
+            self.restore,
+            self.generic_restore,
+        )
+        combined = "\n".join(capacity_scripts)
+        self.assertEqual(combined.count("df -B1 --output=avail"), 7)
+        self.assertEqual(combined.count("df --output=iavail"), 7)
+        self.assertNotIn("df -PB1 --output=avail", combined)
+        self.assertNotIn("df -Pi --output=iavail", combined)
         self.assertIn("MAX_RESTORE_PEAK_BYTES", self.restore)
         self.assertIn("upload_transfer_cap + upload_bytes", self.restore)
         self.assertIn('--max-transfer "$upload_transfer_cap"', self.restore)
@@ -511,6 +519,26 @@ esac
         self.assertIn("MAX_PG_SOURCE_INODES=1000000", self.capture)
         self.assertIn("find /var/lib/postgresql/data -xdev -print | wc -l", self.capture)
         self.assertIn("pg_source_inodes + upload_source_inodes", self.capture)
+
+    def test_df_capacity_probe_live_shape_is_positive_numeric(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            for arguments in (
+                ("-B1", "--output=avail"),
+                ("--output=iavail",),
+            ):
+                result = subprocess.run(
+                    ["/usr/bin/df", *arguments, str(target)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                )
+                lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                self.assertEqual(len(lines), 2, result.stdout)
+                self.assertRegex(lines[1], r"^[0-9]+$")
+                self.assertGreater(int(lines[1]), 0)
 
     def test_frequent_last_ok_advances_only_after_complete_remote_check(self) -> None:
         remote_check = self.frequent.index('$RC check "$WORK"')
@@ -661,8 +689,10 @@ esac
         self.assertIn("MAX_GENERIC_CIPHER_BYTES", self.generic_restore)
         self.assertIn("MAX_GENERIC_PLAIN_BYTES", self.generic_restore)
         self.assertIn("--format sp --separator '|'", self.generic_restore)
-        self.assertIn("df -PB1", self.generic_restore)
-        self.assertIn("df -Pi", self.generic_restore)
+        self.assertIn("df -B1 --output=avail", self.generic_restore)
+        self.assertIn("df --output=iavail", self.generic_restore)
+        self.assertNotIn("df -PB1 --output=avail", self.generic_restore)
+        self.assertNotIn("df -Pi --output=iavail", self.generic_restore)
         self.assertIn("MemAvailable", self.generic_restore)
         self.assertIn('--tmpfs "/var/lib/postgresql/data:', self.generic_restore)
         self.assertIn('--mount "type=bind,src=$WORK,dst=/restore,readonly"', self.generic_restore)

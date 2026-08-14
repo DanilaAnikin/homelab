@@ -191,13 +191,13 @@ for db in $DBS; do
 done
 
 required_state_bytes=$((selected_cipher_total * 2 + MIN_STATE_MARGIN_BYTES))
-state_free_bytes=$(df -PB1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
-state_free_inodes=$(df -Pi --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+state_free_bytes=$(df -B1 --output=avail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
+state_free_inodes=$(df --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
 docker_root=$(docker info --format '{{.DockerRootDir}}')
 [[ "$docker_root" == /* && -d "$docker_root" && ! -L "$docker_root" ]] \
   || die 'Docker data root is unsafe'
-docker_free_bytes=$(df -PB1 --output=avail "$docker_root" | tail -1 | tr -d '[:space:]')
-docker_free_inodes=$(df -Pi --output=iavail "$docker_root" | tail -1 | tr -d '[:space:]')
+docker_free_bytes=$(df -B1 --output=avail "$docker_root" | tail -1 | tr -d '[:space:]')
+docker_free_inodes=$(df --output=iavail "$docker_root" | tail -1 | tr -d '[:space:]')
 available_memory_kib=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
 [[ "$state_free_bytes" =~ ^[0-9]+$ && "$state_free_inodes" =~ ^[0-9]+$ && \
    "$docker_free_bytes" =~ ^[0-9]+$ && "$docker_free_inodes" =~ ^[0-9]+$ && \
