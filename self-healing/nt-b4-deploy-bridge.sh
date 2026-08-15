@@ -112,7 +112,18 @@ case "${1:---verify}" in
   fi
 
   # Build the env file container-to-container. Mode 0600, deleted immediately.
-  ENVFILE="$(mktemp /run/nt-bridge-env.XXXXXX)"
+  #
+  # Prefer a tmpfs so the values never touch a disk. /dev/shm first because it
+  # is tmpfs and writable without root — /run alone made this untestable
+  # anywhere but the host, and a deployment script nobody can rehearse is a
+  # deployment script nobody has rehearsed.
+  ENVDIR=""
+  for d in /dev/shm /run "${TMPDIR:-/tmp}"; do
+    [[ -d "$d" && -w "$d" ]] && { ENVDIR="$d"; break; }
+  done
+  [[ -n "$ENVDIR" ]] || die "no writable directory for the environment file"
+  [[ "$ENVDIR" == "${TMPDIR:-/tmp}" ]] && note info "env file on disk, not tmpfs" "$ENVDIR"
+  ENVFILE="$(mktemp "$ENVDIR/nt-bridge-env.XXXXXX")"
   chmod 600 "$ENVFILE"
   trap 'rm -f "$ENVFILE"' EXIT
   MISSING=()
