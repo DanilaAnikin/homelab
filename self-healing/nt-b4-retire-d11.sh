@@ -60,9 +60,17 @@ networks_of(){ docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{
 pre_checks(){
   echo "PRE-CHECKS"
 
-  local state; state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo absent)"
-  [[ "$state" != absent ]] && ok "old dashboard found" "$CONTAINER ($state)" \
-                           || bad "no container named $CONTAINER" "nothing to retire"
+  # Existence is asked as its own question. The previous form was
+  #   state="$(docker inspect ... || echo absent)"
+  # which concatenates whatever the failing command printed with the fallback,
+  # so a command that prints AND fails yields "absent\nabsent" — a value that
+  # is not equal to "absent" and takes the success branch. A rehearsal caught
+  # it: "there is no such container" allowed the retire.
+  if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    ok "old dashboard found" "$CONTAINER ($(docker inspect -f '{{.State.Status}}' "$CONTAINER"))"
+  else
+    bad "no container named $CONTAINER" "nothing to retire"
+  fi
 
   # It must not be the one serving. Retiring the live backend is an outage.
   if grep -q "$BRIDGE" "$DYN/natetrader.yml" 2>/dev/null; then
