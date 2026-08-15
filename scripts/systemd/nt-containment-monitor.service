@@ -1,0 +1,19 @@
+[Unit]
+Description=Nate Trader containment boundary monitor (Auth, freeze, edge denial, BUILD_SHA)
+Documentation=file:///srv/homelab/self-healing/nt-containment-monitor.sh
+After=network-online.target docker.service
+Wants=network-online.target
+OnFailure=notify-failure@nt-containment-monitor.service
+
+[Service]
+Type=oneshot
+# The script takes its own flock, so an overrun cannot stack. The timeout is the
+# backstop: a probe wedged on a hung TLS handshake must not hold the lock and
+# silence every later run, which would look exactly like "no alerts".
+TimeoutStartSec=180
+ExecStart=/srv/homelab/self-healing/nt-containment-monitor.sh
+# Secrets reach the script as a root-only file, never as argv, so the disposable
+# probe credentials cannot be read out of the host process list.
+NoNewPrivileges=true
+ProtectHome=read-only
+PrivateTmp=true

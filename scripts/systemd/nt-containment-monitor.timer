@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Nate Trader containment monitor every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+# A missed window during a reboot must still produce a verdict; a boundary that
+# is only checked when the machine happens to be up is not monitored.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
