@@ -209,7 +209,10 @@ def check_auth():
         # whether anyone else can log in — but a false alarm every morning would
         # train us to ignore this mail, so space the probes out.
         if i:
-            time.sleep(3)
+            # 3s was not enough: this endpoint is limited far more tightly than
+            # the global 30/min, so four probes in and the rest came back 429.
+            # A daily job can afford to take two minutes and check all seven.
+            time.sleep(20)
         st, body = http(
             f"https://{domain}/api/auth/sign-in/social", "POST",
             json.dumps({"provider": "google", "callbackURL": "/cs/dashboard"}),
