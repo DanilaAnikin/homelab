@@ -29,6 +29,17 @@ MAXDUP="$(DBQ "select coalesce(max(cnt),0) from (select count(*) cnt from pgmq.q
 ATT_6H="$(DBQ "select count(*) from attempts where started_at > now() - interval '6 hours';")"
 READY="$(DBQ "select count(*) from tasks t join projects p on p.id=t.project_id where t.status='queued' and p.status='active';")"
 
+# Zastavená farma nemá co diagnostikovat. Bez tohohle hlídač každou hodinu hlásí
+# "uvázlý dispatch: 0 pokusů, přitom čeká N tasků" a "fan-out fronty" — obojí je
+# u schválně vypnuté farmy pravda a zároveň to není problém. Takový poplach jen
+# otupí pozornost a překryje ten okamžik, kdy se pokazí něco doopravdy.
+PAUSED="$(DBQ "select coalesce((select value::text from farm_settings where key='global_pause'),'false');")"
+if [ "${PAUSED:-false}" = "true" ]; then
+  SRC="$(DBQ "select coalesce((select value::text from farm_settings where key='pause_source'),'?');")"
+  echo "[farm-health-guard] farma je zastavena (${SRC}) — kontroly přeskočeny"
+  exit 0
+fi
+
 problems=()
 [ "${FAILED_1H:-0}" -gt 150 ] && problems+=("churn: ${FAILED_1H} selhání/hod")
 [ "${INSTANT_1H:-0}" -gt 60 ] && problems+=("okamžitá selhání: ${INSTANT_1H}/hod (podpis otráveného worktree)")
