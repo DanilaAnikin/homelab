@@ -69,7 +69,15 @@ case "$1" in
     esac
     [[ "$(cat "$S/container_state" 2>/dev/null || echo absent)" == absent ]] && exit 1
     exit 0 ;;
-  run) cat "$S/internal_health" 2>/dev/null || true; exit 0 ;;
+  run)
+    # `docker run ... curl` inside the pre-checks. Two different probes: the
+    # health body, and the status of a protected read.
+    if printf '%s' "$*" | grep -q '/api/accounts'; then
+      cat "$S/internal_protected" 2>/dev/null || echo 401
+    else
+      cat "$S/internal_health" 2>/dev/null || true
+    fi
+    exit 0 ;;
 esac
 exit 1
 EOF
@@ -131,6 +139,7 @@ healthy_world(){
   echo 0                       > "$STUB_STATE/restart_count"
   echo "dokploy-network "      > "$STUB_STATE/networks"
   echo "$bridge_body"          > "$STUB_STATE/internal_health"
+  echo 401                     > "$STUB_STATE/internal_protected"
   echo 200 > "$STUB_STATE/code_health";       echo "$bridge_body" > "$STUB_STATE/body_health"
   echo 200 > "$STUB_STATE/code_login"
   echo 200 > "$STUB_STATE/code_auth"
@@ -231,6 +240,13 @@ precheck_blocks "bridge restart-looping"       'echo 7 > "$STUB_STATE/restart_co
 precheck_blocks "bridge off dokploy-network"   'echo "bridge " > "$STUB_STATE/networks"'
 precheck_blocks "bridge health silent"         ': > "$STUB_STATE/internal_health"'
 precheck_blocks "bridge is the WRONG image"    'echo "{\"artifact_role\":\"dashboard\"}" > "$STUB_STATE/internal_health"'
+# The scenario that /api/health cannot see: the image serves, declares itself
+# correctly, and answers 503 on every real page because SUPABASE_SERVER_URL is
+# unset. The image currently in production predates that variable and its
+# container does not set it, so a bridge started from production's environment
+# would look healthy and be useless. Measured on a real container: GET
+# /api/accounts is 503 without it and 401 with it.
+precheck_blocks "bridge serves but is NOT configured" 'echo 503 > "$STUB_STATE/internal_protected"'
 precheck_blocks "current site already broken"  'echo 502 > "$STUB_STATE/code_health"'
 precheck_blocks "Auth already down"            'echo 503 > "$STUB_STATE/code_auth"'
 

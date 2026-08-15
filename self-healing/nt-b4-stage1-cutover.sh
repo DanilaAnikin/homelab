@@ -145,6 +145,31 @@ pre_checks(){
     bad "bridge does not declare writes_enabled=false"
   fi
 
+  # 7b. SERVING IS NOT THE SAME AS CONFIGURED.
+  #
+  # /api/health returns early in the proxy, before any configuration is read,
+  # so it answers 200 from an image that cannot serve a single real page. The
+  # bridge requires SUPABASE_SERVER_URL — the internal Kong origin — and
+  # getSupabaseServerUrl() throws when it is missing, deliberately, so a
+  # dashboard cannot silently fall back to the public origin and defeat the
+  # containment it exists for.
+  #
+  # This is not hypothetical. The image currently in production predates that
+  # function and its container does not set the variable, so a bridge started
+  # from production's environment would answer 200 here and 503 on everything
+  # else. A health check that cannot tell those apart is worse than none.
+  #
+  # A protected API path is the discriminator: 401 means the proxy reached
+  # authentication and the configuration is present; 503 means it never got
+  # that far.
+  local protected; protected="$(docker run --rm --network dokploy-network curlimages/curl:latest \
+      -sS -o /dev/null -w '%{http_code}' --max-time 10 "$BRIDGE_URL/api/accounts" 2>/dev/null || echo 000)"
+  case "$protected" in
+    401) ok "bridge is CONFIGURED, not merely serving" "protected read -> 401" ;;
+    503) bad "bridge answers 503 on a protected read" "SUPABASE_SERVER_URL is probably unset — it serves /api/health and nothing else" ;;
+    *)   bad "bridge protected read returned $protected" "expected 401" ;;
+  esac
+
   # 8. the site is currently healthy — never start a cutover from a broken base,
   #    or the post-checks cannot tell your change from the pre-existing fault
   local s; s="$(http_status "$DASH_HOST/api/health")"
