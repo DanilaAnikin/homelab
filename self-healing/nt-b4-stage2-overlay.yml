@@ -1,0 +1,113 @@
+# ============================================================================
+# B4 Stage 2 — the auth-only edge for ntapi.anikin.cz.
+#
+# This is the containment boundary. Everything the public Supabase data plane
+# exposes — REST, Storage, Realtime, Functions, GraphQL, the pg meta API and
+# the Kong root — stops here, in front of Kong, and only GoTrue continues.
+#
+# HOW IT DENIES
+# -------------
+# Two routers on the same host, separated by priority. The high-priority one
+# matches the auth surface and forwards to Kong untouched. The low-priority one
+# matches the host and nothing more, so it catches everything the first did not,
+# and carries a middleware that refuses.
+#
+# The refusal is an `ipAllowList` whose allowed range is a single address that
+# cannot be a client source. Traefik has no "return 403" middleware; this is the
+# idiomatic way to get one, and it fails in the safe direction — a
+# misconfiguration here denies traffic rather than admitting it.
+#
+# WHY BOTH `Path` AND `PathPrefix`
+# --------------------------------
+# `PathPrefix(`/auth/v1/`)` with the trailing slash covers the whole surface —
+# /auth/v1/token, /user, /logout, /settings — while refusing `/auth/v1xyz`,
+# which a slashless prefix would happily admit. `Path(`/auth/v1`)` then adds
+# back the bare form. Written as one slashless prefix it would be shorter and
+# wrong: `/auth/v1` is a prefix of `/auth/v1-is-not-auth`.
+#
+# WHY THE PATH MAY NOT CONTAIN A PERCENT SIGN
+# -------------------------------------------
+# The obvious attack on any path matcher is to satisfy it with something the
+# backend then resolves elsewhere: /auth/v1/../rest/v1/accounts. Traefik's
+# default `sanitizePath` collapses /../ and /./ before matching, so the plain
+# form is caught — but it does NOT decode percent-escapes first, and it
+# forwards the path raw. Measured on v3.6.7, not assumed:
+#
+#   /auth/v1/../rest/v1/accounts        403   sanitizePath collapses it
+#   /auth/v1/..%2Frest%2Fv1%2Faccounts  200   REACHED THE BACKEND, raw
+#   /auth/v1/%252e%252e/rest/v1/...     200   REACHED THE BACKEND, raw
+#
+# The first bypass is the real one: Traefik matches the literal `..%2F` as an
+# ordinary path segment under /auth/v1/, forwards it unchanged, and Kong then
+# decodes %2F into a separator and resolves /rest/v1/accounts. That is exactly
+# the split-view Traefik warns about at startup — two parties disagreeing about
+# what the same bytes mean, with the security decision made by the one that
+# decodes less.
+#
+# Traefik can be told to reject these (`allowEncodedSlash`, `allowEncodedPercent`,
+# `sanitizePath`) but only per ENTRYPOINT, in the static config — which this
+# Traefik shares with every other site on the host. Changing it to contain one
+# application would silently change request handling for all of them.
+#
+# So the guard is scoped to this router: the auth surface may not contain a
+# percent sign anywhere in its PATH. GoTrue never needs one — /token, /user,
+# /logout, /verify, /recover, /settings, /authorize, /sso, /admin/users/<uuid>
+# are all plain — and Traefik matchers see the path only, so query strings are
+# untouched. `?redirect_to=https%3A%2F%2F...` still works, and is tested.
+#
+# Anything with a percent in the path now falls through to the deny router,
+# which is the correct direction to fail: an encoding this edge does not
+# understand is refused rather than forwarded for someone else to interpret.
+#
+# WHAT IS DELIBERATELY UNCHANGED
+# ------------------------------
+# The Kong service definition, the dashboard router and the dashboard service.
+# Stage 2 adds routers and a middleware; it does not recreate Auth, REST, Kong,
+# the database, Storage or Realtime, and it does not restart anything.
+# ============================================================================
+http:
+  routers:
+    # ── the only thing that gets through ────────────────────────────────────
+    natetrader-api-auth:
+      rule: "Host(`ntapi.anikin.cz`) && (Path(`/auth/v1`) || PathPrefix(`/auth/v1/`)) && !PathRegexp(`%`)"
+      priority: 100
+      service: natetrader-kong
+      entryPoints: [web]
+
+    # ── everything else on this host ────────────────────────────────────────
+    # Lower priority, so it only sees what the rule above declined. Traefik
+    # would otherwise pick the longest rule, and depending on an implicit
+    # tie-break for a security boundary is how boundaries move by accident.
+    natetrader-api:
+      rule: "Host(`ntapi.anikin.cz`)"
+      priority: 1
+      service: natetrader-kong
+      entryPoints: [web]
+      middlewares: [natetrader-deny-data-plane]
+
+    # ── the dashboard host is Stage 1's, and is repeated here verbatim ──────
+    natetrader-dashboard:
+      rule: "Host(`nate-trader.anikin.cz`)"
+      service: natetrader-dashboard
+      entryPoints: [web]
+
+  middlewares:
+    natetrader-deny-data-plane:
+      ipAllowList:
+        # 255.255.255.255 is the limited broadcast address. It is never a
+        # source address on a received packet, so this list matches nothing
+        # and every request carrying it is refused with 403.
+        sourceRange:
+          - "255.255.255.255/32"
+
+  services:
+    natetrader-kong:
+      loadBalancer:
+        servers:
+          - url: "http://natetrader-supabase-kong:8000"
+        passHostHeader: true
+    natetrader-dashboard:
+      loadBalancer:
+        servers:
+          - url: "http://natetrader-dashboard:3000"
+        passHostHeader: true
