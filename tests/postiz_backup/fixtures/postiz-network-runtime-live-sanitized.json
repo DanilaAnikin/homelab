@@ -1,0 +1,196 @@
+{
+  "container_networks": {
+    "postiz": {
+      "dokploy-network": {
+        "Aliases": [
+          "postiz",
+          "postiz"
+        ],
+        "NetworkID": "u02n58elmfvy9ykgyek8m0g23",
+        "EndpointID": "b1ff16c4ce443a642ca8bc630409f372c25d526f4fcaec7464d1046d640ef91d",
+        "Gateway": "",
+        "IPAddress": "10.0.1.99",
+        "IPPrefixLen": 24,
+        "IPv6Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "MacAddress": "02:42:0a:00:01:63"
+      },
+      "postiz_postiz-internal": {
+        "Aliases": [
+          "postiz",
+          "postiz"
+        ],
+        "NetworkID": "3cbc1bd9221ed311b78fc13c13b2582570ad994b5fda2af5a68bb8e1f8b93ff7",
+        "EndpointID": "77cd92925c4548f14d915ab13b93dc8daae481a5bf0d4fabc1a77306c72e1276",
+        "Gateway": "192.168.16.1",
+        "IPAddress": "192.168.16.10",
+        "IPPrefixLen": 20,
+        "IPv6Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "MacAddress": "02:42:c0:a8:10:0a"
+      }
+    },
+    "postiz-postgres": {
+      "postiz_postiz-internal": {
+        "Aliases": [
+          "postiz-postgres",
+          "postiz-postgres"
+        ],
+        "NetworkID": "3cbc1bd9221ed311b78fc13c13b2582570ad994b5fda2af5a68bb8e1f8b93ff7",
+        "EndpointID": "505160cb76641aea7cd6269ce55e342cb96795a6f35ad972531c169bf65245bc",
+        "Gateway": "192.168.16.1",
+        "IPAddress": "192.168.16.11",
+        "IPPrefixLen": 20,
+        "IPv6Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "MacAddress": "02:42:c0:a8:10:0b"
+      }
+    },
+    "postiz-redis": {
+      "postiz_postiz-internal": {
+        "Aliases": [
+          "postiz-redis",
+          "postiz-redis"
+        ],
+        "NetworkID": "3cbc1bd9221ed311b78fc13c13b2582570ad994b5fda2af5a68bb8e1f8b93ff7",
+        "EndpointID": "7567ec6aa878edd514979dc8c13f0b384ac3e976caf90ba7ea589a2a4748fad1",
+        "Gateway": "192.168.16.1",
+        "IPAddress": "192.168.16.12",
+        "IPPrefixLen": 20,
+        "IPv6Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "MacAddress": "02:42:c0:a8:10:0c"
+      }
+    },
+    "postiz-temporal": {
+      "postiz_postiz-internal": {
+        "Aliases": [
+          "postiz-temporal",
+          "postiz-temporal"
+        ],
+        "NetworkID": "3cbc1bd9221ed311b78fc13c13b2582570ad994b5fda2af5a68bb8e1f8b93ff7",
+        "EndpointID": "2f712ec020a2cc459686034c6c9819674cc3d1f75f6e41b18193095e904838e0",
+        "Gateway": "192.168.16.1",
+        "IPAddress": "192.168.16.13",
+        "IPPrefixLen": 20,
+        "IPv6Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "MacAddress": "02:42:c0:a8:10:0d"
+      }
+    }
+  },
+  "network_inspect": [
+  {
+    "Name": "dokploy-network",
+    "Id": "u02n58elmfvy9ykgyek8m0g23",
+    "Driver": "overlay",
+    "Scope": "swarm",
+    "Internal": false,
+    "Attachable": true,
+    "Ingress": false,
+    "ConfigOnly": false,
+    "ConfigFrom": {
+      "Network": ""
+    },
+    "EnableIPv4": true,
+    "EnableIPv6": false,
+    "Options": {
+      "com.docker.network.driver.overlay.vxlanid_list": "4097"
+    },
+    "IPAM": {
+      "Driver": "default",
+      "Options": null,
+      "Config": [
+        {
+          "Subnet": "10.0.1.0/24",
+          "Gateway": "10.0.1.1"
+        }
+      ]
+    },
+    "Containers": {
+      "38a7d9ba82f2531733010074602472d4a1fb069f68e77477ac50dae0d269fdc7": {
+        "Name": "postiz",
+        "EndpointID": "b1ff16c4ce443a642ca8bc630409f372c25d526f4fcaec7464d1046d640ef91d",
+        "MacAddress": "02:42:0a:00:01:63",
+        "IPv4Address": "10.0.1.99/24",
+        "IPv6Address": ""
+      },
+      "cb1f036c63a852f11813bd62f58360b43d056d87b5d7d0122f40f263e64c0007": {
+        "Name": "unrelated-external-service",
+        "EndpointID": "d870cfce23c14f5edc0680fe99cf84c617b63c93f94d58ce1b79ba38b255222d",
+        "MacAddress": "02:42:0a:00:01:fa",
+        "IPv4Address": "10.0.1.250/24",
+        "IPv6Address": ""
+      },
+      "lb-dokploy-network": {
+        "Name": "dokploy-network-endpoint",
+        "EndpointID": "b2040b2798bb6c0928f5c9df7e20850146c1b61d0e3558603fe660e4c598c3a8",
+        "MacAddress": "02:42:0a:00:01:06",
+        "IPv4Address": "10.0.1.6/24",
+        "IPv6Address": ""
+      }
+    }
+  },
+  {
+    "Name": "postiz_postiz-internal",
+    "Id": "3cbc1bd9221ed311b78fc13c13b2582570ad994b5fda2af5a68bb8e1f8b93ff7",
+    "Driver": "bridge",
+    "Scope": "local",
+    "Internal": false,
+    "Attachable": false,
+    "Ingress": false,
+    "ConfigOnly": false,
+    "ConfigFrom": {
+      "Network": ""
+    },
+    "EnableIPv4": true,
+    "EnableIPv6": false,
+    "Options": {},
+    "IPAM": {
+      "Driver": "default",
+      "Options": null,
+      "Config": [
+        {
+          "Subnet": "192.168.16.0/20",
+          "Gateway": "192.168.16.1"
+        }
+      ]
+    },
+    "Containers": {
+      "38a7d9ba82f2531733010074602472d4a1fb069f68e77477ac50dae0d269fdc7": {
+        "Name": "postiz",
+        "EndpointID": "77cd92925c4548f14d915ab13b93dc8daae481a5bf0d4fabc1a77306c72e1276",
+        "MacAddress": "02:42:c0:a8:10:0a",
+        "IPv4Address": "192.168.16.10/20",
+        "IPv6Address": ""
+      },
+      "4fcc49961caccd8d63ab225030e059bd0bf276781b4a59172c280eb5154f0a7f": {
+        "Name": "postiz-postgres",
+        "EndpointID": "505160cb76641aea7cd6269ce55e342cb96795a6f35ad972531c169bf65245bc",
+        "MacAddress": "02:42:c0:a8:10:0b",
+        "IPv4Address": "192.168.16.11/20",
+        "IPv6Address": ""
+      },
+      "5981895f900d4b96e2de6fc51abcdd456c0d90d9433a6d52fc28cf72228d0b8e": {
+        "Name": "postiz-redis",
+        "EndpointID": "7567ec6aa878edd514979dc8c13f0b384ac3e976caf90ba7ea589a2a4748fad1",
+        "MacAddress": "02:42:c0:a8:10:0c",
+        "IPv4Address": "192.168.16.12/20",
+        "IPv6Address": ""
+      },
+      "7aeafcc36838569736e84eedae3087953cf069495421e2e43c0e40b9e1472cb7": {
+        "Name": "postiz-temporal",
+        "EndpointID": "2f712ec020a2cc459686034c6c9819674cc3d1f75f6e41b18193095e904838e0",
+        "MacAddress": "02:42:c0:a8:10:0d",
+        "IPv4Address": "192.168.16.13/20",
+        "IPv6Address": ""
+      }
+    }
+  }
+  ]
+}

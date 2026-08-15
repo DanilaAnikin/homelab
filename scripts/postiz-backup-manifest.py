@@ -45,6 +45,13 @@ MAX_CONFIG_ARCHIVE_MEMBER_BYTES = 16 * 1024**2
 MAX_CONFIG_ARCHIVE_EXPANDED_BYTES = 64 * 1024**2
 MAX_PHYSICAL_ARCHIVE_MEMBERS = 1_000_000
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SWARM_NETWORK_ID_RE = re.compile(r"^[a-z0-9]{25}$")
+DOCKER_ENDPOINT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,254}$")
+DOCKER_MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
+VXLAN_VNI_RE = re.compile(r"^[1-9][0-9]{0,7}$")
+VXLAN_OPTION_KEY = "com.docker.network.driver.overlay.vxlanid_list"
+MAX_VXLAN_VNI = (1 << 24) - 1
+EXPECTED_DOKPLOY_VXLAN_VNI = 4097
 TIMESTAMP_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
 DOCKER_FINISHED_AT_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$"
@@ -1875,6 +1882,45 @@ def _network_endpoint_ipv4(
     return endpoint
 
 
+def _network_endpoint_gateway(
+    endpoint: ipaddress.IPv4Interface,
+    ipam: tuple[tuple[ipaddress.IPv4Network, ipaddress.IPv4Address], ...],
+) -> ipaddress.IPv4Address:
+    matching = [gateway for subnet, gateway in ipam if endpoint.ip in subnet]
+    if len(matching) != 1:
+        _die("Docker network endpoint does not bind one exact IPAM Gateway")
+    return matching[0]
+
+
+def _valid_unicast_mac(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and DOCKER_MAC_RE.fullmatch(value) is not None
+        and value != "00:00:00:00:00:00"
+        and int(value[:2], 16) & 1 == 0
+    )
+
+
+def _valid_network_driver_options(driver: str, value: Any) -> bool:
+    if driver == "bridge":
+        return value == {}
+    if (
+        driver != "overlay"
+        or not isinstance(value, dict)
+        or set(value) != {VXLAN_OPTION_KEY}
+    ):
+        return False
+    raw_vni = value[VXLAN_OPTION_KEY]
+    if not isinstance(raw_vni, str) or VXLAN_VNI_RE.fullmatch(raw_vni) is None:
+        return False
+    vni = int(raw_vni)
+    return (
+        str(vni) == raw_vni
+        and 1 <= vni <= MAX_VXLAN_VNI
+        and vni == EXPECTED_DOKPLOY_VXLAN_VNI
+    )
+
+
 def _verify_container_state(state: dict[str, Any], running: bool) -> None:
     expected_status = "running" if running else "exited"
     finished_at = state.get("FinishedAt")
@@ -1949,8 +1995,10 @@ def _verify_container_topology(
             if (
                 endpoint is not None
                 or network.get("EndpointID") != ""
+                or network.get("Gateway") != ""
                 or network.get("IPAddress") != ""
                 or network.get("IPPrefixLen") != 0
+                or network.get("IPv6Gateway") != ""
                 or network.get("GlobalIPv6Address") != ""
                 or network.get("GlobalIPv6PrefixLen") != 0
                 or network.get("MacAddress") != ""
@@ -1966,23 +2014,26 @@ def _verify_container_topology(
         ):
             _die("container/network inspect endpoint identity differs")
         ipv4 = _network_endpoint_ipv4(endpoint.get("IPv4Address"), ipam)
+        gateway = _network_endpoint_gateway(ipv4, ipam)
+        expected_container_gateway = (
+            "" if record.get("Driver") == "overlay" else str(gateway)
+        )
         if (
             str(ipv4.ip) != network.get("IPAddress")
             or ipv4.network.prefixlen != network.get("IPPrefixLen")
+            or network.get("Gateway") != expected_container_gateway
         ):
-            _die("container/network inspect IPv4 address/prefix differs")
+            _die("container/network inspect IPv4 address/prefix/Gateway differs")
         if (
             endpoint.get("IPv6Address") != ""
+            or network.get("IPv6Gateway") != ""
             or network.get("GlobalIPv6Address") != ""
             or network.get("GlobalIPv6PrefixLen") != 0
         ):
             _die("IPv6 is unexpectedly enabled on a Postiz runtime network")
         mac_address = network.get("MacAddress")
         if (
-            not isinstance(mac_address, str)
-            or not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac_address)
-            or mac_address == "00:00:00:00:00:00"
-            or int(mac_address[:2], 16) & 1
+            not _valid_unicast_mac(mac_address)
             or endpoint.get("MacAddress") != mac_address
         ):
             _die("container/network inspect MAC address differs or is invalid")
@@ -2121,7 +2172,7 @@ def _load_image_inspect_evidence(
 
 
 def _load_network_inspect_evidence(
-    path: Path, expected_names: set[str]
+    path: Path, expected_external_by_name: dict[str, bool]
 ) -> dict[
     str,
     tuple[
@@ -2129,6 +2180,7 @@ def _load_network_inspect_evidence(
         tuple[tuple[ipaddress.IPv4Network, ipaddress.IPv4Address], ...],
     ],
 ]:
+    expected_names = set(expected_external_by_name)
     value = _load_json_value(path)
     if not isinstance(value, list) or len(value) != len(expected_names):
         _die("Docker network inspect evidence lacks the exact Compose network set")
@@ -2147,30 +2199,63 @@ def _load_network_inspect_evidence(
             _die("Docker network inspect evidence has an invalid record")
         name = record.get("Name")
         network_id = record.get("Id")
+        driver = record.get("Driver")
+        scope = record.get("Scope")
         containers = record.get("Containers")
         ipam = record.get("IPAM")
         raw_subnets = ipam.get("Config") if isinstance(ipam, dict) else None
+        external = expected_external_by_name.get(name) \
+            if isinstance(name, str) else None
+        expected_driver = "overlay" if external is True else "bridge"
+        expected_scope = "swarm" if external is True else "local"
+        valid_network_id = (
+            SWARM_NETWORK_ID_RE.fullmatch(network_id) is not None
+            if expected_driver == "overlay" and isinstance(network_id, str)
+            else SHA256_RE.fullmatch(network_id) is not None
+            if expected_driver == "bridge" and isinstance(network_id, str)
+            else False
+        )
+        options = record.get("Options")
+        config_from = record.get("ConfigFrom")
         if (
             not isinstance(name, str)
             or name not in expected_names
             or name in networks
-            or not isinstance(network_id, str)
-            or not SHA256_RE.fullmatch(network_id)
+            or not valid_network_id
             or network_id in network_ids
+            or driver != expected_driver
+            or scope != expected_scope
+            or record.get("Internal") is not False
+            or record.get("Attachable") is not external
+            or record.get("Ingress") is not False
+            or record.get("ConfigOnly") is not False
+            or config_from != {"Network": ""}
+            or record.get("EnableIPv4") is not True
             or record.get("EnableIPv6") is not False
+            or not _valid_network_driver_options(expected_driver, options)
             or not isinstance(containers, dict)
-            or any(not isinstance(key, str) or not SHA256_RE.fullmatch(key) for key in containers)
+            or not isinstance(ipam, dict)
+            or ipam.get("Driver") != "default"
+            or ipam.get("Options") is not None
             or not isinstance(raw_subnets, list)
             or not raw_subnets
         ):
-            _die("Docker network inspect identity/IPAM evidence is invalid or duplicate")
+            _die(
+                "Docker network inspect identity/driver/scope/options/IPAM evidence "
+                "is invalid or duplicate"
+            )
         network_ids.add(network_id)
         ipam_entries: list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Address]] = []
         try:
             for item in raw_subnets:
                 raw_subnet = item.get("Subnet") if isinstance(item, dict) else None
                 raw_gateway = item.get("Gateway") if isinstance(item, dict) else None
-                if not isinstance(raw_subnet, str) or not isinstance(raw_gateway, str):
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"Subnet", "Gateway"}
+                    or not isinstance(raw_subnet, str)
+                    or not isinstance(raw_gateway, str)
+                ):
                     _die("Docker network inspect IPAM subnet evidence is invalid")
                 subnet = ipaddress.ip_network(raw_subnet, strict=True)
                 gateway = ipaddress.ip_address(raw_gateway)
@@ -2196,20 +2281,35 @@ def _load_network_inspect_evidence(
             _die(f"Docker network inspect IPAM subnet evidence is invalid: {exc}")
         network_ipv4: set[ipaddress.IPv4Address] = set()
         network_macs: set[str] = set()
+        network_endpoint_names: set[str] = set()
         for container_id, endpoint in containers.items():
+            regular_container = (
+                isinstance(container_id, str)
+                and SHA256_RE.fullmatch(container_id) is not None
+            )
+            load_balancer = (
+                expected_driver == "overlay"
+                and container_id == f"lb-{name}"
+            )
             endpoint_id = endpoint.get("EndpointID") if isinstance(endpoint, dict) else None
             endpoint_name = endpoint.get("Name") if isinstance(endpoint, dict) else None
+            canonical_endpoint_name = (
+                endpoint_name.lower().rstrip(".")
+                if isinstance(endpoint_name, str)
+                else None
+            )
             mac_address = endpoint.get("MacAddress") if isinstance(endpoint, dict) else None
             if (
-                not isinstance(endpoint_name, str)
-                or not endpoint_name
+                not (regular_container or load_balancer)
+                or not isinstance(endpoint_name, str)
+                or endpoint_name != canonical_endpoint_name
+                or DOCKER_ENDPOINT_NAME_RE.fullmatch(endpoint_name) is None
+                or (load_balancer and endpoint_name != f"{name}-endpoint")
+                or canonical_endpoint_name in network_endpoint_names
                 or not isinstance(endpoint_id, str)
                 or not SHA256_RE.fullmatch(endpoint_id)
                 or endpoint_id in endpoint_ids
-                or not isinstance(mac_address, str)
-                or not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac_address)
-                or mac_address == "00:00:00:00:00:00"
-                or int(mac_address[:2], 16) & 1
+                or not _valid_unicast_mac(mac_address)
                 or mac_address in network_macs
                 or endpoint.get("IPv6Address") != ""
             ):
@@ -2219,7 +2319,10 @@ def _load_network_inspect_evidence(
                 _die("Docker network endpoint IPv4 address is duplicate")
             endpoint_ids.add(endpoint_id)
             network_macs.add(mac_address)
+            network_endpoint_names.add(canonical_endpoint_name)
             network_ipv4.add(ipv4.ip)
+        if expected_driver == "overlay" and f"lb-{name}" not in containers:
+            _die("Docker overlay network lacks its exact load-balancer endpoint")
         networks[name] = (record, tuple(ipam_entries))
     if set(networks) != expected_names:
         _die("Docker network inspect name set differs from resolved Compose")
@@ -2241,19 +2344,47 @@ def command_verify_compose_runtime(args: argparse.Namespace) -> None:
     expected_images = _load_expected_service_images(args.expected_image)
     images = _load_image_inspect_evidence(Path(args.image_inspect_json), expected_images)
     network_names = _resolved_network_names(compose)
-    referenced_network_sources: set[str] = set()
-    for definition in services.values():
+    compose_network_definitions = compose.get("networks")
+    if not isinstance(compose_network_definitions, dict):
+        _die("resolved Compose network definitions are invalid")
+    expected_external_by_name: dict[str, bool] = {}
+    for source, network_name in network_names.items():
+        definition = compose_network_definitions.get(source)
+        external = definition.get("external", False) \
+            if isinstance(definition, dict) else None
+        driver = definition.get("driver") if isinstance(definition, dict) else None
+        if (
+            type(external) is not bool
+            or (external and driver not in (None, "overlay"))
+            or (not external and driver != "bridge")
+            or definition.get("internal", False) is not False
+            or definition.get("attachable", False) is not False
+            or definition.get("enable_ipv4", True) is not True
+            or definition.get("enable_ipv6", False) is not False
+        ):
+            _die("resolved Compose network definition is incompatible with Postiz")
+        expected_external_by_name[network_name] = external
+    if sorted(expected_external_by_name.values()) != [False, True]:
+        _die("resolved Compose must bind one private bridge and one shared overlay")
+    private_source = next(
+        source
+        for source, network_name in network_names.items()
+        if not expected_external_by_name[network_name]
+    )
+    shared_source = next(
+        source
+        for source, network_name in network_names.items()
+        if expected_external_by_name[network_name]
+    )
+    for service, definition in services.items():
         service_networks = definition.get("networks")
-        if not isinstance(service_networks, dict) or not service_networks:
-            _die("resolved Compose service network set is invalid")
-        for source in service_networks:
-            if source not in network_names:
-                _die("resolved Compose service references an unknown network resource")
-            referenced_network_sources.add(source)
-    if referenced_network_sources != set(network_names):
-        _die("resolved Compose network resource map is not exactly referenced")
+        expected_sources = (
+            {private_source, shared_source} if service == "postiz" else {private_source}
+        )
+        if not isinstance(service_networks, dict) or set(service_networks) != expected_sources:
+            _die("resolved Compose service network roles differ from the Postiz matrix")
     networks = _load_network_inspect_evidence(
-        Path(args.network_inspect_json), set(network_names.values())
+        Path(args.network_inspect_json), expected_external_by_name
     )
     hashes = _load_compose_hashes(
         Path(args.compose_hashes), JOURNAL_SERVICES, "source-full Compose service hash output"
@@ -2342,9 +2473,6 @@ def command_verify_compose_runtime(args: argparse.Namespace) -> None:
         _die("container runtime service set differs")
     if used_image_ids != set(images):
         _die("container runtime does not bind the exact Docker image inspect set")
-    compose_network_definitions = compose.get("networks")
-    if not isinstance(compose_network_definitions, dict):
-        _die("resolved Compose network definitions are invalid")
     all_container_ids = set(container_ids_by_service.values())
     for source, definition in compose_network_definitions.items():
         network_name = _resolved_resource_name(compose, "networks", source)
@@ -2353,14 +2481,37 @@ def command_verify_compose_runtime(args: argparse.Namespace) -> None:
         external = definition.get("external", False) if isinstance(definition, dict) else None
         if not isinstance(external, bool):
             _die("resolved Compose network definition is invalid")
+        expected_network_services = (
+            SHARED_NETWORK_SERVICES if external else PRIVATE_NETWORK_SERVICES
+        )
         expected_ids = {
             container_ids_by_service[service]
-            for service, service_definition in services.items()
+            for service in expected_network_services
             if service in expected_running_services
-            and source in service_definition.get("networks", {})
         }
         record_containers = networks[network_name][0].get("Containers")
         actual_ids = set(record_containers) if isinstance(record_containers, dict) else set()
+        expected_reserved_ids = {
+            service: container_ids_by_service[service]
+            for service in expected_network_services
+            if service in expected_running_services
+            and not (
+                args.runtime_state == "writer-fenced"
+                and service == "postiz-postgres"
+            )
+        }
+        for candidate_id, endpoint in record_containers.items():
+            endpoint_name = endpoint.get("Name") if isinstance(endpoint, dict) else None
+            canonical_endpoint_name = (
+                endpoint_name.lower().rstrip(".")
+                if isinstance(endpoint_name, str)
+                else None
+            )
+            if (
+                canonical_endpoint_name in JOURNAL_SERVICES
+                and expected_reserved_ids.get(canonical_endpoint_name) != candidate_id
+            ):
+                _die("reserved Postiz endpoint name is bound to an unexpected container")
         if actual_ids & all_container_ids != expected_ids:
             _die("Docker network membership differs for the exact Postiz container IDs")
         if not external and actual_ids != expected_ids:
@@ -2986,6 +3137,8 @@ def command_verify_auth_record(args: argparse.Namespace) -> None:
 
 
 JOURNAL_SERVICES = {"postiz", "postiz-postgres", "postiz-temporal", "postiz-redis"}
+PRIVATE_NETWORK_SERVICES = frozenset(JOURNAL_SERVICES)
+SHARED_NETWORK_SERVICES = frozenset({"postiz"})
 RESTORE_JOURNAL_ROLES = {
     f"{kind}-{remote}"
     for remote in ("primary", "dr")

@@ -292,11 +292,24 @@ class ArchiveContractTests(unittest.TestCase):
                     "container_name": service,
                     "image": f"fixture/{service}:pinned",
                     "environment": {"GENERATION": "g1"},
-                    "networks": {"postiz-internal": None},
+                    "networks": (
+                        {"dokploy-network": None, "postiz-internal": None}
+                        if service == "postiz"
+                        else {"postiz-internal": None}
+                    ),
                 }
                 for service in services
             },
-            "networks": {"postiz-internal": {"name": "postiz_postiz-internal"}},
+            "networks": {
+                "dokploy-network": {
+                    "name": "dokploy-network",
+                    "external": True,
+                },
+                "postiz-internal": {
+                    "name": "postiz_postiz-internal",
+                    "driver": "bridge",
+                },
+            },
             "volumes": {},
         }
         compose["services"]["postiz"]["depends_on"] = copy.deepcopy(
@@ -322,25 +335,67 @@ class ArchiveContractTests(unittest.TestCase):
             }
             for service in services
         ]
-        network_id = hashlib.sha256(b"network:postiz-internal").hexdigest()
-        network_members = {}
+        network_ids = {
+            "dokploy-network": "u02n58elmfvy9ykgyek8m0g23",
+            "postiz_postiz-internal": hashlib.sha256(
+                b"network:postiz-internal"
+            ).hexdigest(),
+        }
+        network_members = {
+            "dokploy-network": {
+                "lb-dokploy-network": {
+                    "Name": "dokploy-network-endpoint",
+                    "EndpointID": hashlib.sha256(b"overlay-lb-endpoint").hexdigest(),
+                    "MacAddress": "02:42:0a:00:01:06",
+                    "IPv4Address": "10.0.1.6/24",
+                    "IPv6Address": "",
+                }
+            },
+            "postiz_postiz-internal": {},
+        }
         containers = []
         for index, service in enumerate(services, 10):
             name = "/postiz-postgres-backup-fenced" if service == "postiz-postgres" else f"/{service}"
             running = service == "postiz-postgres"
-            endpoint_id = hashlib.sha256(f"endpoint:{service}".encode()).hexdigest()
-            ip_address = f"10.77.0.{index}"
-            mac_address = f"02:42:0a:4d:00:{index:02x}"
-            attachment = {
-                "Aliases": [service, service],
-                "NetworkID": network_id,
-                "EndpointID": endpoint_id if running else "",
-                "IPAddress": ip_address if running else "",
-                "IPPrefixLen": 24 if running else 0,
-                "GlobalIPv6Address": "",
-                "GlobalIPv6PrefixLen": 0,
-                "MacAddress": mac_address if running else "",
-            }
+            network_names = (
+                ("dokploy-network", "postiz_postiz-internal")
+                if service == "postiz"
+                else ("postiz_postiz-internal",)
+            )
+            attachments = {}
+            for network_name in network_names:
+                overlay = network_name == "dokploy-network"
+                endpoint_id = hashlib.sha256(
+                    f"endpoint:{network_name}:{service}".encode()
+                ).hexdigest()
+                ip_address = "10.0.1.99" if overlay else f"10.77.0.{index}"
+                mac_address = (
+                    "02:42:0a:00:01:63"
+                    if overlay
+                    else f"02:42:0a:4d:00:{index:02x}"
+                )
+                attachments[network_name] = {
+                    "Aliases": [service, service],
+                    "NetworkID": network_ids[network_name],
+                    "EndpointID": endpoint_id if running else "",
+                    "Gateway": (
+                        "" if overlay or not running else "10.77.0.1"
+                    ),
+                    "IPAddress": ip_address if running else "",
+                    "IPPrefixLen": 24 if running else 0,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "MacAddress": mac_address if running else "",
+                }
+                if running:
+                    network_members[network_name][container_ids[service]] = {
+                        "Name": name.removeprefix("/"),
+                        "EndpointID": endpoint_id,
+                        "MacAddress": mac_address,
+                        "IPv4Address": f"{ip_address}/24",
+                        "IPv6Address": "",
+                    }
             containers.append(
                 {
                     "Id": container_ids[service],
@@ -373,27 +428,48 @@ class ArchiveContractTests(unittest.TestCase):
                     },
                     "HostConfig": {"PortBindings": {}},
                     "Mounts": [],
-                    "NetworkSettings": {
-                        "Networks": {"postiz_postiz-internal": attachment}
-                    },
+                    "NetworkSettings": {"Networks": attachments},
                 }
             )
-            if running:
-                network_members[container_ids[service]] = {
-                    "Name": name.removeprefix("/"),
-                    "EndpointID": endpoint_id,
-                    "MacAddress": mac_address,
-                    "IPv4Address": f"{ip_address}/24",
-                    "IPv6Address": "",
-                }
         networks = [
             {
-                "Name": "postiz_postiz-internal",
-                "Id": network_id,
+                "Name": network_name,
+                "Id": network_ids[network_name],
+                "Driver": "overlay" if network_name == "dokploy-network" else "bridge",
+                "Scope": "swarm" if network_name == "dokploy-network" else "local",
+                "Internal": False,
+                "Attachable": network_name == "dokploy-network",
+                "Ingress": False,
+                "ConfigOnly": False,
+                "ConfigFrom": {"Network": ""},
+                "EnableIPv4": True,
                 "EnableIPv6": False,
-                "IPAM": {"Config": [{"Subnet": "10.77.0.0/24", "Gateway": "10.77.0.1"}]},
-                "Containers": network_members,
+                "Options": (
+                    {"com.docker.network.driver.overlay.vxlanid_list": "4097"}
+                    if network_name == "dokploy-network"
+                    else {}
+                ),
+                "IPAM": {
+                    "Driver": "default",
+                    "Options": None,
+                    "Config": [
+                        {
+                            "Subnet": (
+                                "10.0.1.0/24"
+                                if network_name == "dokploy-network"
+                                else "10.77.0.0/24"
+                            ),
+                            "Gateway": (
+                                "10.0.1.1"
+                                if network_name == "dokploy-network"
+                                else "10.77.0.1"
+                            ),
+                        }
+                    ],
+                },
+                "Containers": network_members[network_name],
             }
+            for network_name in ("dokploy-network", "postiz_postiz-internal")
         ]
         compose_path = self.base / "compose.json"
         no_deps_compose_path = self.base / "compose-no-deps.json"

@@ -47,24 +47,39 @@ LIVE_IMAGE_IDS = {
 }
 SERVICE_ORDINAL = {service: index for index, service in enumerate(LIVE_V53_FULL_HASHES, 10)}
 NETWORK_IDS = {
-    name: hashlib.sha256(f"network:{name}".encode()).hexdigest()
-    for name in ("dokploy-network", "postiz_postiz-internal")
+    "dokploy-network": "u02n58elmfvy9ykgyek8m0g23",
+    "postiz_postiz-internal": hashlib.sha256(
+        b"network:postiz_postiz-internal"
+    ).hexdigest(),
 }
 STOPPED_FINISHED_AT = "2026-08-15T08:30:00.123456789Z"
+# Cross-view field shape from a read-only live inspect; every configuration value,
+# container/image identity and endpoint identity is non-secret or deterministically
+# replaced.  The fixture intentionally preserves the bridge-vs-swarm asymmetries.
+LIVE_SANITIZED_NETWORK_FIXTURE = (
+    ROOT / "tests/postiz_backup/fixtures/postiz-network-runtime-live-sanitized.json"
+)
 
 
 def network_attachment(service: str, network_name: str) -> dict[str, object]:
     ordinal = SERVICE_ORDINAL[service]
     external = network_name == "dokploy-network"
-    third_octet = 31 if external else 30
-    ipv4 = f"172.{third_octet}.0.{ordinal}"
-    mac = f"02:42:ac:{third_octet:02x}:00:{ordinal:02x}"
+    ipv4 = "10.0.1.99" if external else f"192.168.16.{ordinal}"
+    prefix = 24 if external else 20
+    gateway = "" if external else "192.168.16.1"
+    mac = (
+        "02:42:0a:00:01:63"
+        if external
+        else f"02:42:c0:a8:10:{ordinal:02x}"
+    )
     return {
         "Aliases": [service, service],
         "NetworkID": NETWORK_IDS[network_name],
         "EndpointID": hashlib.sha256(f"endpoint:{network_name}:{service}".encode()).hexdigest(),
+        "Gateway": gateway,
         "IPAddress": ipv4,
-        "IPPrefixLen": 24,
+        "IPPrefixLen": prefix,
+        "IPv6Gateway": "",
         "GlobalIPv6Address": "",
         "GlobalIPv6PrefixLen": 0,
         "MacAddress": mac,
@@ -215,8 +230,10 @@ def runtime_containers(
                 attachment.update(
                     {
                         "EndpointID": "",
+                        "Gateway": "",
                         "IPAddress": "",
                         "IPPrefixLen": 0,
+                        "IPv6Gateway": "",
                         "GlobalIPv6Address": "",
                         "GlobalIPv6PrefixLen": 0,
                         "MacAddress": "",
@@ -301,21 +318,45 @@ def runtime_networks(
             members[external_id] = {
                 "Name": "unrelated-external-service",
                 "EndpointID": external_endpoint,
-                "MacAddress": "02:42:ac:1f:00:fa",
-                "IPv4Address": "172.31.0.250/24",
+                "MacAddress": "02:42:0a:00:01:fa",
+                "IPv4Address": "10.0.1.250/24",
                 "IPv6Address": "",
             }
-        third_octet = 31 if network_name == "dokploy-network" else 30
+            members[f"lb-{network_name}"] = {
+                "Name": f"{network_name}-endpoint",
+                "EndpointID": hashlib.sha256(
+                    f"load-balancer:{network_name}".encode()
+                ).hexdigest(),
+                "MacAddress": "02:42:0a:00:01:06",
+                "IPv4Address": "10.0.1.6/24",
+                "IPv6Address": "",
+            }
+        external = definition.get("external", False)
         records.append(
             {
                 "Name": network_name,
                 "Id": NETWORK_IDS[network_name],
+                "Driver": "overlay" if external else "bridge",
+                "Scope": "swarm" if external else "local",
+                "Internal": False,
+                "Attachable": external,
+                "Ingress": False,
+                "ConfigOnly": False,
+                "ConfigFrom": {"Network": ""},
+                "EnableIPv4": True,
                 "EnableIPv6": False,
+                "Options": (
+                    {"com.docker.network.driver.overlay.vxlanid_list": "4097"}
+                    if external
+                    else {}
+                ),
                 "IPAM": {
+                    "Driver": "default",
+                    "Options": None,
                     "Config": [
                         {
-                            "Subnet": f"172.{third_octet}.0.0/24",
-                            "Gateway": f"172.{third_octet}.0.1",
+                            "Subnet": "10.0.1.0/24" if external else "192.168.16.0/20",
+                            "Gateway": "10.0.1.1" if external else "192.168.16.1",
                         }
                     ]
                 },
@@ -323,6 +364,26 @@ def runtime_networks(
             }
         )
     return records
+
+
+def named_network(
+    networks: list[dict[str, object]], name: str
+) -> dict[str, object]:
+    return next(record for record in networks if record["Name"] == name)
+
+
+def add_valid_overlay_member(
+    network: dict[str, object], seed: str, ipv4: str, mac: str
+) -> str:
+    container_id = hashlib.sha256(f"container:{seed}".encode()).hexdigest()
+    network["Containers"][container_id] = {
+        "Name": seed,
+        "EndpointID": hashlib.sha256(f"endpoint:{seed}".encode()).hexdigest(),
+        "MacAddress": mac,
+        "IPv4Address": f"{ipv4}/24",
+        "IPv6Address": "",
+    }
+    return container_id
 
 
 class ComposeRuntimeContractFixtures(unittest.TestCase):
@@ -414,6 +475,368 @@ class ComposeRuntimeContractFixtures(unittest.TestCase):
         )
         self.verify()
 
+    def test_sanitized_live_bridge_overlay_and_lb_read_only_replay(self) -> None:
+        compose = live_v53_compose_shape()
+        containers = runtime_containers(compose)
+        evidence = json.loads(LIVE_SANITIZED_NETWORK_FIXTURE.read_text(encoding="utf-8"))
+        networks = evidence["network_inspect"]
+        for container in containers:
+            service = container["Config"]["Labels"]["com.docker.compose.service"]
+            container["NetworkSettings"]["Networks"] = copy.deepcopy(
+                evidence["container_networks"][service]
+            )
+        self.assertEqual(networks, runtime_networks(compose, containers))
+
+        overlay = named_network(networks, "dokploy-network")
+        bridge = named_network(networks, "postiz_postiz-internal")
+        self.assertRegex(overlay["Id"], r"^[a-z0-9]{25}$")
+        self.assertRegex(bridge["Id"], r"^[0-9a-f]{64}$")
+        self.assertEqual(overlay["Driver"], "overlay")
+        self.assertEqual(overlay["Scope"], "swarm")
+        self.assertEqual(bridge["Driver"], "bridge")
+        self.assertEqual(bridge["Scope"], "local")
+        self.assertEqual(
+            overlay["Containers"]["lb-dokploy-network"]["Name"],
+            "dokploy-network-endpoint",
+        )
+        postiz = next(item for item in containers if item["Name"] == "/postiz")
+        self.assertEqual(
+            postiz["NetworkSettings"]["Networks"]["dokploy-network"]["Gateway"],
+            "",
+        )
+        self.assertEqual(
+            postiz["NetworkSettings"]["Networks"]["postiz_postiz-internal"][
+                "Gateway"
+            ],
+            "192.168.16.1",
+        )
+        self.verify(compose=compose, containers=containers, networks=networks)
+
+    def test_bridge_overlay_identity_and_metadata_drift_fail_closed(self) -> None:
+        compose = live_v53_compose_shape()
+
+        for network_name, replacement in (
+            ("dokploy-network", "a" * 64),
+            ("dokploy-network", "A" * 25),
+            ("dokploy-network", "a" * 24),
+            ("postiz_postiz-internal", "a" * 25),
+            ("postiz_postiz-internal", "g" * 64),
+        ):
+            with self.subTest(field="Id", network=network_name, value=replacement):
+                containers = runtime_containers(compose)
+                networks = runtime_networks(compose, containers)
+                named_network(networks, network_name)["Id"] = replacement
+                for container in containers:
+                    attachment = container["NetworkSettings"]["Networks"].get(network_name)
+                    if attachment is not None:
+                        attachment["NetworkID"] = replacement
+                self.rejected(compose=compose, containers=containers, networks=networks)
+
+        mutations = (
+            ("dokploy-network", "Driver", "bridge"),
+            ("dokploy-network", "Scope", "local"),
+            ("postiz_postiz-internal", "Driver", "overlay"),
+            ("postiz_postiz-internal", "Scope", "swarm"),
+            ("dokploy-network", "Internal", True),
+            ("dokploy-network", "Attachable", False),
+            ("postiz_postiz-internal", "Attachable", True),
+            ("dokploy-network", "Ingress", True),
+            ("dokploy-network", "ConfigOnly", True),
+            ("dokploy-network", "ConfigFrom", {"Network": "other"}),
+            ("dokploy-network", "EnableIPv4", False),
+            ("dokploy-network", "EnableIPv6", True),
+            ("dokploy-network", "Options", None),
+            ("dokploy-network", "Options", {}),
+            ("dokploy-network", "Options", {"vxlanid": 4097}),
+            (
+                "dokploy-network",
+                "Options",
+                {manifest_module.VXLAN_OPTION_KEY: "9999"},
+            ),
+            (
+                "dokploy-network",
+                "Options",
+                {manifest_module.VXLAN_OPTION_KEY: "04097"},
+            ),
+            (
+                "dokploy-network",
+                "Options",
+                {
+                    manifest_module.VXLAN_OPTION_KEY: "4097",
+                    "unexpected": "value",
+                },
+            ),
+            ("postiz_postiz-internal", "Options", []),
+            ("postiz_postiz-internal", "Options", {"unexpected": "value"}),
+        )
+        for network_name, field, value in mutations:
+            with self.subTest(field=field, network=network_name, value=value):
+                containers = runtime_containers(compose)
+                networks = runtime_networks(compose, containers)
+                named_network(networks, network_name)[field] = value
+                self.rejected(compose=compose, containers=containers, networks=networks)
+
+        for field, value in (("Driver", "custom"), ("Options", {})):
+            with self.subTest(section="IPAM", field=field, value=value):
+                containers = runtime_containers(compose)
+                networks = runtime_networks(compose, containers)
+                named_network(networks, "dokploy-network")["IPAM"][field] = value
+                self.rejected(compose=compose, containers=containers, networks=networks)
+
+        containers = runtime_containers(compose)
+        networks = runtime_networks(compose, containers)
+        named_network(networks, "dokploy-network")["IPAM"]["Config"][0][
+            "IPRange"
+        ] = "10.0.1.0/25"
+        self.rejected(compose=compose, containers=containers, networks=networks)
+
+    def test_overlay_lb_and_unrelated_member_contract_fail_closed(self) -> None:
+        compose = live_v53_compose_shape()
+
+        containers = runtime_containers(compose)
+        networks = runtime_networks(compose, containers)
+        overlay = named_network(networks, "dokploy-network")
+        del overlay["Containers"]["lb-dokploy-network"]
+        self.rejected(compose=compose, containers=containers, networks=networks)
+
+        containers = runtime_containers(compose)
+        networks = runtime_networks(compose, containers)
+        overlay = named_network(networks, "dokploy-network")
+        unrelated_id = hashlib.sha256(b"external-dokploy-member").hexdigest()
+        del overlay["Containers"][unrelated_id]
+        add_valid_overlay_member(
+            overlay, "replacement-external-service", "10.0.1.249", "02:42:0a:00:01:f9"
+        )
+        self.verify(compose=compose, containers=containers, networks=networks)
+
+        for changed_key in ("lb-wrong-network", "not-a-container-id"):
+            with self.subTest(field="load-balancer-key", value=changed_key):
+                containers = runtime_containers(compose)
+                networks = runtime_networks(compose, containers)
+                overlay = named_network(networks, "dokploy-network")
+                overlay["Containers"][changed_key] = overlay["Containers"].pop(
+                    "lb-dokploy-network"
+                )
+                self.rejected(compose=compose, containers=containers, networks=networks)
+
+        lb_mutations = (
+            ("Name", "wrong-endpoint"),
+            ("EndpointID", "not-an-endpoint"),
+            ("MacAddress", "00:00:00:00:00:00"),
+            ("IPv4Address", "10.0.1.1/24"),
+            ("IPv6Address", "fd00::6/64"),
+        )
+        for field, value in lb_mutations:
+            with self.subTest(field=f"load-balancer-{field}", value=value):
+                containers = runtime_containers(compose)
+                networks = runtime_networks(compose, containers)
+                lb = named_network(networks, "dokploy-network")["Containers"][
+                    "lb-dokploy-network"
+                ]
+                lb[field] = value
+                self.rejected(compose=compose, containers=containers, networks=networks)
+
+        for field in ("EndpointID", "MacAddress", "IPv4Address"):
+            with self.subTest(field=f"load-balancer-collision-{field}"):
+                containers = runtime_containers(compose)
+                networks = runtime_networks(compose, containers)
+                overlay = named_network(networks, "dokploy-network")
+                postiz = next(item for item in containers if item["Name"] == "/postiz")
+                lb = overlay["Containers"]["lb-dokploy-network"]
+                lb[field] = overlay["Containers"][postiz["Id"]][field]
+                self.rejected(compose=compose, containers=containers, networks=networks)
+
+        unrelated_mutations = (
+            ("Name", "bad/name"),
+            ("Name", "postiz"),
+            ("EndpointID", "bad"),
+            ("MacAddress", "01:42:0a:00:01:fa"),
+            ("IPv4Address", "10.0.1.0/24"),
+            ("IPv6Address", "fd00::fa/64"),
+        )
+        for field, value in unrelated_mutations:
+            with self.subTest(field=f"unrelated-{field}", value=value):
+                containers = runtime_containers(compose)
+                networks = runtime_networks(compose, containers)
+                overlay = named_network(networks, "dokploy-network")
+                unrelated_id = hashlib.sha256(b"external-dokploy-member").hexdigest()
+                overlay["Containers"][unrelated_id][field] = value
+                self.rejected(compose=compose, containers=containers, networks=networks)
+
+        containers = runtime_containers(compose)
+        networks = runtime_networks(compose, containers)
+        bridge = named_network(networks, "postiz_postiz-internal")
+        bridge["Containers"]["lb-postiz_postiz-internal"] = {
+            "Name": "postiz_postiz-internal-endpoint",
+            "EndpointID": hashlib.sha256(b"bridge-lb-endpoint").hexdigest(),
+            "MacAddress": "02:42:c0:a8:10:fa",
+            "IPv4Address": "192.168.16.250/20",
+            "IPv6Address": "",
+        }
+        self.rejected(compose=compose, containers=containers, networks=networks)
+
+    def test_container_network_cross_view_gateway_and_identity_fail_closed(self) -> None:
+        compose = live_v53_compose_shape()
+        mutations = (
+            ("NetworkID", "x" * 25),
+            ("EndpointID", "0" * 64),
+            ("Gateway", "10.0.1.1"),
+            ("IPv6Gateway", "fd00::1"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field, value=value):
+                containers = runtime_containers(compose)
+                networks = runtime_networks(compose, containers)
+                postiz = next(item for item in containers if item["Name"] == "/postiz")
+                postiz["NetworkSettings"]["Networks"]["dokploy-network"][field] = value
+                self.rejected(compose=compose, containers=containers, networks=networks)
+
+        containers = runtime_containers(compose)
+        networks = runtime_networks(compose, containers)
+        postgres = next(item for item in containers if item["Name"] == "/postiz-postgres")
+        postgres["NetworkSettings"]["Networks"]["postiz_postiz-internal"][
+            "Gateway"
+        ] = "192.168.16.2"
+        self.rejected(compose=compose, containers=containers, networks=networks)
+
+        containers = runtime_containers(compose)
+        networks = runtime_networks(compose, containers)
+        postiz = next(item for item in containers if item["Name"] == "/postiz")
+        named_network(networks, "dokploy-network")["Containers"][postiz["Id"]][
+            "Name"
+        ] = "wrong-name"
+        self.rejected(compose=compose, containers=containers, networks=networks)
+
+        for field, value in (("Gateway", "10.0.1.1"), ("IPv6Gateway", "fd00::1")):
+            with self.subTest(state="writer-fenced", field=field):
+                containers = runtime_containers(compose, "writer-fenced")
+                networks = runtime_networks(compose, containers)
+                postiz = next(item for item in containers if item["Name"] == "/postiz")
+                postiz["NetworkSettings"]["Networks"]["dokploy-network"][field] = value
+                self.rejected(
+                    compose=compose,
+                    containers=containers,
+                    networks=networks,
+                    runtime_state="writer-fenced",
+                )
+
+    def test_private_bridge_has_exact_postiz_members_but_overlay_inventory_is_dynamic(
+        self,
+    ) -> None:
+        compose = live_v53_compose_shape()
+        containers = runtime_containers(compose)
+        networks = runtime_networks(compose, containers)
+        bridge = named_network(networks, "postiz_postiz-internal")
+        add_valid_overlay_member(
+            bridge, "unexpected-private-member", "192.168.16.250", "02:42:c0:a8:10:fa"
+        )
+        self.rejected(compose=compose, containers=containers, networks=networks)
+
+        for source, field, value in (
+            ("dokploy-network", "driver", "bridge"),
+            ("postiz-internal", "driver", "overlay"),
+            ("postiz-internal", "external", True),
+        ):
+            with self.subTest(source=source, field=field, value=value):
+                changed = live_v53_compose_shape()
+                changed["networks"][source][field] = value
+                self.rejected(compose=changed)
+
+        role_mutations = (
+            ("postiz", {"postiz-internal": None}),
+            ("postiz", {"dokploy-network": None}),
+            (
+                "postiz-postgres",
+                {"dokploy-network": None, "postiz-internal": None},
+            ),
+            (
+                "postiz-redis",
+                {"dokploy-network": None, "postiz-internal": None},
+            ),
+            (
+                "postiz-temporal",
+                {"dokploy-network": None, "postiz-internal": None},
+            ),
+        )
+        for service, service_networks in role_mutations:
+            with self.subTest(service=service, networks=service_networks):
+                changed = live_v53_compose_shape()
+                changed["services"][service]["networks"] = service_networks
+                self.rejected(compose=changed)
+
+    def test_reserved_service_endpoint_names_reject_spoofs_in_both_phases(self) -> None:
+        compose = live_v53_compose_shape()
+        for runtime_state in ("preflight", "writer-fenced"):
+            for ordinal, reserved_name in enumerate(sorted(manifest_module.JOURNAL_SERVICES), 100):
+                with self.subTest(runtime_state=runtime_state, reserved_name=reserved_name):
+                    containers = runtime_containers(compose, runtime_state)
+                    networks = runtime_networks(compose, containers)
+                    overlay = named_network(networks, "dokploy-network")
+                    spoof_id = add_valid_overlay_member(
+                        overlay,
+                        f"spoof-{runtime_state}-{reserved_name}",
+                        f"10.0.1.{ordinal}",
+                        f"02:42:0a:00:01:{ordinal:02x}",
+                    )
+                    overlay["Containers"][spoof_id]["Name"] = reserved_name
+                    self.rejected(
+                        compose=compose,
+                        containers=containers,
+                        networks=networks,
+                        runtime_state=runtime_state,
+                    )
+
+    def test_endpoint_names_are_canonical_lowercase_and_unique_in_both_phases(
+        self,
+    ) -> None:
+        compose = live_v53_compose_shape()
+        for runtime_state in ("preflight", "writer-fenced"):
+            for ordinal, bad_name in enumerate(
+                ("POSTIZ", "Postiz", "postiz.", "POSTIZ-REDIS"), 120
+            ):
+                with self.subTest(runtime_state=runtime_state, bad_name=bad_name):
+                    containers = runtime_containers(compose, runtime_state)
+                    networks = runtime_networks(compose, containers)
+                    overlay = named_network(networks, "dokploy-network")
+                    spoof_id = add_valid_overlay_member(
+                        overlay,
+                        f"case-spoof-{runtime_state}-{ordinal}",
+                        f"10.0.1.{ordinal}",
+                        f"02:42:0a:00:01:{ordinal:02x}",
+                    )
+                    overlay["Containers"][spoof_id]["Name"] = bad_name
+                    self.rejected(
+                        compose=compose,
+                        containers=containers,
+                        networks=networks,
+                        runtime_state=runtime_state,
+                    )
+
+            containers = runtime_containers(compose, runtime_state)
+            networks = runtime_networks(compose, containers)
+            overlay = named_network(networks, "dokploy-network")
+            first_id = add_valid_overlay_member(
+                overlay,
+                f"canonical-duplicate-a-{runtime_state}",
+                "10.0.1.130",
+                "02:42:0a:00:01:82",
+            )
+            second_id = add_valid_overlay_member(
+                overlay,
+                f"canonical-duplicate-b-{runtime_state}",
+                "10.0.1.131",
+                "02:42:0a:00:01:83",
+            )
+            overlay["Containers"][first_id]["Name"] = "canonical-peer"
+            overlay["Containers"][second_id]["Name"] = "canonical-peer"
+            with self.subTest(runtime_state=runtime_state, bad_name="canonical-duplicate"):
+                self.rejected(
+                    compose=compose,
+                    containers=containers,
+                    networks=networks,
+                    runtime_state=runtime_state,
+                )
+
     def test_image_defaults_are_exact_and_compose_environment_overrides_them(self) -> None:
         compose = live_v53_compose_shape()
         containers = runtime_containers(compose)
@@ -443,7 +866,7 @@ class ComposeRuntimeContractFixtures(unittest.TestCase):
         )
 
         stopped["NetworkSettings"]["Networks"]["dokploy-network"]["IPAddress"] = (
-            "172.31.0.10"
+            "10.0.1.10"
         )
         self.rejected(
             compose=compose,
@@ -562,9 +985,9 @@ class ComposeRuntimeContractFixtures(unittest.TestCase):
         for gateway in (
             None,
             "not-an-ip",
-            "172.30.1.1",
-            "172.30.0.0",
-            "172.30.0.255",
+            "192.168.32.1",
+            "192.168.16.0",
+            "192.168.31.255",
         ):
             with self.subTest(gateway=gateway):
                 containers = runtime_containers(compose)
@@ -589,11 +1012,11 @@ class ComposeRuntimeContractFixtures(unittest.TestCase):
         networks = runtime_networks(compose, containers)
         internal = next(item for item in networks if item["Name"] == "postiz_postiz-internal")
         internal["IPAM"]["Config"][0].update(
-            {"Subnet": "172.30.0.0/15", "Gateway": "172.30.0.1"}
+            {"Subnet": "10.0.0.0/23", "Gateway": "10.0.0.1"}
         )
         self.rejected(compose=compose, containers=containers, networks=networks)
 
-        for endpoint_ip in ("172.30.0.0", "172.30.0.1", "172.30.0.255"):
+        for endpoint_ip in ("192.168.16.0", "192.168.16.1", "192.168.31.255"):
             with self.subTest(endpoint_ip=endpoint_ip):
                 containers = runtime_containers(compose)
                 networks = runtime_networks(compose, containers)
@@ -604,7 +1027,7 @@ class ComposeRuntimeContractFixtures(unittest.TestCase):
                     item for item in containers if item["Name"] == "/postiz-postgres"
                 )
                 internal["Containers"][postgres["Id"]]["IPv4Address"] = (
-                    f"{endpoint_ip}/24"
+                    f"{endpoint_ip}/20"
                 )
                 postgres["NetworkSettings"]["Networks"]["postiz_postiz-internal"][
                     "IPAddress"
@@ -800,16 +1223,18 @@ class ComposeRuntimeContractFixtures(unittest.TestCase):
         networks = runtime_networks(compose, containers)
         postiz = next(item for item in containers if item["Name"] == "/postiz")
         postiz["NetworkSettings"]["Networks"]["dokploy-network"]["IPAddress"] = (
-            "172.31.0.99"
+            "10.0.1.98"
         )
         self.rejected(compose=compose, containers=containers, networks=networks)
 
         containers = runtime_containers(compose)
         networks = runtime_networks(compose, containers)
         postiz = next(item for item in containers if item["Name"] == "/postiz")
-        postiz["NetworkSettings"]["Networks"]["dokploy-network"]["IPAddress"] = "10.0.0.9"
+        postiz["NetworkSettings"]["Networks"]["dokploy-network"]["IPAddress"] = (
+            "203.0.113.9"
+        )
         external = next(item for item in networks if item["Name"] == "dokploy-network")
-        external["Containers"][postiz["Id"]]["IPv4Address"] = "10.0.0.9/24"
+        external["Containers"][postiz["Id"]]["IPv4Address"] = "203.0.113.9/24"
         self.rejected(compose=compose, containers=containers, networks=networks)
 
         containers = runtime_containers(compose)
@@ -826,7 +1251,7 @@ class ComposeRuntimeContractFixtures(unittest.TestCase):
         networks = runtime_networks(compose, containers)
         postiz = next(item for item in containers if item["Name"] == "/postiz")
         postiz["NetworkSettings"]["Networks"]["dokploy-network"]["MacAddress"] = (
-            "02:42:ac:1f:00:ff"
+            "02:42:0a:00:01:ff"
         )
         self.rejected(compose=compose, containers=containers, networks=networks)
 

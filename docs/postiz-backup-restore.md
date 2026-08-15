@@ -42,11 +42,32 @@ root-only journal vytvořený a fsyncnutý před prvním stopem. Před fence ov�
   vzniklé přepsáním image defaults explicitními Compose hodnotami, bez extra,
   chybějících nebo duplicitních klíčů;
 - exact persistent mounts, cross-checked container/network-inspect endpoint IDs,
-  aliases, IPv4/prefix, disabled IPv6, MAC a nulové host port bindings. Network
-  source→resolved names i NetworkID jsou bijektivní; endpoint ID jsou globálně
-  unikátní a IPv4/MAC unikátní v každé síti. IPv4 IPAM subnets jsou canonical,
-  vzájemně se nepřekrývají a mají usable in-subnet Gateway; endpoint nesmí být
-  network, broadcast ani Gateway adresa. Preflight vyžaduje čtyři stabilně
+  aliases, IPv4/prefix, bridge Gateway (u swarm overlay exact prázdný container
+  Gateway), disabled IPv6/IPv6Gateway, MAC a nulové host port
+  bindings. Privátní síť je exact `bridge/local` s 64hex ID a pouze aktuálními
+  čtyřmi Postiz endpointy; sdílená `dokploy-network` je `overlay/swarm` s
+  25znakovým lower-alnum ID a binduje pouze očekávaný Postiz endpoint, zatímco
+  ostatní 64hex členy se validují strukturálně bez zmrazení jejich inventory.
+  Role jsou pevná matice, ne tvrzení dodané Compose modelem: `postiz` musí být
+  právě na private+shared, PostgreSQL/Redis/Temporal právě na private. Rezervovaná
+  jména těchto čtyř služeb smí v network inspect patřit pouze exact očekávanému
+  container ID v dané síti a capture fázi; po writer fence se respektuje dočasné
+  jméno PostgreSQL a žádný cizí člen nesmí spoofovat původní service name.
+  Každé endpoint `Name` musí být už v canonical lowercase ASCII tvaru bez
+  trailing dot; unikátnost i reserved-name binding se vyhodnocují nad canonical
+  DNS jménem v každé síti.
+  Jediná povolená ne-64hex položka overlaye je povinný
+  `lb-dokploy-network` s exact názvem `dokploy-network-endpoint` a validním,
+  nekolidujícím endpoint ID/IP/MAC. Name/ID, driver, scope, internal/attachable/
+  ingress a IPv4/IPv6 flags jsou fail-closed. Bridge options jsou exact `{}`;
+  overlay má jedinou option `com.docker.network.driver.overlay.vxlanid_list`
+  s canonical decimálním VNI v rozsahu VXLAN, pro tento live baseline exact
+  `4097`. IPAM je exact default driver/null options. Network source→resolved
+  names i NetworkID jsou bijektivní;
+  endpoint ID jsou globálně unikátní a IPv4/MAC unikátní v každé síti. IPv4
+  IPAM subnets jsou canonical, vzájemně se nepřekrývají a mají usable in-subnet
+  Gateway; endpoint nesmí být network, broadcast ani Gateway adresa. Preflight
+  vyžaduje čtyři stabilně
   `running` kontejnery a active endpointy; jejich `FinishedAt` je Docker zero
   sentinel nebo syntakticky validní nenulový Docker timestamp. Writer-fenced stav vyžaduje
   stabilně `running` pouze přejmenovaný Postgres; tři zastavené writery musí být exact
