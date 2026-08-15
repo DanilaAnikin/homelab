@@ -9,12 +9,14 @@ counts that shell callers can safely consume.
 from __future__ import annotations
 
 import argparse
+import copy
 import configparser
 import datetime as dt
 import gzip
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -44,12 +46,20 @@ MAX_CONFIG_ARCHIVE_EXPANDED_BYTES = 64 * 1024**2
 MAX_PHYSICAL_ARCHIVE_MEMBERS = 1_000_000
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TIMESTAMP_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
+DOCKER_FINISHED_AT_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$"
+)
+DOCKER_ZERO_TIME = "0001-01-01T00:00:00Z"
 ACCOUNT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,62}[a-z0-9]$")
 SAFE_PATH_RE = re.compile(
     r"^(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*$"
 )
 SAFE_REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+POSTIZ_NO_DEPS_DEPENDENCIES = {
+    "postiz-postgres": {"condition": "service_started", "required": True},
+    "postiz-redis": {"condition": "service_started", "required": True},
+}
 EXPECTED_CONFIG_MEMBERS = {
     "etc/homelab/postiz-backup-source-revision",
     "etc/systemd/system/backup.service",
@@ -1756,87 +1766,610 @@ def command_verify_config_source(args: argparse.Namespace) -> None:
             os.close(descriptor)
 
 
-def command_verify_compose_runtime(args: argparse.Namespace) -> None:
-    compose = _load_json(Path(args.compose_json))
-    containers = _load_json_value(Path(args.container_json))
+def _load_exact_compose_model(path: Path, label: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    compose = _load_json(path)
     services = compose.get("services") if isinstance(compose, dict) else None
-    if not isinstance(services, dict) or set(services) != JOURNAL_SERVICES:
-        _die("resolved Compose runtime lacks the exact Postiz service set")
-    if not isinstance(containers, list) or len(containers) != len(JOURNAL_SERVICES):
-        _die("container runtime evidence lacks the exact Postiz service set")
+    if compose.get("name") != "postiz" or not isinstance(services, dict) \
+            or set(services) != JOURNAL_SERVICES:
+        _die(f"{label} lacks the exact Postiz project/service set")
+    if any(not isinstance(definition, dict) for definition in services.values()):
+        _die(f"{label} has an invalid service definition")
+    return compose, services
+
+
+def _postiz_no_deps_projection(compose: dict[str, Any]) -> dict[str, Any]:
+    services = compose.get("services")
+    postiz = services.get("postiz") if isinstance(services, dict) else None
+    if not isinstance(postiz, dict) or postiz.get("depends_on") != POSTIZ_NO_DEPS_DEPENDENCIES:
+        _die("resolved Postiz depends_on differs from the exact Docker Compose v5 shape")
+    projection = copy.deepcopy(compose)
+    del projection["services"]["postiz"]["depends_on"]
+    return projection
+
+
+def command_write_compose_no_deps_model(args: argparse.Namespace) -> None:
+    compose, _services = _load_exact_compose_model(
+        Path(args.compose_json), "resolved full Compose runtime"
+    )
+    _atomic_json(Path(args.output), _postiz_no_deps_projection(compose))
+
+
+def _load_compose_hashes(path: Path, expected: set[str], label: str) -> dict[str, str]:
     hashes: dict[str, str] = {}
     try:
-        for raw_line in Path(args.compose_hashes).read_text(encoding="utf-8").splitlines():
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
             parts = raw_line.split()
             if (
                 len(parts) != 2
-                or parts[0] not in JOURNAL_SERVICES
+                or parts[0] not in expected
                 or parts[0] in hashes
-                or not re.fullmatch(r"[0-9a-f]{64}", parts[1])
+                or not SHA256_RE.fullmatch(parts[1])
             ):
-                _die("resolved Compose service hash output is invalid")
+                _die(f"{label} is invalid")
             hashes[parts[0]] = parts[1]
     except (OSError, UnicodeDecodeError) as exc:
-        _die(f"cannot read resolved Compose service hashes: {exc}")
-    if set(hashes) != JOURNAL_SERVICES:
-        _die("resolved Compose service hash set differs")
+        _die(f"cannot read {label}: {exc}")
+    if set(hashes) != expected:
+        _die(f"{label} set differs")
+    return hashes
+
+
+def _resolved_resource_name(compose: dict[str, Any], section: str, source: Any) -> str:
+    resources = compose.get(section)
+    definition = resources.get(source) if isinstance(resources, dict) else None
+    name = definition.get("name") if isinstance(definition, dict) else None
+    if not isinstance(source, str) or not isinstance(name, str) or not name:
+        _die(f"resolved Compose {section} resource is invalid")
+    return name
+
+
+def _resolved_network_names(compose: dict[str, Any]) -> dict[str, str]:
+    resources = compose.get("networks")
+    if not isinstance(resources, dict) or not resources:
+        _die("resolved Compose network resource map is invalid")
+    names: dict[str, str] = {}
+    resolved_names: set[str] = set()
+    for source, definition in resources.items():
+        name = definition.get("name") if isinstance(definition, dict) else None
+        if (
+            not isinstance(source, str)
+            or not source
+            or not isinstance(name, str)
+            or not name
+            or name in resolved_names
+        ):
+            _die("resolved Compose network resource names are not bijective/distinct")
+        names[source] = name
+        resolved_names.add(name)
+    return names
+
+
+def _network_endpoint_ipv4(
+    raw_value: Any,
+    ipam: tuple[tuple[ipaddress.IPv4Network, ipaddress.IPv4Address], ...],
+) -> ipaddress.IPv4Interface:
+    try:
+        endpoint = ipaddress.ip_interface(raw_value) if isinstance(raw_value, str) else None
+    except ValueError as exc:
+        _die(f"Docker network endpoint IPv4 evidence is invalid: {exc}")
+    matching = (
+        [(subnet, gateway) for subnet, gateway in ipam if endpoint.ip in subnet]
+        if isinstance(endpoint, ipaddress.IPv4Interface)
+        else []
+    )
+    if (
+        not isinstance(endpoint, ipaddress.IPv4Interface)
+        or str(endpoint) != raw_value
+        or len(matching) != 1
+        or endpoint.network != matching[0][0]
+        or endpoint.ip in {
+            matching[0][0].network_address,
+            matching[0][0].broadcast_address,
+            matching[0][1],
+        }
+        or endpoint.ip.is_unspecified
+        or endpoint.ip.is_loopback
+        or endpoint.ip.is_multicast
+    ):
+        _die("Docker network endpoint IPv4/prefix is outside usable IPAM hosts")
+    return endpoint
+
+
+def _verify_container_state(state: dict[str, Any], running: bool) -> None:
+    expected_status = "running" if running else "exited"
+    finished_at = state.get("FinishedAt")
+    if (
+        state.get("Status") != expected_status
+        or state.get("Running") is not running
+        or state.get("Paused") is not False
+        or state.get("Restarting") is not False
+        or state.get("Dead") is not False
+        or type(state.get("ExitCode")) is not int
+        or state.get("ExitCode") != 0
+    ):
+        _die("container runtime state is not the exact stable capture phase")
+    if running and finished_at == DOCKER_ZERO_TIME:
+        return
+    if not isinstance(finished_at, str) or not DOCKER_FINISHED_AT_RE.fullmatch(finished_at):
+        _die("container Docker FinishedAt is invalid")
+    try:
+        finished_second = dt.datetime.strptime(finished_at[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError as exc:
+        _die(f"container Docker FinishedAt is invalid: {exc}")
+    if finished_at == DOCKER_ZERO_TIME or finished_second.year < 1970:
+        _die("container Docker FinishedAt is not a valid non-zero exit timestamp")
+
+
+def _verify_container_topology(
+    compose: dict[str, Any],
+    service: str,
+    definition: dict[str, Any],
+    container: dict[str, Any],
+    running: bool,
+    network_evidence: dict[
+        str,
+        tuple[
+            dict[str, Any],
+            tuple[tuple[ipaddress.IPv4Network, ipaddress.IPv4Address], ...],
+        ],
+    ],
+) -> None:
+    expected_name = definition.get("container_name")
+    if expected_name != service:
+        _die("resolved Compose container_name differs from the exact service name")
+
+    compose_networks = definition.get("networks")
+    if not isinstance(compose_networks, dict) or not compose_networks:
+        _die("resolved Compose service network set is invalid")
+    expected_networks: set[str] = set()
+    for source, attachment in compose_networks.items():
+        if attachment not in (None, {}):
+            _die("resolved Compose service has unsupported network attachment options")
+        expected_networks.add(_resolved_resource_name(compose, "networks", source))
+    network_settings = container.get("NetworkSettings")
+    actual_networks = network_settings.get("Networks") \
+        if isinstance(network_settings, dict) else None
+    if not isinstance(actual_networks, dict) or set(actual_networks) != expected_networks:
+        _die("running container network set differs from resolved Compose")
+    container_id = container.get("Id")
+    container_name = container.get("Name")
+    for network_name, network in actual_networks.items():
+        aliases = network.get("Aliases") if isinstance(network, dict) else None
+        record, ipam = network_evidence[network_name]
+        network_id = record.get("Id")
+        record_containers = record.get("Containers")
+        endpoint = record_containers.get(container_id) \
+            if isinstance(record_containers, dict) else None
+        endpoint_id = network.get("EndpointID") if isinstance(network, dict) else None
+        if aliases != [service, service]:
+            _die("running container network aliases differ from resolved Compose")
+        if not isinstance(network, dict) or network.get("NetworkID") != network_id:
+            _die("container/network inspect network identity differs")
+        if not running:
+            if (
+                endpoint is not None
+                or network.get("EndpointID") != ""
+                or network.get("IPAddress") != ""
+                or network.get("IPPrefixLen") != 0
+                or network.get("GlobalIPv6Address") != ""
+                or network.get("GlobalIPv6PrefixLen") != 0
+                or network.get("MacAddress") != ""
+            ):
+                _die("stopped container unexpectedly retains an active network endpoint")
+            continue
+        if (
+            not isinstance(endpoint, dict)
+            or endpoint.get("Name") != str(container_name).removeprefix("/")
+            or not isinstance(endpoint_id, str)
+            or not SHA256_RE.fullmatch(endpoint_id)
+            or endpoint.get("EndpointID") != endpoint_id
+        ):
+            _die("container/network inspect endpoint identity differs")
+        ipv4 = _network_endpoint_ipv4(endpoint.get("IPv4Address"), ipam)
+        if (
+            str(ipv4.ip) != network.get("IPAddress")
+            or ipv4.network.prefixlen != network.get("IPPrefixLen")
+        ):
+            _die("container/network inspect IPv4 address/prefix differs")
+        if (
+            endpoint.get("IPv6Address") != ""
+            or network.get("GlobalIPv6Address") != ""
+            or network.get("GlobalIPv6PrefixLen") != 0
+        ):
+            _die("IPv6 is unexpectedly enabled on a Postiz runtime network")
+        mac_address = network.get("MacAddress")
+        if (
+            not isinstance(mac_address, str)
+            or not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac_address)
+            or mac_address == "00:00:00:00:00:00"
+            or int(mac_address[:2], 16) & 1
+            or endpoint.get("MacAddress") != mac_address
+        ):
+            _die("container/network inspect MAC address differs or is invalid")
+
+    compose_mounts = definition.get("volumes", [])
+    if compose_mounts is None:
+        compose_mounts = []
+    if not isinstance(compose_mounts, list):
+        _die("resolved Compose service volume set is invalid")
+    expected_mounts: set[tuple[str, str, str, bool]] = set()
+    allowed_mount_fields = {"type", "source", "target", "read_only", "volume"}
+    for mount in compose_mounts:
+        if not isinstance(mount, dict) or not {"type", "source", "target"} <= set(mount) \
+                or set(mount) - allowed_mount_fields:
+            _die("resolved Compose volume attachment shape is invalid")
+        if mount.get("type") != "volume" or mount.get("volume", {}) != {}:
+            _die("resolved Compose service has an unsupported volume attachment")
+        target = mount.get("target")
+        read_only = mount.get("read_only", False)
+        if not isinstance(target, str) or not target.startswith("/") or not isinstance(read_only, bool):
+            _die("resolved Compose volume target/options are invalid")
+        expected_mounts.add(
+            (
+                "volume",
+                _resolved_resource_name(compose, "volumes", mount.get("source")),
+                target,
+                not read_only,
+            )
+        )
+    raw_mounts = container.get("Mounts")
+    if not isinstance(raw_mounts, list):
+        _die("container runtime mount evidence is invalid")
+    actual_mounts: set[tuple[str, str, str, bool]] = set()
+    for mount in raw_mounts:
+        if not isinstance(mount, dict):
+            _die("container runtime mount entry is invalid")
+        item = (mount.get("Type"), mount.get("Name"), mount.get("Destination"), mount.get("RW"))
+        if (
+            not all(isinstance(value, str) for value in item[:3])
+            or not isinstance(item[3], bool)
+            or item in actual_mounts
+        ):
+            _die("container runtime mount entry is invalid or duplicate")
+        actual_mounts.add(item)
+    if actual_mounts != expected_mounts:
+        _die("running container mount set differs from resolved Compose")
+
+    if definition.get("ports") not in (None, []):
+        _die("resolved Compose unexpectedly publishes a host port")
+    host_config = container.get("HostConfig")
+    port_bindings = host_config.get("PortBindings") if isinstance(host_config, dict) else None
+    if not isinstance(host_config, dict) or port_bindings not in (None, {}):
+        _die("running container unexpectedly publishes a host port")
+
+
+def _parse_environment_list(value: Any, label: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, list):
+        _die(f"{label} is not a list")
+    environment: dict[str, str] = {}
+    for item in value:
+        if not isinstance(item, str) or "=" not in item:
+            _die(f"{label} has an invalid entry")
+        key, item_value = item.split("=", 1)
+        if not key or key in environment:
+            _die(f"{label} has a duplicate/empty key")
+        environment[key] = item_value
+    return environment
+
+
+def _compose_environment(definition: dict[str, Any]) -> dict[str, str]:
+    value = definition.get("environment", {})
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        _die("resolved Compose environment is not canonical")
+    environment: dict[str, str] = {}
+    for key, item_value in value.items():
+        if not isinstance(key, str) or not key:
+            _die("resolved Compose environment key is invalid")
+        if item_value is None:
+            expected_value = ""
+        elif isinstance(item_value, str):
+            expected_value = item_value
+        else:
+            _die("resolved Compose environment value is invalid")
+        environment[key] = expected_value
+    return environment
+
+
+def _load_expected_service_images(values: list[str]) -> dict[str, str]:
+    images: dict[str, str] = {}
+    for value in values:
+        parts = value.split("|")
+        if (
+            len(parts) != 2
+            or parts[0] not in JOURNAL_SERVICES
+            or parts[0] in images
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", parts[1])
+            or parts[1] in images.values()
+        ):
+            _die("expected service/image identity is invalid or duplicate")
+        images[parts[0]] = parts[1]
+    if set(images) != JOURNAL_SERVICES:
+        _die("expected service/image identity set differs")
+    return images
+
+
+def _load_image_inspect_evidence(
+    path: Path, expected_images: dict[str, str]
+) -> dict[str, dict[str, str]]:
+    value = _load_json_value(path)
+    if not isinstance(value, list) or len(value) != len(JOURNAL_SERVICES):
+        _die("Docker image inspect evidence lacks the exact Postiz image set")
+    images: dict[str, dict[str, str]] = {}
+    for record in value:
+        if not isinstance(record, dict):
+            _die("Docker image inspect evidence has an invalid record")
+        image_id = record.get("Id")
+        config = record.get("Config")
+        if (
+            not isinstance(image_id, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)
+            or image_id in images
+            or not isinstance(config, dict)
+            or "Env" not in config
+        ):
+            _die("Docker image inspect identity/config evidence is invalid or duplicate")
+        images[image_id] = _parse_environment_list(
+            config.get("Env"), "Docker image default environment"
+        )
+    if set(images) != set(expected_images.values()):
+        _die("Docker image inspect IDs differ from the expected service/image set")
+    return images
+
+
+def _load_network_inspect_evidence(
+    path: Path, expected_names: set[str]
+) -> dict[
+    str,
+    tuple[
+        dict[str, Any],
+        tuple[tuple[ipaddress.IPv4Network, ipaddress.IPv4Address], ...],
+    ],
+]:
+    value = _load_json_value(path)
+    if not isinstance(value, list) or len(value) != len(expected_names):
+        _die("Docker network inspect evidence lacks the exact Compose network set")
+    networks: dict[
+        str,
+        tuple[
+            dict[str, Any],
+            tuple[tuple[ipaddress.IPv4Network, ipaddress.IPv4Address], ...],
+        ],
+    ] = {}
+    network_ids: set[str] = set()
+    endpoint_ids: set[str] = set()
+    all_subnets: list[ipaddress.IPv4Network] = []
+    for record in value:
+        if not isinstance(record, dict):
+            _die("Docker network inspect evidence has an invalid record")
+        name = record.get("Name")
+        network_id = record.get("Id")
+        containers = record.get("Containers")
+        ipam = record.get("IPAM")
+        raw_subnets = ipam.get("Config") if isinstance(ipam, dict) else None
+        if (
+            not isinstance(name, str)
+            or name not in expected_names
+            or name in networks
+            or not isinstance(network_id, str)
+            or not SHA256_RE.fullmatch(network_id)
+            or network_id in network_ids
+            or record.get("EnableIPv6") is not False
+            or not isinstance(containers, dict)
+            or any(not isinstance(key, str) or not SHA256_RE.fullmatch(key) for key in containers)
+            or not isinstance(raw_subnets, list)
+            or not raw_subnets
+        ):
+            _die("Docker network inspect identity/IPAM evidence is invalid or duplicate")
+        network_ids.add(network_id)
+        ipam_entries: list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Address]] = []
+        try:
+            for item in raw_subnets:
+                raw_subnet = item.get("Subnet") if isinstance(item, dict) else None
+                raw_gateway = item.get("Gateway") if isinstance(item, dict) else None
+                if not isinstance(raw_subnet, str) or not isinstance(raw_gateway, str):
+                    _die("Docker network inspect IPAM subnet evidence is invalid")
+                subnet = ipaddress.ip_network(raw_subnet, strict=True)
+                gateway = ipaddress.ip_address(raw_gateway)
+                if (
+                    not isinstance(subnet, ipaddress.IPv4Network)
+                    or not isinstance(gateway, ipaddress.IPv4Address)
+                    or str(subnet) != raw_subnet
+                    or str(gateway) != raw_gateway
+                    or subnet.num_addresses < 4
+                    or gateway not in subnet
+                    or gateway in {subnet.network_address, subnet.broadcast_address}
+                    or gateway.is_unspecified
+                    or gateway.is_loopback
+                    or gateway.is_multicast
+                    or any(subnet.overlaps(existing) for existing in all_subnets)
+                ):
+                    _die(
+                        "Docker network inspect IPv4 subnet/Gateway is invalid or overlapping"
+                    )
+                ipam_entries.append((subnet, gateway))
+                all_subnets.append(subnet)
+        except ValueError as exc:
+            _die(f"Docker network inspect IPAM subnet evidence is invalid: {exc}")
+        network_ipv4: set[ipaddress.IPv4Address] = set()
+        network_macs: set[str] = set()
+        for container_id, endpoint in containers.items():
+            endpoint_id = endpoint.get("EndpointID") if isinstance(endpoint, dict) else None
+            endpoint_name = endpoint.get("Name") if isinstance(endpoint, dict) else None
+            mac_address = endpoint.get("MacAddress") if isinstance(endpoint, dict) else None
+            if (
+                not isinstance(endpoint_name, str)
+                or not endpoint_name
+                or not isinstance(endpoint_id, str)
+                or not SHA256_RE.fullmatch(endpoint_id)
+                or endpoint_id in endpoint_ids
+                or not isinstance(mac_address, str)
+                or not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac_address)
+                or mac_address == "00:00:00:00:00:00"
+                or int(mac_address[:2], 16) & 1
+                or mac_address in network_macs
+                or endpoint.get("IPv6Address") != ""
+            ):
+                _die("Docker network endpoint identity/MAC/IPv6 evidence is invalid")
+            ipv4 = _network_endpoint_ipv4(endpoint.get("IPv4Address"), tuple(ipam_entries))
+            if ipv4.ip in network_ipv4:
+                _die("Docker network endpoint IPv4 address is duplicate")
+            endpoint_ids.add(endpoint_id)
+            network_macs.add(mac_address)
+            network_ipv4.add(ipv4.ip)
+        networks[name] = (record, tuple(ipam_entries))
+    if set(networks) != expected_names:
+        _die("Docker network inspect name set differs from resolved Compose")
+    return networks
+
+
+def command_verify_compose_runtime(args: argparse.Namespace) -> None:
+    compose, services = _load_exact_compose_model(
+        Path(args.compose_json), "resolved full Compose runtime"
+    )
+    no_deps_compose, _no_deps_services = _load_exact_compose_model(
+        Path(args.postiz_no_deps_compose_json), "resolved Postiz --no-deps Compose runtime"
+    )
+    if no_deps_compose != _postiz_no_deps_projection(compose):
+        _die("resolved Postiz --no-deps model differs by more than depends_on")
+    containers = _load_json_value(Path(args.container_json))
+    if not isinstance(containers, list) or len(containers) != len(JOURNAL_SERVICES):
+        _die("container runtime evidence lacks the exact Postiz service set")
+    expected_images = _load_expected_service_images(args.expected_image)
+    images = _load_image_inspect_evidence(Path(args.image_inspect_json), expected_images)
+    network_names = _resolved_network_names(compose)
+    referenced_network_sources: set[str] = set()
+    for definition in services.values():
+        service_networks = definition.get("networks")
+        if not isinstance(service_networks, dict) or not service_networks:
+            _die("resolved Compose service network set is invalid")
+        for source in service_networks:
+            if source not in network_names:
+                _die("resolved Compose service references an unknown network resource")
+            referenced_network_sources.add(source)
+    if referenced_network_sources != set(network_names):
+        _die("resolved Compose network resource map is not exactly referenced")
+    networks = _load_network_inspect_evidence(
+        Path(args.network_inspect_json), set(network_names.values())
+    )
+    hashes = _load_compose_hashes(
+        Path(args.compose_hashes), JOURNAL_SERVICES, "source-full Compose service hash output"
+    )
+    resolved_hashes = _load_compose_hashes(
+        Path(args.resolved_compose_hashes),
+        JOURNAL_SERVICES,
+        "reparsed resolved Compose service hash output",
+    )
+    no_deps_hash = _load_compose_hashes(
+        Path(args.postiz_no_deps_hash), {"postiz"}, "resolved Postiz --no-deps hash output"
+    )["postiz"]
+    if resolved_hashes["postiz"] != no_deps_hash:
+        _die("Postiz resolved and --no-deps effective Compose hashes differ")
+    if hashes["postiz"] == resolved_hashes["postiz"]:
+        _die("Postiz source-full and resolved effective Compose hashes unexpectedly match")
+    for service in JOURNAL_SERVICES - {"postiz"}:
+        if hashes[service] != resolved_hashes[service]:
+            _die("non-Postiz source-full and resolved Compose hashes differ")
+    expected_running_services = (
+        JOURNAL_SERVICES if args.runtime_state == "preflight" else {"postiz-postgres"}
+    )
     actual_by_name: dict[str, dict[str, str]] = {}
+    container_ids_by_service: dict[str, str] = {}
+    image_ids_by_service: dict[str, str] = {}
+    container_ids: set[str] = set()
+    used_image_ids: set[str] = set()
     for container in containers:
         if not isinstance(container, dict):
             _die("invalid container runtime evidence")
+        container_id = container.get("Id")
+        image_id = container.get("Image")
         name = container.get("Name")
         config = container.get("Config")
+        state = container.get("State")
         raw_environment = config.get("Env") if isinstance(config, dict) else None
-        if not isinstance(name, str) or not name.startswith("/") or not isinstance(
-            raw_environment, list
+        if (
+            not isinstance(container_id, str)
+            or not SHA256_RE.fullmatch(container_id)
+            or container_id in container_ids
+            or not isinstance(image_id, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)
+            or image_id not in images
+            or image_id in used_image_ids
+            or not isinstance(name, str)
+            or not name.startswith("/")
+            or not isinstance(state, dict)
         ):
-            _die("invalid container runtime identity/environment")
+            _die("invalid or duplicate container/image runtime identity")
+        container_ids.add(container_id)
+        used_image_ids.add(image_id)
         labels = config.get("Labels") if isinstance(config, dict) else None
         service = labels.get("com.docker.compose.service") if isinstance(labels, dict) else None
-        allowed_names = {f"/{service}"}
-        if service == "postiz-postgres":
-            allowed_names.add("/postiz-postgres-backup-fenced")
-        if service not in JOURNAL_SERVICES or service in actual_by_name or name not in allowed_names:
+        expected_name = (
+            "/postiz-postgres-backup-fenced"
+            if args.runtime_state == "writer-fenced" and service == "postiz-postgres"
+            else f"/{service}"
+        )
+        if service not in JOURNAL_SERVICES or service in actual_by_name or name != expected_name:
             _die("container runtime service/name set differs")
+        running = service in expected_running_services
+        _verify_container_state(state, running)
+        if image_id != expected_images[service]:
+            _die("running container image ID differs from the expected pinned service image")
+        expected_label_hash = no_deps_hash if service == "postiz" else hashes[service]
         if (
             not isinstance(labels, dict)
             or labels.get("com.docker.compose.project") != "postiz"
             or labels.get("com.docker.compose.service") != service
-            or labels.get("com.docker.compose.config-hash") != hashes[service]
+            or labels.get("com.docker.compose.config-hash") != expected_label_hash
         ):
             _die("running container is not the exact resolved Compose generation")
+        if service == "postiz" and labels.get("com.docker.compose.depends_on") != "":
+            _die("running Postiz dependency label is not the exact --no-deps generation")
         expected_image = services[service].get("image") if isinstance(services[service], dict) else None
         if not isinstance(expected_image, str) or config.get("Image") != expected_image:
             _die("running container configured image reference differs from Compose")
-        environment: dict[str, str] = {}
-        for item in raw_environment:
-            if not isinstance(item, str) or "=" not in item:
-                _die("invalid container environment entry")
-            key, value = item.split("=", 1)
-            if not key or key in environment:
-                _die("duplicate/empty container environment key")
-            environment[key] = value
+        _verify_container_topology(
+            compose, service, services[service], container, running, networks
+        )
+        environment = _parse_environment_list(raw_environment, "running container environment")
         actual_by_name[service] = environment
+        container_ids_by_service[service] = container_id
+        image_ids_by_service[service] = image_id
     if set(actual_by_name) != JOURNAL_SERVICES:
         _die("container runtime service set differs")
+    if used_image_ids != set(images):
+        _die("container runtime does not bind the exact Docker image inspect set")
+    compose_network_definitions = compose.get("networks")
+    if not isinstance(compose_network_definitions, dict):
+        _die("resolved Compose network definitions are invalid")
+    all_container_ids = set(container_ids_by_service.values())
+    for source, definition in compose_network_definitions.items():
+        network_name = _resolved_resource_name(compose, "networks", source)
+        if network_name not in networks:
+            continue
+        external = definition.get("external", False) if isinstance(definition, dict) else None
+        if not isinstance(external, bool):
+            _die("resolved Compose network definition is invalid")
+        expected_ids = {
+            container_ids_by_service[service]
+            for service, service_definition in services.items()
+            if service in expected_running_services
+            and source in service_definition.get("networks", {})
+        }
+        record_containers = networks[network_name][0].get("Containers")
+        actual_ids = set(record_containers) if isinstance(record_containers, dict) else set()
+        if actual_ids & all_container_ids != expected_ids:
+            _die("Docker network membership differs for the exact Postiz container IDs")
+        if not external and actual_ids != expected_ids:
+            _die("private Postiz Docker network contains an unexpected container")
     for service, definition in services.items():
-        expected_environment = definition.get("environment", {}) if isinstance(definition, dict) else None
-        if expected_environment is None:
-            expected_environment = {}
-        if not isinstance(expected_environment, dict):
-            _die("resolved Compose environment is not canonical")
-        actual_environment = actual_by_name[service]
-        for key, value in expected_environment.items():
-            if not isinstance(key, str):
-                _die("resolved Compose environment key is invalid")
-            if value is None:
-                expected_value = ""
-            elif isinstance(value, str):
-                expected_value = value
-            else:
-                _die("resolved Compose environment value is invalid")
-            if actual_environment.get(key) != expected_value:
-                _die("running container environment differs from encrypted runtime config")
+        expected_environment = dict(images[image_ids_by_service[service]])
+        expected_environment.update(_compose_environment(definition))
+        if actual_by_name[service] != expected_environment:
+            _die("running container environment differs from image defaults plus Compose")
 
 
 def command_config_archive_get(args: argparse.Namespace) -> None:
@@ -3789,10 +4322,24 @@ def build_parser() -> argparse.ArgumentParser:
     config_source.add_argument("--archive", required=True)
     config_source.set_defaults(func=command_verify_config_source)
 
+    compose_no_deps = subparsers.add_parser("write-compose-no-deps-model")
+    compose_no_deps.add_argument("--compose-json", required=True)
+    compose_no_deps.add_argument("--output", required=True)
+    compose_no_deps.set_defaults(func=command_write_compose_no_deps_model)
+
     compose_runtime = subparsers.add_parser("verify-compose-runtime")
     compose_runtime.add_argument("--compose-json", required=True)
     compose_runtime.add_argument("--compose-hashes", required=True)
+    compose_runtime.add_argument("--resolved-compose-hashes", required=True)
+    compose_runtime.add_argument("--postiz-no-deps-compose-json", required=True)
+    compose_runtime.add_argument("--postiz-no-deps-hash", required=True)
     compose_runtime.add_argument("--container-json", required=True)
+    compose_runtime.add_argument("--image-inspect-json", required=True)
+    compose_runtime.add_argument("--network-inspect-json", required=True)
+    compose_runtime.add_argument("--expected-image", action="append", default=[], required=True)
+    compose_runtime.add_argument(
+        "--runtime-state", choices=("preflight", "writer-fenced"), required=True
+    )
     compose_runtime.set_defaults(func=command_verify_compose_runtime)
 
     config_get = subparsers.add_parser("config-archive-get")

@@ -506,21 +506,53 @@ free_inodes=$(df --output=iavail "$STATE_ROOT" | tail -1 | tr -d '[:space:]')
 verify_compose_generation() {
   local suffix=$1
   local resolved_compose=$output_dir/runtime-compose-$suffix.json
-  local resolved_hashes=$output_dir/runtime-compose-$suffix-hashes.txt
+  local source_hashes=$output_dir/runtime-compose-$suffix-source-hashes.txt
+  local resolved_semantic_hashes=$output_dir/runtime-compose-$suffix-resolved-hashes.txt
+  local no_deps_input=$output_dir/runtime-compose-$suffix-no-deps-input.json
+  local no_deps_compose=$output_dir/runtime-compose-$suffix-no-deps.json
+  local no_deps_hash=$output_dir/runtime-compose-$suffix-no-deps-hash.txt
   local container_runtime=$output_dir/runtime-containers-$suffix.json
+  local image_runtime=$output_dir/runtime-images-$suffix.json
+  local network_runtime=$output_dir/runtime-networks-$suffix.json
   timeout --signal=TERM --kill-after=5s 30s docker compose \
     --env-file /srv/postiz/postiz.env -f /srv/postiz/docker-compose.yml \
     config --format json > "$resolved_compose"
   timeout --signal=TERM --kill-after=5s 30s docker compose \
     --env-file /srv/postiz/postiz.env -f /srv/postiz/docker-compose.yml \
-    config --hash '*' > "$resolved_hashes"
+    config --hash '*' > "$source_hashes"
+  timeout --signal=TERM --kill-after=5s 30s docker compose \
+    -f "$resolved_compose" config --hash '*' > "$resolved_semantic_hashes"
+  "$HELPER" write-compose-no-deps-model --compose-json "$resolved_compose" \
+    --output "$no_deps_input"
+  timeout --signal=TERM --kill-after=5s 30s docker compose \
+    -f "$no_deps_input" config --format json > "$no_deps_compose"
+  timeout --signal=TERM --kill-after=5s 30s docker compose \
+    -f "$no_deps_input" config --hash postiz > "$no_deps_hash"
   timeout --signal=TERM --kill-after=5s 20s docker inspect \
     "${container_ids[postiz]}" "${container_ids[postiz-postgres]}" \
     "${container_ids[postiz-redis]}" "${container_ids[postiz-temporal]}" > "$container_runtime"
-  chmod 600 "$resolved_compose" "$resolved_hashes" "$container_runtime"
+  timeout --signal=TERM --kill-after=5s 20s docker image inspect \
+    "${image_ids[postiz]}" "${image_ids[postiz-postgres]}" \
+    "${image_ids[postiz-redis]}" "${image_ids[postiz-temporal]}" > "$image_runtime"
+  timeout --signal=TERM --kill-after=5s 20s docker network inspect \
+    dokploy-network "$INTERNAL_NETWORK" > "$network_runtime"
+  chmod 600 "$resolved_compose" "$source_hashes" "$resolved_semantic_hashes" "$no_deps_input" \
+    "$no_deps_compose" "$no_deps_hash" "$container_runtime" "$image_runtime" "$network_runtime"
   "$HELPER" verify-compose-runtime --compose-json "$resolved_compose" \
-    --compose-hashes "$resolved_hashes" --container-json "$container_runtime"
-  rm -f -- "$resolved_compose" "$resolved_hashes" "$container_runtime"
+    --compose-hashes "$source_hashes" \
+    --resolved-compose-hashes "$resolved_semantic_hashes" \
+    --postiz-no-deps-compose-json "$no_deps_compose" \
+    --postiz-no-deps-hash "$no_deps_hash" \
+    --container-json "$container_runtime" \
+    --image-inspect-json "$image_runtime" \
+    --network-inspect-json "$network_runtime" \
+    --runtime-state "$suffix" \
+    --expected-image "postiz|${image_ids[postiz]}" \
+    --expected-image "postiz-postgres|${image_ids[postiz-postgres]}" \
+    --expected-image "postiz-redis|${image_ids[postiz-redis]}" \
+    --expected-image "postiz-temporal|${image_ids[postiz-temporal]}"
+  rm -f -- "$resolved_compose" "$source_hashes" "$resolved_semantic_hashes" "$no_deps_input" \
+    "$no_deps_compose" "$no_deps_hash" "$container_runtime" "$image_runtime" "$network_runtime"
 }
 
 # Fail generation drift before the durable journal and before the first stop.

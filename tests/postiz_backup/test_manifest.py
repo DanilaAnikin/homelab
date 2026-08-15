@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import io
@@ -285,39 +286,144 @@ class ArchiveContractTests(unittest.TestCase):
     def test_compose_runtime_binds_list_root_hash_image_environment_and_fenced_name(self) -> None:
         services = sorted(manifest_module.JOURNAL_SERVICES)
         compose = {
+            "name": "postiz",
             "services": {
-                service: {"image": f"fixture/{service}:pinned", "environment": {"GENERATION": "g1"}}
+                service: {
+                    "container_name": service,
+                    "image": f"fixture/{service}:pinned",
+                    "environment": {"GENERATION": "g1"},
+                    "networks": {"postiz-internal": None},
+                }
                 for service in services
-            }
+            },
+            "networks": {"postiz-internal": {"name": "postiz_postiz-internal"}},
+            "volumes": {},
         }
+        compose["services"]["postiz"]["depends_on"] = copy.deepcopy(
+            manifest_module.POSTIZ_NO_DEPS_DEPENDENCIES
+        )
+        no_deps_compose = copy.deepcopy(compose)
+        del no_deps_compose["services"]["postiz"]["depends_on"]
         hashes = {service: hashlib.sha256(service.encode()).hexdigest() for service in services}
+        no_deps_hash = hashlib.sha256(b"postiz-no-deps").hexdigest()
+        resolved_hashes = {**hashes, "postiz": no_deps_hash}
+        container_ids = {
+            service: hashlib.sha256(f"container:{service}".encode()).hexdigest()
+            for service in services
+        }
+        image_ids = {
+            service: f"sha256:{hashlib.sha256(f'image:{service}'.encode()).hexdigest()}"
+            for service in services
+        }
+        images = [
+            {
+                "Id": image_ids[service],
+                "Config": {"Env": ["IMAGE_DEFAULT=allowed-default"]},
+            }
+            for service in services
+        ]
+        network_id = hashlib.sha256(b"network:postiz-internal").hexdigest()
+        network_members = {}
         containers = []
-        for service in services:
+        for index, service in enumerate(services, 10):
             name = "/postiz-postgres-backup-fenced" if service == "postiz-postgres" else f"/{service}"
+            running = service == "postiz-postgres"
+            endpoint_id = hashlib.sha256(f"endpoint:{service}".encode()).hexdigest()
+            ip_address = f"10.77.0.{index}"
+            mac_address = f"02:42:0a:4d:00:{index:02x}"
+            attachment = {
+                "Aliases": [service, service],
+                "NetworkID": network_id,
+                "EndpointID": endpoint_id if running else "",
+                "IPAddress": ip_address if running else "",
+                "IPPrefixLen": 24 if running else 0,
+                "GlobalIPv6Address": "",
+                "GlobalIPv6PrefixLen": 0,
+                "MacAddress": mac_address if running else "",
+            }
             containers.append(
                 {
+                    "Id": container_ids[service],
+                    "Image": image_ids[service],
                     "Name": name,
+                    "State": {
+                        "Status": "running" if running else "exited",
+                        "Running": running,
+                        "Paused": False,
+                        "Restarting": False,
+                        "Dead": False,
+                        "ExitCode": 0,
+                        "FinishedAt": (
+                            manifest_module.DOCKER_ZERO_TIME
+                            if running
+                            else "2026-08-15T08:30:00.123456789Z"
+                        ),
+                    },
                     "Config": {
                         "Image": f"fixture/{service}:pinned",
-                        "Env": ["GENERATION=g1", "IMAGE_DEFAULT=allowed-extra"],
+                        "Env": ["GENERATION=g1", "IMAGE_DEFAULT=allowed-default"],
                         "Labels": {
                             "com.docker.compose.project": "postiz",
                             "com.docker.compose.service": service,
-                            "com.docker.compose.config-hash": hashes[service],
+                            "com.docker.compose.config-hash": (
+                                no_deps_hash if service == "postiz" else hashes[service]
+                            ),
+                            "com.docker.compose.depends_on": "" if service == "postiz" else "fixture",
                         },
+                    },
+                    "HostConfig": {"PortBindings": {}},
+                    "Mounts": [],
+                    "NetworkSettings": {
+                        "Networks": {"postiz_postiz-internal": attachment}
                     },
                 }
             )
+            if running:
+                network_members[container_ids[service]] = {
+                    "Name": name.removeprefix("/"),
+                    "EndpointID": endpoint_id,
+                    "MacAddress": mac_address,
+                    "IPv4Address": f"{ip_address}/24",
+                    "IPv6Address": "",
+                }
+        networks = [
+            {
+                "Name": "postiz_postiz-internal",
+                "Id": network_id,
+                "EnableIPv6": False,
+                "IPAM": {"Config": [{"Subnet": "10.77.0.0/24", "Gateway": "10.77.0.1"}]},
+                "Containers": network_members,
+            }
+        ]
         compose_path = self.base / "compose.json"
+        no_deps_compose_path = self.base / "compose-no-deps.json"
         container_path = self.base / "containers.json"
+        image_path = self.base / "images.json"
+        network_path = self.base / "networks.json"
         hash_path = self.base / "hashes.txt"
+        resolved_hash_path = self.base / "resolved-hashes.txt"
+        no_deps_hash_path = self.base / "no-deps-hash.txt"
         compose_path.write_text(json.dumps(compose))
+        no_deps_compose_path.write_text(json.dumps(no_deps_compose))
         container_path.write_text(json.dumps(containers))
+        image_path.write_text(json.dumps(images))
+        network_path.write_text(json.dumps(networks))
         hash_path.write_text("".join(f"{service} {hashes[service]}\n" for service in services))
+        resolved_hash_path.write_text(
+            "".join(f"{service} {resolved_hashes[service]}\n" for service in services)
+        )
+        no_deps_hash_path.write_text(f"postiz {no_deps_hash}\n")
         args = Namespace(
             compose_json=str(compose_path),
             compose_hashes=str(hash_path),
+            resolved_compose_hashes=str(resolved_hash_path),
+            postiz_no_deps_compose_json=str(no_deps_compose_path),
+            postiz_no_deps_hash=str(no_deps_hash_path),
             container_json=str(container_path),
+            image_inspect_json=str(image_path),
+            network_inspect_json=str(network_path),
+            expected_image=[f"{service}|{image_ids[service]}" for service in services],
+            runtime_state="writer-fenced",
         )
         manifest_module.command_verify_compose_runtime(args)
         containers[0]["Config"]["Labels"]["com.docker.compose.config-hash"] = "0" * 64

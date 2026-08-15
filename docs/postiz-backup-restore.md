@@ -19,7 +19,7 @@ dumpy jsou druhá, striktně testovaná cesta; nejsou skládány z různých ča
 | Maintenance DB | `postgres` se nedumpuje logicky jen pokud má 0 user objektů | exact inventory a zero-object receipt pod fence |
 | Temporal state | Temporal DB, visibility DB a jejich `schema_version` | tabulky, workflow/execution counts a row fingerprints |
 | Redis | stabilní `SAVE` po zastavení app/Temporal, exact RDB + root/file UID/GID/mode | `redis-check-rdb`, isolated load, `loaded + TTL-expired == RDB keys` |
-| Runtime config | šifrovaný exact allowlist včetně `postiz.env`, Compose, image source, scheduleru, recovery toolingu, unitů, tmpfiles a source commitu | member/owner/mode/hash kontrola a Compose config-hash proti exact containerům |
+| Runtime config | šifrovaný exact allowlist včetně `postiz.env`, Compose, image source, scheduleru, recovery toolingu, unitů, tmpfiles a source commitu | member/owner/mode/hash kontrola, source-full i resolved Compose hashes, exact Postiz `--no-deps` effective hash a image-inspect identity/default-env proti exact containerům |
 | `postiz-config` volume | exact root-owned archive | network-none extract a metadata/hash kontrola |
 | Uploads | `postiz_postiz-uploads`, maximálně 100 000 souborů / 16 GiB | každý obnovený soubor má exact path, size, mode a SHA-256 |
 | Seasonal rollback state | policy + `seasonal-releases` + `seasonal-anchor-replacement`, nebo doložený pre-apply `absent` | schema/role/inventory SHA, root mode `0700`, bez symlinků/hardlinků |
@@ -35,8 +35,23 @@ vyžaduje review, nikoli automatické oslabení testu.
 Nightly capture používá `/run/homelab-backup/postiz-mutation.lock` a durable
 root-only journal vytvořený a fsyncnutý před prvním stopem. Před fence ověří:
 
-- exact container ID/image ID a canonical Compose config hash všech čtyř služeb;
-- exact persistent mounts, Docker networks, aliases a nulové host port bindings;
+- exact container ID/image ID, source-full i resolved Compose model/hash všech čtyř
+  služeb a samostatný Postiz effective label hash modelu bez pouze
+  `postiz.depends_on`;
+- bijektivní service→container→image-inspect identity a exact runtime environment
+  vzniklé přepsáním image defaults explicitními Compose hodnotami, bez extra,
+  chybějících nebo duplicitních klíčů;
+- exact persistent mounts, cross-checked container/network-inspect endpoint IDs,
+  aliases, IPv4/prefix, disabled IPv6, MAC a nulové host port bindings. Network
+  source→resolved names i NetworkID jsou bijektivní; endpoint ID jsou globálně
+  unikátní a IPv4/MAC unikátní v každé síti. IPv4 IPAM subnets jsou canonical,
+  vzájemně se nepřekrývají a mají usable in-subnet Gateway; endpoint nesmí být
+  network, broadcast ani Gateway adresa. Preflight vyžaduje čtyři stabilně
+  `running` kontejnery a active endpointy; jejich `FinishedAt` je Docker zero
+  sentinel nebo syntakticky validní nenulový Docker timestamp. Writer-fenced stav vyžaduje
+  stabilně `running` pouze přejmenovaný Postgres; tři zastavené writery musí být exact
+  `exited`, bez restart/dead/paused stavu, s exit code 0, validním `FinishedAt` a
+  prázdnými endpoint fields;
 - interní network membership pouze těchto čtyř exact ID;
 - přesný DB inventory, nulové user objekty v `postgres`, žádné dlouhé transakce,
   lock waitery ani prepared transactions;
@@ -261,18 +276,23 @@ portable fallback, ale jsou také plně testované včetně globals, owners a AC
 
 ### Povinné gates před instalací
 
-- reviewed source ancestor je `26b0d5ae6eeb8c86767924a4e9ed2bed83370ea4`;
+- reviewed source ancestor je `8ec0e5535879d93bb0ce0df556b291d1228f2315`;
   `/etc/homelab/postiz-backup-source-revision` však musí obsahovat výsledný
   reviewed commit, ne ancestor ani dirty tree;
 - R2 dnes nesmí být považováno za chráněné, dokud attester neprokáže všechna
   lock/lifecycle pravidla a cross-bucket denial;
-- current Postiz container má Compose config-hash drift: canonical file hash
-  `3f88a262802d14fa0401a71abf751153132250408a3a6d55fdee2cb2842999db`
-  neodpovídá running label
-  `6e0fb11e0ae8b8ab9f6188ee0ead6a66b16835e530284c5413842cac2af40eb1`;
-  capture proto správně
-  selže před prvním stopem. Po auditu je nutný samostatně schválený controlled
-  recreate `postiz` z exact pinned bytes, následovaný ID/image/health/hash checkem;
+- Docker Compose `5.3.1` dává Postiz source modelu s deklarací `env_file`
+  `3f88a262802d14fa0401a71abf751153132250408a3a6d55fdee2cb2842999db`.
+  Full resolved JSON po opětovném zpracování přes Compose má hash
+  `6e0fb11e0ae8b8ab9f6188ee0ead6a66b16835e530284c5413842cac2af40eb1`,
+  protože už nenese source `env_file` provenance. Odstranění pouze
+  `services.postiz.depends_on` tento resolved hash nemění; Compose `5.3.1`
+  `depends_on` do service hashe nezahrnuje. Auditovaný controlled recreate přes
+  `up --no-deps` vytvořil právě effective label `6e0…`. Nejde o
+  environment/image/mount/network drift. Capture musí fail-closed přepočítat
+  source-full, full-resolved a exact no-deps model, dokázat jejich přesné vztahy,
+  porovnat Postiz label s effective hashem a zbývající tři labels se source-full
+  hashes. Jakýkoli jiný rozdíl zastaví běh před prvním stopem;
 - `/run/homelab-backup` a `/var/lib/freio-content` se vytvoří tmpfiles pravidlem
   před schedulery; nevytvářej je ad hoc s jinými právy;
 - všechny Postiz deploy/recreate cesty musí používat shared mutation lock.
@@ -321,10 +341,13 @@ sudo systemctl enable --now postiz-restore-cleanup.service
 sudo /usr/local/sbin/postiz-r2-policy-attest.sh
 ```
 
-Nezapínej timery. Nejdřív vyřeš config-hash gate controlled recreate přes
-`postiz-compose-locked.sh`, ověř všechny container IDs/images/health/networks a
-pak spusť jeden supervised `backup.service`. Teprve poté spusť
-`restore-drill.service`.
+Nezapínej timery. Nejdřív musí být zelený source/resolved/effective hash gate:
+source-full model, full resolved model, exact Postiz `depends_on`-only projection,
+Postiz effective label a source-full labels zbývajících tří služeb. Controlled
+recreate smí jít jen přes
+`postiz-compose-locked.sh`; nesmí se snažit vynutit full Postiz label a současně
+používat `--no-deps`. Potom ověř všechny container IDs/images/health/topology a
+spusť jeden supervised `backup.service`. Teprve poté spusť `restore-drill.service`.
 
 ### Go acceptance
 
@@ -332,7 +355,12 @@ pak spusť jeden supervised `backup.service`. Teprve poté spusť
   `0700/0600`, bez symlinků;
 - attester potvrzuje default-jurisdiction account/bucket binding, exact locks,
   lifecycle a explicitní cross-bucket denial;
-- preflight canonical Compose hashes odpovídají exact running labels;
+- preflight source-full i resolved Compose hashes jsou exact; Postiz resolved a
+  `--no-deps` hashes jsou shodné a running label jim odpovídá, other3 source-full
+  a resolved hashes jsou shodné a odpovídají jejich labels. Full model je navázán
+  na unique container IDs, exact Docker image-inspect IDs, merged image-default +
+  Compose environment, stable phase-specific container state a bijektivní,
+  cross-checked network/IPAM/alias/IP/IPv6/MAC/mount/port topology;
 - fault injection TERM/HUP/timeout obnoví pouze původně running exact IDs v
   pořadí PG→Redis→Temporal→Postiz; stale journal přežije reboot a retry;
 - jeden marker vznikne až poslední v obou `recovery-sets` prefixes a jeho HMAC,

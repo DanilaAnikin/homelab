@@ -1,0 +1,61 @@
+name: postiz
+
+networks:
+  dokploy-network:
+    name: dokploy-network
+    external: true
+  postiz-internal:
+    name: postiz_postiz-internal
+    driver: bridge
+
+volumes:
+  postiz-config:
+    name: postiz_postiz-config
+  postiz-uploads:
+    name: postiz_postiz-uploads
+  postiz-postgres:
+    name: postiz_postiz-postgres
+  postiz-redis:
+    name: postiz_postiz-redis
+
+services:
+  postiz:
+    image: fixture.invalid/postiz:1
+    pull_policy: never
+    container_name: postiz
+    restart: unless-stopped
+    mem_limit: 1700m
+    env_file:
+      - ./postiz-compose-v5.env.example
+    volumes:
+      - postiz-config:/config
+      - postiz-uploads:/uploads
+    networks: [dokploy-network, postiz-internal]
+    depends_on: [postiz-postgres, postiz-redis]
+  postiz-postgres:
+    image: fixture.invalid/postgres:17
+    container_name: postiz-postgres
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      GENERATION: ${POSTIZ_GENERATION:?fixture generation is required}
+    volumes:
+      - postiz-postgres:/var/lib/postgresql/data
+    networks: [postiz-internal]
+  postiz-redis:
+    image: fixture.invalid/redis:7.2
+    container_name: postiz-redis
+    restart: unless-stopped
+    mem_limit: 256m
+    volumes:
+      - postiz-redis:/data
+    networks: [postiz-internal]
+  postiz-temporal:
+    image: fixture.invalid/temporal:1.25.2
+    container_name: postiz-temporal
+    restart: unless-stopped
+    mem_limit: 1024m
+    environment:
+      GENERATION: ${POSTIZ_GENERATION:?fixture generation is required}
+    networks: [postiz-internal]
+    depends_on: [postiz-postgres]
