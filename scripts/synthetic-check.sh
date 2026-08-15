@@ -38,11 +38,23 @@ check_keyword(){ local name="$1" url="$2" kw="$3"
 
 echo "═══ SYNTHETIC $(date -Iseconds) ═══"
 [[ -n "$GT_ANON" ]] && check_http "gorilla auth" "https://gtapi.anikin.cz/auth/v1/health" 200 "apikey: $GT_ANON"
-[[ -n "$CL_ANON" ]] && check_http "classio auth" "https://capi.anikin.cz/auth/v1/health" 200 "apikey: $CL_ANON"
+# Classio je od 15. 8. 2026 schválně vypnuté (Supabase stack běžel naprázdno bez
+# aplikace a žral ~940 MB RAM). Kontrolovat vypnutou službu nemá smysl — trvale
+# červený check jen otupí pozornost a překryje okamžik, kdy spadne něco, co běžet
+# MÁ. Stejnou logiku už používá backup.sh: "kontejner neběží — přeskakuji".
+if docker ps --format '{{.Names}}' | grep -q '^classio-supabase-auth'; then
+  [[ -n "$CL_ANON" ]] && check_http "classio auth" "https://capi.anikin.cz/auth/v1/health" 200 "apikey: $CL_ANON"
+else
+  echo "  - classio auth (stack vypnutý, přeskakuji)"
+fi
 [[ -n "$GT_ANON" ]] && check_rest "gorilla DB (profiles)" "https://gtapi.anikin.cz/rest/v1/profiles?limit=1" "$GT_ANON"
 check_keyword "anikin.cz render" "https://anikin.cz" "Anikin"
 check_keyword "gorillatype render" "https://gorillatype.anikin.cz" "gorilla"
-check_keyword "classio render" "https://classio.anikin.cz" "Classio"
+if docker ps --format '{{.Names}}' | grep -q '^classio-supabase'; then
+  check_keyword "classio render" "https://classio.anikin.cz" "Classio"
+else
+  echo "  - classio render (stack vypnutý, přeskakuji)"
+fi
 check_keyword "freio render" "https://freio.cz" "freio"
 check_keyword "ripieno render" "https://www.ripieno.xyz" "Ripieno"
 
