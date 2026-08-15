@@ -256,6 +256,26 @@ verify(){
   [[ $FAIL -eq $before_fail ]]
 }
 
+# After a rollback the question is NOT "is the bridge serving" — it is "did
+# service come back". `verify` asserts the bridge's identity and its 503s,
+# which is exactly what rolling back removes, so a correct rollback would have
+# reported failure. The Stage 2 rehearsal exposed this; Stage 1's own rehearsal
+# had missed it because its stub kept returning the bridge's health body after
+# the backend had been pointed away.
+verify_service(){
+  echo "SERVICE VERIFICATION (post-rollback)"
+  local before=$FAIL
+  local s
+  s="$(http_status "$DASH_HOST/api/health")"
+  [[ "$s" == "200" ]] && ok "dashboard /api/health" "http 200" || bad "dashboard /api/health" "http $s"
+  s="$(http_status "$DASH_HOST/login")"
+  [[ "$s" == "200" ]] && ok "GET /login renders" "http 200" || bad "GET /login" "http $s"
+  s="$(http_status "$API_HOST/auth/v1/settings")"
+  [[ "$s" == "200" ]] && ok "auth /settings" "http 200" || bad "auth /settings" "http $s"
+  echo
+  [[ $FAIL -eq $before ]]
+}
+
 rollback(){
   local target; target="$(cat "$BACKUP_DIR/stage1-rollback-target" 2>/dev/null || true)"
   [[ -n "$target" && -f "$target" ]] || die "no rollback target recorded — refusing to guess"
@@ -272,7 +292,7 @@ rollback(){
 case "${1:---check}" in
   --check)    pre_checks ;;
   --verify)   verify && echo "VERIFY OK ($PASS ok)" || { echo "VERIFY FAILED ($FAIL failed)"; exit 1; } ;;
-  --rollback) rollback; verify && echo "ROLLBACK VERIFIED" || { echo "ROLLBACK DID NOT RESTORE SERVICE"; exit 1; } ;;
+  --rollback) rollback; verify_service && echo "ROLLBACK VERIFIED" || { echo "ROLLBACK DID NOT RESTORE SERVICE"; exit 1; } ;;
   --cutover)
       pre_checks
       echo
@@ -285,7 +305,8 @@ case "${1:---check}" in
         echo
         echo "POST-CHECK FAILED — rolling back automatically"
         rollback
-        echo "rolled back. Stage 1 NOT applied."
+        if verify_service; then echo "rolled back, service restored. Stage 1 NOT applied."
+        else echo "ROLLED BACK BUT SERVICE IS STILL NOT HEALTHY — ESCALATE"; fi
         exit 1
       fi
       ;;

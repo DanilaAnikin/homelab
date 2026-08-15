@@ -74,11 +74,22 @@ esac
 exit 1
 EOF
 
+# The health BODY is decided from the live config, not from a fixture.
+#
+# The first version of this stub returned the bridge's identity unconditionally,
+# so it kept saying "frozen-containment-bridge" even after a rollback had
+# pointed traffic back at the old dashboard. That masked a real bug: `--rollback`
+# ran the post-cutover verification, which asserts the bridge's identity and its
+# 503s — precisely what rolling back removes. A correct rollback would have
+# reported failure in production. The Stage 2 rehearsal caught it because its
+# stub read the config; this one now does too.
 cat > "$STUB_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 # Answers by URL and method, from state files. -w '%{http_code}' means the
 # caller wants the status; otherwise it wants the body.
 S="$STUB_STATE"
+LIVE="$NT_TEST_LIVE"
+on_bridge(){ grep -q 'natetrader-dashboard-bridge' "$LIVE" 2>/dev/null; }
 url=""; method=GET; want_code=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -100,6 +111,14 @@ case "$url" in
 esac
 code="$(cat "$S/code_$key" 2>/dev/null || echo 200)"
 body="$(cat "$S/body_$key" 2>/dev/null || echo '{}')"
+# whoever the route points at is who answers
+if [[ "$key" == health ]]; then
+  if on_bridge; then body="$(cat "$S/body_health" 2>/dev/null || echo '{}')"
+  else body='{"artifact_role":"dashboard","writes_enabled":true}'; fi
+fi
+if [[ "$key" == accounts_POST || "$key" == accounts_PUT || "$key" == accounts_PATCH || "$key" == accounts_DELETE ]]; then
+  if ! on_bridge; then code=401; body='{"code":"UNAUTHENTICATED"}'; fi
+fi
 if [[ "$want_code" == 1 ]]; then printf '%s' "$code"; else printf '%s' "$body"; fi
 exit 0
 EOF
@@ -129,7 +148,7 @@ fresh_dyn(){
 
 run_script(){ # <mode>
   PATH="$STUB_BIN:$PATH" STUB_STATE="$STUB_STATE" \
-  DYN="$WORK/dyn" BACKUP_DIR="$WORK/backup" \
+  DYN="$WORK/dyn" BACKUP_DIR="$WORK/backup" NT_TEST_LIVE="$WORK/dyn/natetrader.yml" \
   bash "$SCRIPT" "$1" >"$WORK/out.txt" 2>&1
 }
 
@@ -165,6 +184,20 @@ else fail "rollback failed"; sed -n '$p' "$WORK/out.txt"; fi
 if diff -q <(printf '%s\n' "$LIVE_YML") "$WORK/dyn/natetrader.yml" >/dev/null; then
   pass "rollback restored the file BYTE FOR BYTE"
 else fail "rollback did not restore the original file"; fi
+
+# ── 2b. rollback verifies SERVICE, not the change it just removed ───────────
+# The bug this covers: `--rollback` used to run the post-cutover verification,
+# which asserts the bridge's identity and its 503s — exactly what rolling back
+# undoes. With a config-aware stub the old code fails here; the split into
+# verify_service() is what makes it pass.
+fresh_dyn; healthy_world
+run_script --cutover >/dev/null 2>&1 || true
+if run_script --rollback; then
+  pass "rollback reports success once service is restored"
+else
+  fail "rollback restored the config but still reported failure"
+  tail -4 "$WORK/out.txt"
+fi
 
 # ── 3. a rollback that cannot verify its own backup must refuse ─────────────
 fresh_dyn; healthy_world
