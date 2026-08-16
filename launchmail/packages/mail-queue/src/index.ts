@@ -54,6 +54,7 @@ export {
   getSmtpConfig,
   getSmtpConfigById,
   getDefaultSmtpConfig,
+  getSmtpConfigByFromDomain,
   createSmtpConfig,
   updateSmtpConfig,
   deleteSmtpConfig,

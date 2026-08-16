@@ -126,6 +126,39 @@ export async function getSmtpConfigById(
   return row ? toSmtpConfig(row) : null;
 }
 
+/**
+ * Najde konfiguraci, jejíž odesílací adresa je ve STEJNÉ doméně jako požadovaný
+ * odesílatel.
+ *
+ * PROČ: bez tohohle spadl každý požadavek bez `smtpConfigId` na org default a
+ * odešel cizí schránkou — appka LokWave poslala „Přihlášení do DentalLocal"
+ * s From `noreply@dentallocal.cz`, ale transportem `contact@freio.cz`, a Seznam
+ * viditelného odesílatele přepsal na freio. Mail tvrdil jedno a chodil odjinud.
+ *
+ * Porovnává se jen doména, ne celá adresa: aplikace posílají z `noreply@`,
+ * `hello@` apod., zatímco schránka je `contact@`. Doména je to, co drží SPF,
+ * DKIM i důvěru příjemce.
+ */
+export async function getSmtpConfigByFromDomain(
+  organizationId: string,
+  domain: string,
+): Promise<SmtpConfig | null> {
+  const needle = domain.trim().toLowerCase();
+  if (!needle) return null;
+  const rows = await db
+    .select()
+    .from(smtpConfigs)
+    .where(eq(smtpConfigs.organizationId, organizationId));
+  // Přesná shoda domény má přednost; teprve pak subdoména (outreach.ripieno.xyz
+  // nesmí ukrást poštu pro ripieno.xyz, ale ripieno.xyz může posloužit jako
+  // rodič, když pro subdoménu vlastní schránka není).
+  const domainOf = (addr: string) => addr.split("@").pop()?.toLowerCase() ?? "";
+  const exact = rows.find((r) => domainOf(r.fromAddress) === needle);
+  if (exact) return toSmtpConfig(exact);
+  const parent = rows.find((r) => needle.endsWith("." + domainOf(r.fromAddress)));
+  return parent ? toSmtpConfig(parent) : null;
+}
+
 export async function getDefaultSmtpConfig(
   organizationId: string,
 ): Promise<SmtpConfig | null> {

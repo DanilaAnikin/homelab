@@ -6,6 +6,7 @@ import {
   sendEmailSchema,
   getSmtpConfigById,
   getDefaultSmtpConfig,
+  getSmtpConfigByFromDomain,
 } from "@workspace/mail-queue";
 import { hasPermission } from "@workspace/auth/permissions";
 import type { AppVariables } from ".";
@@ -124,9 +125,26 @@ const mailRouter = new Hono<AppVariables>()
       // per-request via `smtpConfigId`, falling back to the org default. This
       // lets one token send from every per-domain mailbox (Lokwave email bot).
       const chosenConfigId = boundConfigId ?? data.smtpConfigId;
+
+      // Doména požadovaného odesílatele. Bere se z "Jméno <adresa>" i z holé adresy.
+      const requestedDomain = (data.from ?? "")
+        .replace(/^.*</, "")
+        .replace(/>.*$/, "")
+        .split("@")
+        .pop()
+        ?.trim()
+        .toLowerCase();
+
+      // Když volající neurčí konfiguraci, VYBERE SE PODLE DOMÉNY ODESÍLATELE,
+      // ne podle org defaultu. Default jako tichá záchrana byl přesně ta chyba:
+      // appka LokWave poslala mail s From `noreply@dentallocal.cz`, LaunchMail
+      // sáhl po výchozí konfiguraci `contact@freio.cz` a Seznam viditelného
+      // odesílatele přepsal na freio. Mail tvrdil jedno a chodil odjinud.
       const config = chosenConfigId
         ? await getSmtpConfigById(chosenConfigId)
-        : await getDefaultSmtpConfig(organizationId);
+        : (requestedDomain
+            ? await getSmtpConfigByFromDomain(organizationId, requestedDomain)
+            : null) ?? (await getDefaultSmtpConfig(organizationId));
       if (!config || config.organizationId !== organizationId) {
         return c.json(
           {
@@ -142,6 +160,31 @@ const mailRouter = new Hono<AppVariables>()
         from = config.fromName
           ? `${config.fromName} <${config.fromAddress}>`
           : config.fromAddress;
+      }
+
+      // POJISTKA: odesílatel a schránka se nikdy nesmí rozejít. Když se doména
+      // From liší od domény zvolené konfigurace (typicky token natvrdo vázaný
+      // na jinou schránku, nebo doména bez vlastní konfigurace), přepíšeme
+      // adresu na tu, kterou schránka opravdu má — zobrazované jméno necháme.
+      // Jinak by odešel mail, který o sobě lže, a poskytovatel ho stejně
+      // přepíše nebo odmítne kvůli SPF/DKIM.
+      const finalDomain = from
+        .replace(/^.*</, "")
+        .replace(/>.*$/, "")
+        .split("@")
+        .pop()
+        ?.trim()
+        .toLowerCase();
+      const configDomain = config.fromAddress.split("@").pop()?.toLowerCase();
+      if (finalDomain && configDomain && finalDomain !== configDomain) {
+        const display = from.includes("<")
+          ? from.slice(0, from.indexOf("<")).trim().replace(/^"|"$/g, "")
+          : (config.fromName ?? "");
+        from = display ? `${display} <${config.fromAddress}>` : config.fromAddress;
+        console.warn(
+          `[mail] From doména ${finalDomain} nesouhlasí se schránkou ${configDomain}; ` +
+            `odesílatel přepsán na ${config.fromAddress}`,
+        );
       }
 
       // A send is only genuinely "scheduled" when sendAt parses to a real
