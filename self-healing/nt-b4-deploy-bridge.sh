@@ -96,7 +96,14 @@ case "${1:---verify}" in
 
   LOADED="$(docker load -i "$TAR" | sed -n 's/^Loaded image: //p' | head -1)"
   [[ -n "$LOADED" ]] && ok "image loaded" "$LOADED" || die "docker load produced no image"
-  echo "$LOADED" > /var/lib/homelab/b4/bridge-tag 2>/dev/null || true
+  # The tag file is how --start finds the image, so losing it is not cosmetic:
+  # `> … 2>/dev/null || true` dropped it silently when the directory did not
+  # exist — nothing in this script created it — and --start then died with a
+  # misleading "no image tag".
+  mkdir -p /var/lib/homelab/b4 || die "cannot create /var/lib/homelab/b4 to record the image tag"
+  printf '%s\n' "$LOADED" > /var/lib/homelab/b4/bridge-tag \
+    || die "could not record the image tag; --start would not find $LOADED"
+  [[ $FAIL -eq 0 ]] || die "$FAIL problem(s) during load"
   echo "  next: $0 --start"
   ;;
 
@@ -137,6 +144,20 @@ case "${1:---verify}" in
   [[ ${#MISSING[@]} -eq 0 ]] && ok "nothing expected was missing" \
                              || bad "not present on $SRC" "$(printf '%s ' "${MISSING[@]}")"
   ok "added SUPABASE_SERVER_URL" "$INTERNAL_URL"
+
+  # THE GATE. `bad` above only increments a counter; this branch used to run
+  # `docker run -d` regardless and end without ever consulting $FAIL, so a
+  # bridge missing a carried secret started anyway and the operator's shell saw
+  # exit 0. --verify would not catch it either: a bridge with no GITHUB_TOKEN
+  # still serves /login, still reports artifact_role and writes_enabled=false,
+  # and still 503s every mutating verb — it fails later, on the read paths it
+  # exists to serve, by which time Stage 1 has cut public traffic to it.
+  # Only --verify had this line. It belongs wherever a `bad` can be recorded.
+  if [[ $FAIL -ne 0 ]]; then
+    rm -f "$ENVFILE"
+    die "$FAIL problem(s) with the environment — refusing to start $BRIDGE.
+       Nothing was started and the env file has been removed."
+  fi
 
   # No published port. Traefik reaches it over the network; publishing would
   # expose a pre-cutover artifact to the host's interfaces.
@@ -206,7 +227,21 @@ case "${1:---verify}" in
   ;;
 
 --remove)
-  docker rm -f "$BRIDGE" >/dev/null 2>&1 && echo "removed $BRIDGE" || echo "$BRIDGE was not present"
+  # The one destructive line here, and $BRIDGE is an environment override. With
+  # NT_BRIDGE_CONTAINER set to the OLD dashboard's name this force-deleted the
+  # rollback artifact the whole B4 plan rests on. It also reported "was not
+  # present" for any failure at all — a daemon that is down, a permission
+  # denial — which is a false statement rather than an error.
+  [[ "$BRIDGE" != "$SRC" ]] || die "refusing to remove '$BRIDGE': that is \$SRC, the ORIGINAL dashboard
+       and the rollback path for this whole plan. NT_BRIDGE_CONTAINER and
+       NT_OLD_DASHBOARD must name two different containers."
+  if ! docker inspect "$BRIDGE" >/dev/null 2>&1; then
+    echo "$BRIDGE is not present — nothing to remove"
+  elif docker rm -f "$BRIDGE" >/dev/null 2>&1; then
+    echo "removed $BRIDGE"
+  else
+    die "could not remove $BRIDGE — it exists but docker refused"
+  fi
   ;;
 *) die "unknown mode: ${1:-}" ;;
 esac

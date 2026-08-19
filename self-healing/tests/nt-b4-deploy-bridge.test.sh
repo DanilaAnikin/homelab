@@ -172,6 +172,53 @@ docker inspect "$BRIDGE" >/dev/null 2>&1 && fail "--remove left the container" \
 docker inspect "$SRC" >/dev/null 2>&1 && pass "--remove did not touch the old container" \
                                       || fail "--remove destroyed the old container"
 
+# ── C4: --start must not start a bridge whose environment is incomplete ─────
+# `bad "not present on $SRC"` only incremented a counter. `docker run -d` then
+# executed unconditionally and the branch ended without ever consulting $FAIL,
+# so a bridge missing a carried secret started anyway and the operator's shell
+# saw exit 0. --verify does not catch it either: a bridge with no GITHUB_TOKEN
+# still serves /login, still reports artifact_role and writes_enabled=false and
+# still 503s every mutating verb. It fails later, on the read paths it exists
+# to serve, by which time Stage 1 has cut public traffic to it.
+SRC2="nt-t-old2-$SUF"
+docker rm -f "$SRC2" >/dev/null 2>&1 || true
+docker run -d --name "$SRC2" --network "$NET" \
+  -e NEXT_PUBLIC_SUPABASE_URL=https://ntapi.example.invalid \
+  -e NEXT_PUBLIC_SUPABASE_ANON_KEY=stub-anon \
+  -e GITHUB_TOKEN=stub-token -e GITHUB_REPO=stub/repo -e GITHUB_STATE_REF=stub-ref \
+  busybox:latest sleep 600 >/dev/null   # deliberately NO SUPABASE_SERVICE_ROLE_KEY
+BRIDGE2="nt-t-bridge2-$SUF"
+docker rm -f "$BRIDGE2" >/dev/null 2>&1 || true
+if NT_OLD_DASHBOARD="$SRC2" NT_BRIDGE_CONTAINER="$BRIDGE2" NT_NETWORK="$NET" \
+   NT_TEST_IMAGE="$IMAGE" NT_BRIDGE_TAG="$IMAGE" STATE_DIR="$STATE" \
+   bash "$DEPLOY" --start >"$WORK/out.txt" 2>&1; then
+  fail "C4: --start returned 0 with a carried secret missing"
+else
+  pass "C4: --start refuses when a carried secret is missing"
+fi
+docker inspect "$BRIDGE2" >/dev/null 2>&1 \
+  && fail "C4: it started the bridge anyway" \
+  || pass "C4: no bridge container was created"
+grep -qi 'refusing to start' "$WORK/out.txt" \
+  && pass "C4: and it said why" \
+  || { fail "C4: refused without naming the reason"; tail -3 "$WORK/out.txt"; }
+docker rm -f "$SRC2" "$BRIDGE2" >/dev/null 2>&1 || true
+
+# ── C7: --remove must not be able to delete the rollback artifact ───────────
+# $BRIDGE is an environment override and was never compared to $SRC, so
+# NT_BRIDGE_CONTAINER=<the old dashboard> --remove force-deleted the container
+# the entire B4 plan keeps as its rollback path. It is the only unconditional
+# deletion in the set.
+if NT_OLD_DASHBOARD="$SRC" NT_BRIDGE_CONTAINER="$SRC" NT_NETWORK="$NET" \
+   STATE_DIR="$STATE" bash "$DEPLOY" --remove >"$WORK/out.txt" 2>&1; then
+  fail "C7: --remove accepted the OLD dashboard as its target"
+else
+  pass "C7: --remove refuses to delete the old dashboard"
+fi
+docker inspect "$SRC" >/dev/null 2>&1 \
+  && pass "C7: the rollback artifact still exists" \
+  || fail "C7: the old dashboard was destroyed by --remove"
+
 echo
 echo "deploy/retire rehearsal: $OK ok, $BAD not-ok"
 [[ $BAD -eq 0 ]] && { echo "REHEARSAL GREEN"; exit 0; } || { echo "REHEARSAL RED"; exit 1; }

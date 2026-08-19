@@ -66,6 +66,34 @@ ok(){   PASS=$((PASS+1)); note ok   "$1" "${2:-}"; }
 bad(){  FAIL=$((FAIL+1)); note FAIL "$1" "${2:-}"; }
 die(){  echo; echo "ABORT: $*"; exit 1; }
 
+# ── waiting for Traefik, by observing rather than by guessing ───────────────
+# `sleep 5` was the only synchronization with the file watcher. Traefik's
+# default providersThrottleDuration is 2s and applies AFTER the fsnotify
+# debounce, so under load the new routers can be live later than that — and the
+# verification that follows then observes the OLD backend, scores a failure,
+# and triggers an automatic rollback. That is a second live config flip caused
+# by nothing but impatience, followed by a third if the operator retries.
+#
+# So: poll for the condition, up to a bound, and report how long it took. A
+# timeout still falls through to the verification, which is the thing entitled
+# to decide — this only stops the decision being taken before the answer could
+# possibly be right. The matcher rehearsal already polls; the production
+# scripts were the ones still sleeping.
+wait_for(){ # <seconds> <description> <predicate...>
+  local limit="${NT_B4_WAIT_SECONDS:-$1}" desc="$2"; shift 2
+  local i=0
+  while (( i < limit )); do
+    if "$@" >/dev/null 2>&1; then
+      [[ $i -gt 0 ]] && note ok "$desc" "observed after ${i}s" || note ok "$desc" "observed immediately"
+      return 0
+    fi
+    sleep 1; i=$(( i + 1 ))
+  done
+  note info "$desc" "NOT observed within ${limit}s — continuing to verification, which decides"
+  return 1
+}
+
+
 # Write access, not root specifically. On the host these are the same thing —
 # $DYN is root-owned 0755 and $LIVE is 0600 — but "can I write the file I am
 # about to replace" is the property that actually has to hold, and asserting
@@ -224,8 +252,10 @@ do_cutover(){
   mv -f "$staged" "$LIVE"
   ok "route changed atomically" "$CURRENT_URL -> $BRIDGE_URL"
 
-  # Traefik's file watcher is not instantaneous.
-  sleep 5
+  # Traefik's file watcher is not instantaneous. Wait for the BRIDGE to be the
+  # thing answering, rather than for a number of seconds to pass.
+  serving_bridge(){ [[ "$(http_body "$DASH_HOST/api/health")" == *"\"artifact_role\":\"$WANT_ROLE\""* ]]; }
+  wait_for 30 "the bridge is answering on $DASH_HOST" serving_bridge || true
 }
 
 # ── external verification ───────────────────────────────────────────────────
@@ -297,11 +327,53 @@ verify_service(){
   [[ "$s" == "200" ]] && ok "GET /login renders" "http 200" || bad "GET /login" "http $s"
   s="$(http_status "$API_HOST/auth/v1/settings")"
   [[ "$s" == "200" ]] && ok "auth /settings" "http 200" || bad "auth /settings" "http $s"
+
+  # THE ASSERTION THAT MAKES THIS A ROLLBACK CHECK RATHER THAN A LIVENESS CHECK.
+  # All three probes above are 200 whether the route points at the bridge or at
+  # the restored dashboard, so on their own they cannot tell "rolled back" from
+  # "the rename landed but Traefik never reloaded". The bridge is the only thing
+  # that emits artifact_role; the real dashboard does not. Its ABSENCE is the
+  # observable difference, and it costs one request we were already making.
+  # Matched on the ROLE VALUE, not on the field name. The production dashboard
+  # emits no artifact_role at all — measured against the live host, its health
+  # body is {"status":"ok","service":"nate-trader-dashboard",...} — but keying
+  # on the bare field name would also fail an honest successor that reported
+  # some other role, and the question here is only ever "is the BRIDGE gone".
+  local body; body="$(http_body "$DASH_HOST/api/health")"
+  if [[ "$body" == *"\"artifact_role\":\"$WANT_ROLE\""* ]]; then
+    bad "the BRIDGE is still serving $DASH_HOST" "artifact_role is still $WANT_ROLE — the rollback did not take effect"
+  else
+    ok "the bridge is no longer serving $DASH_HOST" "no $WANT_ROLE in the health body"
+  fi
   echo
   [[ $FAIL -eq $before ]]
 }
 
+# Stage 1's rollback target is the file as it was BEFORE STAGE 1. Stage 2 keeps
+# its own pointer and never updates this one, so restoring this target while
+# Stage 2 is live does not undo Stage 1 — it deletes the entire Stage 2
+# containment boundary: no auth-only router, no `!PathRegexp` guard, no deny
+# middleware, and REST/Storage/Realtime/Functions/GraphQL/pg-meta public again
+# on ntapi, in one atomic rename. `verify_service` below could not see it: its
+# three probes are all satisfied with the data plane wide open, so the script
+# printed ROLLBACK VERIFIED over a reopened data plane.
+#
+# This is not a hypothetical operator slip. `nt-b4-retire-d11.sh` used to close
+# by telling the operator to run exactly this command, and that instruction is
+# only ever read in the post-Stage-2 state.
+#
+# The unwind order is Stage 2 first, then Stage 1. That is what the sequence
+# rehearsal does, which is why it never caught this.
+stage2_markers_in_live(){ grep -qE 'natetrader-api-auth|natetrader-deny-data-plane' "$LIVE"; }
+
 rollback(){
+  if stage2_markers_in_live; then
+    die "the live config still carries the Stage 2 containment boundary.
+       Rolling Stage 1 back now would restore the pre-Stage-1 file, which has no
+       auth-only router and no deny middleware — the public data plane would be
+       open again, and this script's own verification would not notice.
+       Unwind in order:  nt-b4-stage2-cutover.sh --rollback   then   $0 --rollback"
+  fi
   local target; target="$(cat "$BACKUP_DIR/stage1-rollback-target" 2>/dev/null || true)"
   [[ -n "$target" && -f "$target" ]] || die "no rollback target recorded — refusing to guess"
   sha256sum -c "$target.sha256" >/dev/null 2>&1 \
@@ -311,7 +383,8 @@ rollback(){
   chmod --reference="$LIVE" "$staged"; chown --reference="$LIVE" "$staged"
   mv -f "$staged" "$LIVE"
   echo "rolled back to $target"
-  sleep 5
+  not_serving_bridge(){ [[ "$(http_body "$DASH_HOST/api/health")" != *"\"artifact_role\":\"$WANT_ROLE\""* ]]; }
+  wait_for 30 "the bridge has stopped answering on $DASH_HOST" not_serving_bridge || true
 }
 
 case "${1:---check}" in

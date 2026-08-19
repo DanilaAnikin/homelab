@@ -97,7 +97,19 @@ cat > "$STUB_BIN/curl" <<'EOF'
 # caller wants the status; otherwise it wants the body.
 S="$STUB_STATE"
 LIVE="$NT_TEST_LIVE"
-on_bridge(){ grep -q 'natetrader-dashboard-bridge' "$LIVE" 2>/dev/null; }
+# The file says one thing; what Traefik is SERVING can lag it. $S/reload_lag,
+# if present, is a countdown: that many calls still answer with the old backend
+# even though the config has already changed. This is the only way to exercise
+# the difference between waiting a fixed number of seconds and waiting for the
+# change to be observable.
+on_bridge(){
+  grep -q 'natetrader-dashboard-bridge' "$LIVE" 2>/dev/null || return 1
+  if [[ -f "$S/reload_lag" ]]; then
+    local n; n="$(cat "$S/reload_lag")"
+    if (( n > 0 )); then echo $(( n - 1 )) > "$S/reload_lag"; return 1; fi
+  fi
+  return 0
+}
 url=""; method=GET; want_code=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -122,7 +134,12 @@ body="$(cat "$S/body_$key" 2>/dev/null || echo '{}')"
 # whoever the route points at is who answers
 if [[ "$key" == health ]]; then
   if on_bridge; then body="$(cat "$S/body_health" 2>/dev/null || echo '{}')"
-  else body='{"artifact_role":"dashboard","writes_enabled":true}'; fi
+  # MEASURED against the live host, not invented. The production dashboard's
+  # /api/health carries no artifact_role at all; the stub used to answer
+  # {"artifact_role":"dashboard","writes_enabled":true}, which no dashboard has
+  # ever emitted, and that fiction is what let a rollback check that merely
+  # counted 200s look adequate.
+  else body='{"status":"ok","service":"nate-trader-dashboard","strategyVersion":"v11-adaptive-momentum","buildSha":"d11bbad8aad7ec98596b0d290cb938706982d069","dataMode":"account-scoped"}'; fi
 fi
 if [[ "$key" == accounts_POST || "$key" == accounts_PUT || "$key" == accounts_PATCH || "$key" == accounts_DELETE ]]; then
   if ! on_bridge; then code=401; body='{"code":"UNAUTHENTICATED"}'; fi
@@ -283,6 +300,32 @@ run_script --cutover >/dev/null 2>&1 || true
 if grep -q 'natetrader-api-RENAMED' "$WORK/dyn/natetrader.yml"; then
   pass "non-vacuity: the harness reads the real file it claims to read"
 else fail "non-vacuity: the file the harness reads is not the one it edits"; fi
+
+# ── C8: a reload slower than the wait must not trigger a rollback ───────────
+# `sleep 5` was the only synchronization with Traefik's file watcher. Its
+# default providersThrottleDuration is 2s and applies after the fsnotify
+# debounce, so under load the routers can be live later than that. The
+# verification then observed the OLD backend, scored a failure, and the cutover
+# rolled itself back — a second live config flip caused by impatience alone,
+# and a third if the operator retried. The wait now polls for the bridge to be
+# answering instead of counting seconds.
+#
+# Here the stub answers as the OLD backend for the first six observations after
+# the config has already changed. With a fixed short sleep that is a failed
+# cutover; with the poll it is a slightly slower successful one.
+fresh_dyn; healthy_world
+echo 6 > "$STUB_STATE/reload_lag"
+if NT_B4_WAIT_SECONDS=20 run_script --cutover; then
+  pass "C8: a reload that lags the config change still cuts over cleanly"
+else
+  fail "C8: a lagging reload was treated as a failed cutover"; tail -6 "$WORK/out.txt"
+fi
+grep -q 'observed after' "$WORK/out.txt" \
+  && pass "C8: the wait reports WHEN it observed the change, not how long it slept" \
+  || fail "C8: no observation timing was reported — the poll may not have run"
+grep -qi 'rolling back\|rolled back' "$WORK/out.txt" \
+  && fail "C8: the lagging reload triggered a rollback" \
+  || pass "C8: no rollback was triggered"
 
 echo
 echo "stage 1 rehearsal: $OK ok, $BAD not-ok"

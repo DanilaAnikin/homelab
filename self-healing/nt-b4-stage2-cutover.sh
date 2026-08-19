@@ -54,6 +54,34 @@ ok(){   PASS=$((PASS+1)); note ok   "$1" "${2:-}"; }
 bad(){  FAIL=$((FAIL+1)); note FAIL "$1" "${2:-}"; }
 die(){  echo; echo "ABORT: $*"; exit 1; }
 
+# ── waiting for Traefik, by observing rather than by guessing ───────────────
+# `sleep 5` was the only synchronization with the file watcher. Traefik's
+# default providersThrottleDuration is 2s and applies AFTER the fsnotify
+# debounce, so under load the new routers can be live later than that — and the
+# verification that follows then observes the OLD backend, scores a failure,
+# and triggers an automatic rollback. That is a second live config flip caused
+# by nothing but impatience, followed by a third if the operator retries.
+#
+# So: poll for the condition, up to a bound, and report how long it took. A
+# timeout still falls through to the verification, which is the thing entitled
+# to decide — this only stops the decision being taken before the answer could
+# possibly be right. The matcher rehearsal already polls; the production
+# scripts were the ones still sleeping.
+wait_for(){ # <seconds> <description> <predicate...>
+  local limit="${NT_B4_WAIT_SECONDS:-$1}" desc="$2"; shift 2
+  local i=0
+  while (( i < limit )); do
+    if "$@" >/dev/null 2>&1; then
+      [[ $i -gt 0 ]] && note ok "$desc" "observed after ${i}s" || note ok "$desc" "observed immediately"
+      return 0
+    fi
+    sleep 1; i=$(( i + 1 ))
+  done
+  note info "$desc" "NOT observed within ${limit}s — continuing to verification, which decides"
+  return 1
+}
+
+
 [[ -d "$DYN" && -w "$DYN" ]] || die "need write access to $DYN (run as root on the host)"
 [[ -f "$OVERLAY" ]] || die "missing overlay: $OVERLAY"
 mkdir -p "$BACKUP_DIR"
@@ -68,6 +96,27 @@ status(){ # <url> [curl args...]
 body(){ local url="$1"; shift; curl -sS --path-as-is --max-time 15 "$@" "$url" 2>/dev/null || true; }
 
 anon_key(){ [[ -r "$ANON_FILE" ]] && tr -d '\r\n' < "$ANON_FILE" || echo ""; }
+
+# ── secrets never go on a command line ──────────────────────────────────────
+# argv is world-readable in /proc for the life of the process, and lands in
+# process accounting and in any `bash -x` capture. The authenticated half of
+# this matrix used to pass the probe identity's password and then its bearer
+# token as `curl -d '{"email":…,"password":…}'` and `-H "Authorization: Bearer …"`,
+# which undoes exactly the discipline nt-b4-deploy-bridge.sh takes trouble to
+# establish on the same host (env-file, mode 0600, tmpfs, unlinked at once).
+#
+# Headers go in a curl `--config` file and the request body in its own file,
+# both 0600, both on tmpfs when there is one, both removed on exit. The JSON is
+# built through STDIN rather than python's argv, because moving the password
+# from curl's command line to python's would not be a fix.
+SECRET_FILES=()
+secret_tmp(){ # -> prints a path to a fresh 0600 file, tracked for cleanup
+  local d="/dev/shm"; [[ -d "$d" && -w "$d" ]] || d="${TMPDIR:-/tmp}"
+  local f; f="$(umask 077; mktemp "$d/nt-b4-secret.XXXXXX")"
+  SECRET_FILES+=("$f"); printf '%s' "$f"
+}
+drop_secrets(){ local f; for f in "${SECRET_FILES[@]:-}"; do [[ -n "$f" ]] && rm -f "$f"; done; SECRET_FILES=(); }
+trap drop_secrets EXIT
 
 # ── pre-checks ──────────────────────────────────────────────────────────────
 pre_checks(){
@@ -156,7 +205,8 @@ do_cutover(){
 
   mv -f "$staged" "$LIVE"
   ok "overlay applied atomically"
-  sleep 5
+  denied_now(){ [[ "$(status "$API_HOST/rest/v1/accounts" -H "apikey: $(anon_key)")" == "403" ]]; }
+  wait_for 30 "the data plane is denied at the edge" denied_now || true
 }
 
 # ── external verification ───────────────────────────────────────────────────
@@ -171,17 +221,25 @@ verify(){
   [[ "$s" == "200" ]] && ok "auth /settings" "http 200" || bad "auth /settings" "http $s"
 
   if [[ -r "$PROBE_CRED" ]]; then
-    local email pw tok
-    email="$(sed -n '1p' "$PROBE_CRED")"; pw="$(sed -n '2p' "$PROBE_CRED")"
+    local tok hdrf bodyf
+    hdrf="$(secret_tmp)"; bodyf="$(secret_tmp)"
+    printf 'header = "apikey: %s"\n' "$key" > "$hdrf"
+    sed -n '1,2p' "$PROBE_CRED" | python3 -c '
+import json, sys
+e = sys.stdin.readline().rstrip("\r\n")
+p = sys.stdin.readline().rstrip("\r\n")
+sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
     tok="$(body "$API_HOST/auth/v1/token?grant_type=password" \
-            -H "apikey: $key" -H 'Content-Type: application/json' \
-            -d "{\"email\":\"$email\",\"password\":\"$pw\"}" \
+            --config "$hdrf" -H 'Content-Type: application/json' --data-binary "@$bodyf" \
           | python3 -c 'import json,sys;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)"
+    rm -f "$bodyf"
     if [[ -n "$tok" ]]; then
       ok "authenticated sign-in still works"
-      s="$(status "$API_HOST/auth/v1/user" -H "apikey: $key" -H "Authorization: Bearer $tok")"
+      { printf 'header = "apikey: %s"\n' "$key"
+        printf 'header = "Authorization: Bearer %s"\n' "$tok"; } > "$hdrf"
+      s="$(status "$API_HOST/auth/v1/user" --config "$hdrf")"
       [[ "$s" == "200" ]] && ok "authenticated /auth/v1/user" "http 200" || bad "authenticated /auth/v1/user" "http $s"
-      s="$(status "$API_HOST/auth/v1/logout" -X POST -H "apikey: $key" -H "Authorization: Bearer $tok")"
+      s="$(status "$API_HOST/auth/v1/logout" -X POST --config "$hdrf")"
       [[ "$s" == "204" ]] && ok "authenticated logout" "http 204" || bad "authenticated logout" "http $s"
     else
       bad "sign-in FAILED through the new edge" "this is the failure Stage 2 must never cause"
@@ -224,12 +282,31 @@ verify(){
 verify_service(){
   echo "SERVICE VERIFICATION (post-rollback)"
   local before=$FAIL
+  # The key first, and as a HARD requirement. anon_key() returns "" when
+  # $ANON_FILE is unreadable, and --rollback runs no pre-checks, so an
+  # unreadable key made /rest/v1 answer 401 — which is "not 403", which scored
+  # ok "data plane reachable again". The check passed *because* it could not be
+  # performed.
   local key; key="$(anon_key)"
+  [[ -n "$key" ]] || bad "no anon key readable at $ANON_FILE" "the data-plane probe below cannot be trusted without one"
+
   local s
   s="$(status "$API_HOST/auth/v1/settings")"
   [[ "$s" == "200" ]] && ok "auth /settings" "http 200" || bad "auth /settings" "http $s"
   s="$(status "$DASH_HOST/api/health")"
   [[ "$s" == "200" ]] && ok "dashboard /api/health" "http 200" || bad "dashboard /api/health" "http $s"
+
+  # THE FILE, not just the wire. A live probe cannot distinguish "the overlay is
+  # gone" from "the overlay is still there but Traefik has not reloaded it yet",
+  # and the probe above is the one an unreadable key silently disarms. The
+  # restored file either carries the Stage 2 routers or it does not, and that is
+  # not a question any timing or credential problem can answer wrongly.
+  if grep -qE 'natetrader-api-auth|natetrader-deny-data-plane' "$LIVE"; then
+    bad "the Stage 2 overlay is still in $LIVE" "the restore did not take effect"
+  else
+    ok "the Stage 2 overlay is gone from $LIVE"
+  fi
+
   # the data plane should be reachable again; that is what was undone
   s="$(status "$API_HOST/rest/v1/" -H "apikey: $key")"
   [[ "$s" == "403" ]] && bad "/rest/v1 still denied after rollback" "the overlay may still be live" \
@@ -248,7 +325,8 @@ rollback(){
   chmod --reference="$LIVE" "$staged"; chown --reference="$LIVE" "$staged"
   mv -f "$staged" "$LIVE"
   echo "rolled back to $target"
-  sleep 5
+  open_now(){ [[ "$(status "$API_HOST/rest/v1/accounts" -H "apikey: $(anon_key)")" != "403" ]]; }
+  wait_for 30 "the data plane is reachable again" open_now || true
 }
 
 case "${1:---check}" in

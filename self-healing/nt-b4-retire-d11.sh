@@ -40,6 +40,9 @@ CONTAINER="${NT_OLD_DASHBOARD:-natetrader-dashboard}"
 BRIDGE="${NT_BRIDGE_CONTAINER:-natetrader-dashboard-bridge}"
 : "${STATE_DIR:=/var/lib/homelab/b4}"
 RECORD="$STATE_DIR/d11-networks.txt"
+# Read-only here: the retire step never writes routing. It is consulted so the
+# script can refuse to stop a container that public traffic still points at.
+LIVE_CONFIG="${NT_TEST_LIVE:-${DYN:-/etc/dokploy/traefik/dynamic}/natetrader.yml}"
 DASH_HOST="${NT_DASH_HOST:-https://nate-trader.anikin.cz}"
 API_HOST="${NT_API_HOST:-https://ntapi.anikin.cz}"
 DYN="${DYN:-/etc/dokploy/traefik/dynamic}"
@@ -57,8 +60,40 @@ mkdir -p "$STATE_DIR"
 
 networks_of(){ docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$1" 2>/dev/null | grep -v '^$' || true; }
 
+# The same question, but able to say "I could not tell". `networks_of` ends in
+# `|| true`, so a failing `docker inspect` returns an EMPTY LIST — which reads
+# identically to "attached to nothing". retire() consumed that twice: it
+# reported "already detached" before doing anything, and then asserted
+# "detached from every network" afterwards, both from a docker call that never
+# answered. A daemon hiccup or a container renamed between the pre-check and
+# the retire was enough to certify containment that had not happened.
+#
+# Exit status here is the answer: 0 = the list is real (possibly empty), 1 =
+# docker did not answer and the caller must not treat the empty list as data.
+networks_of_strict(){ # <container> -> prints the list, rc 1 if docker failed
+  local raw
+  raw="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$1" 2>/dev/null)" || return 1
+  printf '%s' "$raw" | grep -v '^$' || true
+  return 0
+}
+
 pre_checks(){
   echo "PRE-CHECKS"
+
+  # WHO is being retired, before anything about its state is asked.
+  #
+  # $CONTAINER and $BRIDGE are independent environment overrides and were never
+  # compared. Every other pre-check verifies that Traefik points AT $BRIDGE —
+  # none verified that $CONTAINER is not $BRIDGE. So NT_OLD_DASHBOARD set to
+  # the bridge's own name passed all of them, and retire() then stopped the
+  # container serving the public site. The same holds for any other container
+  # on the host, Traefik included.
+  if [[ "$CONTAINER" == "$BRIDGE" ]]; then
+    die "refusing to retire '$CONTAINER': that is the BRIDGE, the container currently
+       serving public traffic. NT_OLD_DASHBOARD and NT_BRIDGE_CONTAINER must name
+       two different containers."
+  fi
+  ok "the container to retire is not the bridge" "$CONTAINER != $BRIDGE"
 
   # Existence is asked as its own question. The previous form was
   #   state="$(docker inspect ... || echo absent)"
@@ -77,6 +112,18 @@ pre_checks(){
     ok "traffic points at the bridge, not at this container"
   else
     bad "Traefik does not point at $BRIDGE" "retiring $CONTAINER would take the site down"
+  fi
+
+  # Belt and braces on the same question from the other side. The check above
+  # asks "does traffic go to the bridge"; this asks "does any route still go to
+  # the container we are about to stop". They differ if the file ever grows a
+  # third router, and the second question is the one whose wrong answer takes
+  # the site down. It runs AFTER the check above so that "Stage 1 was never
+  # applied" keeps its own diagnosis rather than being reported as this.
+  if [[ -r "$LIVE_CONFIG" ]] && grep -qE "url:[[:space:]]*\"?http://${CONTAINER}:" "$LIVE_CONFIG"; then
+    bad "$LIVE_CONFIG still routes to $CONTAINER" "retiring it would take that route down"
+  else
+    ok "no live route points at $CONTAINER"
   fi
 
   # Stage 2 must be in place: this is the last step, not a shortcut to it.
@@ -105,22 +152,41 @@ pre_checks(){
 
 retire(){
   # Record BEFORE changing anything, or --restore has nothing to work from.
-  networks_of "$CONTAINER" > "$RECORD"
-  local n; n="$(wc -l < "$RECORD")"
+  if ! networks_of_strict "$CONTAINER" > "$RECORD"; then
+    die "could not read $CONTAINER's networks — refusing to retire a container whose
+       attachment state is unknown, because an unreadable list is indistinguishable
+       from an empty one and --restore would have nothing to put back"
+  fi
+  local n; n="$(grep -c . "$RECORD" || true)"
   [[ "$n" -gt 0 ]] && ok "recorded $n network(s) for restore" "$RECORD" \
-                   || note info "recorded networks" "none — it was already detached"
+                   || note info "recorded networks" "none — docker answered, and the list is empty"
 
   docker stop "$CONTAINER" >/dev/null
   local state; state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER")"
   [[ "$state" == "exited" ]] && ok "stopped" "$CONTAINER" || bad "stop left it '$state'"
 
   # A restart policy would undo this the next time the daemon restarts.
-  local policy; policy="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER" 2>/dev/null || echo "")"
-  if [[ -n "$policy" && "$policy" != "no" ]]; then
+  # Read, act, then RE-READ. This used to be `docker update … || true` followed
+  # unconditionally by ok "restart policy cleared", so a failed update asserted
+  # the very property the comment above says prevents the container coming back.
+  # The read itself also used `|| echo ""`, so a failing inspect took the
+  # "nothing to clear" branch — the idiom this file documents at the top as
+  # having already failed open once.
+  local policy
+  if ! policy="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER" 2>/dev/null)"; then
+    bad "could not read the restart policy" "cannot confirm it will stay down"
+  elif [[ -n "$policy" && "$policy" != "no" ]]; then
     docker update --restart=no "$CONTAINER" >/dev/null 2>&1 || true
-    ok "restart policy cleared" "was '$policy'"
+    local after
+    if ! after="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER" 2>/dev/null)"; then
+      bad "could not re-read the restart policy" "the update was not confirmed"
+    elif [[ "$after" == "no" ]]; then
+      ok "restart policy cleared" "was '$policy', now '$after'"
+    else
+      bad "restart policy NOT cleared" "was '$policy', still '$after'"
+    fi
   else
-    ok "no restart policy to clear"
+    ok "no restart policy to clear" "reads '$policy'"
   fi
 
   while read -r net; do
@@ -128,16 +194,33 @@ retire(){
     docker network disconnect -f "$net" "$CONTAINER" >/dev/null 2>&1 || true
   done < "$RECORD"
 
-  local left; left="$(networks_of "$CONTAINER" | tr '\n' ' ')"
-  [[ -z "${left// /}" ]] && ok "detached from every network" \
-                         || bad "still attached to" "$left"
+  local left
+  if ! left="$(networks_of_strict "$CONTAINER" | tr '\n' ' ')"; then
+    bad "could not re-read $CONTAINER's networks" "detachment is unconfirmed, not confirmed"
+  elif [[ -z "${left// /}" ]]; then
+    ok "detached from every network"
+  else
+    bad "still attached to" "$left"
+  fi
 
   # It must not be resolvable from the edge any more.
-  if docker run --rm --network dokploy-network busybox:latest \
-       nslookup "$CONTAINER" >/dev/null 2>&1; then
-    bad "$CONTAINER still resolves on dokploy-network"
+  #
+  # WITH A POSITIVE CONTROL, because this check's PASSING value is also its
+  # failure-to-run value: the old form took the else branch — and asserted
+  # "no longer resolves" — whenever `docker run` exited non-zero for ANY
+  # reason, including busybox:latest being absent on an offline host. So the
+  # prober is first pointed at a name that MUST resolve. If that fails, the
+  # prober is broken and neither answer means anything.
+  resolves(){ docker run --rm --network dokploy-network busybox:latest nslookup "$1" >/dev/null 2>&1; }
+  if ! resolves "$BRIDGE"; then
+    bad "the DNS prober is not working" "$BRIDGE does not resolve either — cannot tell detached from unprobeable"
   else
-    ok "$CONTAINER no longer resolves on dokploy-network"
+    ok "DNS prober control" "$BRIDGE resolves, so a negative below is a real negative"
+    if resolves "$CONTAINER"; then
+      bad "$CONTAINER still resolves on dokploy-network"
+    else
+      ok "$CONTAINER no longer resolves on dokploy-network"
+    fi
   fi
 
   # It still EXISTS. That is the rollback path and it is asserted, not assumed.
@@ -166,7 +249,11 @@ restore(){
   ok "reconnected" "${nets:-none}"
   echo
   echo "NOTE: this only brings the container back. Traffic still points at the"
-  echo "bridge until nt-b4-stage1-cutover.sh --rollback is run."
+  echo "bridge, and the unwind has an ORDER:"
+  echo "    1. nt-b4-stage2-cutover.sh --rollback   (removes the containment boundary)"
+  echo "    2. nt-b4-stage1-cutover.sh --rollback   (points traffic back at this container)"
+  echo "Running step 2 first restores a pre-Stage-1 file that has no auth-only"
+  echo "router and no deny middleware, which reopens the public data plane."
 }
 
 case "${1:---check}" in

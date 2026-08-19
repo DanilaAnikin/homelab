@@ -64,6 +64,10 @@ STAGE1_YML='http:
 # rollback cases mean anything.
 cat > "$STUB_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
+# Every invocation's argv, verbatim, so the test can assert what did and did
+# not appear on a command line. argv is world-readable in /proc; a secret that
+# reaches it has leaked whether or not the request succeeds.
+printf '%s\n' "$*" >> "$STUB_STATE/argv.log"
 S="$STUB_STATE"
 LIVE="$NT_TEST_LIVE"
 contained(){ grep -q 'natetrader-deny-data-plane' "$LIVE" 2>/dev/null; }
@@ -120,6 +124,7 @@ fresh(){
   mkdir -p "$WORK/dyn" "$WORK/backup" "$WORK/secrets"
   printf '%s\n' "$STAGE1_YML" > "$WORK/dyn/natetrader.yml"
   chmod 600 "$WORK/dyn/natetrader.yml"
+  : > "$STUB_STATE/argv.log"
   printf 'probe@example.invalid\nnot-a-real-password\n' > "$WORK/secrets/probe.txt"
   printf 'stub-anon-key\n' > "$WORK/secrets/anon.txt"
 }
@@ -248,6 +253,38 @@ else
     && pass "non-vacuity: the overlay's content is actually inspected" \
     || fail "non-vacuity: refused, but not for the missing middleware"
 fi
+
+# ── C9: no secret may reach a command line ──────────────────────────────────
+# The authenticated half of the matrix used to sign in with
+#   curl -d '{"email":…,"password":…}'
+# and then probe with
+#   curl -H "Authorization: Bearer <token>"
+# Both are visible in ps and /proc/<pid>/cmdline to any local user for the
+# duration of the call, and in any process accounting or `bash -x` capture.
+# They are now passed through a 0600 curl --config file and a request-body file
+# on tmpfs, and the JSON is built through python's STDIN rather than its argv,
+# because moving a password from curl's command line to python's is not a fix.
+#
+# This asserts the property directly, from the stub's own record of every argv
+# it was handed — WITH a positive control, because "the password does not
+# appear" is also what an empty log says.
+fresh; healthy_world
+run_script --cutover >/dev/null 2>&1 || true
+ARGV="$STUB_STATE/argv.log"
+[[ -s "$ARGV" ]] && pass "C9 control: the argv log is non-empty ($(wc -l < "$ARGV") invocations)" \
+                 || fail "C9 control: nothing was recorded — the assertions below would be vacuous"
+grep -q 'stub-anon-key' "$ARGV" \
+  && pass "C9 control: a value that IS on argv is found (the publishable anon key)" \
+  || fail "C9 control: the log does not capture argv at all"
+grep -q 'not-a-real-password' "$ARGV" \
+  && fail "C9: the probe PASSWORD appeared on a curl command line" \
+  || pass "C9: the probe password never reaches argv"
+grep -q 'stub-token' "$ARGV" \
+  && fail "C9: the bearer TOKEN appeared on a curl command line" \
+  || pass "C9: the bearer token never reaches argv"
+grep -q 'probe@example.invalid' "$ARGV" \
+  && fail "C9: the probe identity appeared on a curl command line" \
+  || pass "C9: the probe identity never reaches argv"
 
 echo
 echo "stage 2 rehearsal: $OK ok, $BAD not-ok"

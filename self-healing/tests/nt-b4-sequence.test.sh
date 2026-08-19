@@ -108,7 +108,12 @@ case "$url" in
   */login)            code=200 ;;
   */api/health)
       if on_bridge; then body='{"artifact_role":"frozen-containment-bridge","writes_enabled":false}'
-      else body='{"artifact_role":"dashboard","writes_enabled":true}'; fi ;;
+      # MEASURED against the live host, not invented. The production dashboard's
+  # /api/health carries no artifact_role at all; the stub used to answer
+  # {"artifact_role":"dashboard","writes_enabled":true}, which no dashboard has
+  # ever emitted, and that fiction is what let a rollback check that merely
+  # counted 200s look adequate.
+  else body='{"status":"ok","service":"nate-trader-dashboard","strategyVersion":"v11-adaptive-momentum","buildSha":"d11bbad8aad7ec98596b0d290cb938706982d069","dataMode":"account-scoped"}'; fi ;;
   */api/accounts)
       if [[ "$method" == GET ]]; then code=401
       elif on_bridge; then code=503; body='{"reason":"FROZEN_CONTAINMENT_BRIDGE"}'
@@ -167,6 +172,39 @@ CODE(){ PATH="$STUB_BIN:$PATH" NT_TEST_LIVE="$LIVE" curl -sS -o /dev/null -w '%{
   && pass "end state: Auth still works" || fail "end state: Auth is broken"
 [[ "$(CODE https://nate-trader.anikin.cz/api/accounts POST)" == "503" ]] \
   && pass "end state: writes are frozen" || fail "end state: writes are not frozen"
+
+# ── the WRONG order, which is the order the operator is most likely to try ──
+# Stage 1 records its rollback target as the file from before Stage 1. Stage 2
+# keeps a separate pointer and never updates Stage 1's. So `stage1 --rollback`
+# run here — with both stages applied — restores a file with no auth-only
+# router, no percent guard and no deny middleware, reopening the whole public
+# data plane in one atomic rename.
+#
+# MEASURED, against this file's own fixture with the guard removed: the restore
+# landed, `natetrader-deny-data-plane` was gone from the live config, the data
+# plane answered 200, and the script printed ROLLBACK VERIFIED and exited 0 —
+# because its three post-rollback probes are all satisfied with the data plane
+# wide open. `nt-b4-retire-d11.sh` used to close by telling the operator to run
+# exactly this command, and that instruction is only ever read in this state.
+#
+# This block exists because everything above unwinds in the CORRECT order, and
+# a sequence test that only ever walks backwards correctly cannot see this.
+live_before_wrong_order="$(cat "$LIVE")"
+if run1 --rollback; then
+  fail "Stage 1 rolled back WHILE STAGE 2 WAS LIVE and reported success"
+  tail -4 "$WORK/o1.txt"
+else
+  pass "Stage 1 REFUSES to roll back while Stage 2 is live"
+fi
+grep -q 'natetrader-deny-data-plane' "$LIVE" \
+  && pass "the refusal left the containment boundary in place" \
+  || fail "the refused rollback still removed Stage 2's denial"
+[[ "$(cat "$LIVE")" == "$live_before_wrong_order" ]] \
+  && pass "the refused rollback changed nothing at all" \
+  || { fail "the refused rollback modified the live config"; diff <(printf '%s' "$live_before_wrong_order") "$LIVE" | head -6; }
+[[ "$(CODE https://ntapi.anikin.cz/rest/v1/accounts)" == "403" ]] \
+  && pass "the data plane is STILL denied after the refused rollback" \
+  || fail "the refused rollback reopened the data plane"
 
 # ── backward ────────────────────────────────────────────────────────────────
 # A sequence you cannot walk backwards is not reversible, however reversible
