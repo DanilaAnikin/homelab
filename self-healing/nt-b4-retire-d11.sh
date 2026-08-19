@@ -152,11 +152,24 @@ pre_checks(){
 
 retire(){
   # Record BEFORE changing anything, or --restore has nothing to work from.
-  if ! networks_of_strict "$CONTAINER" > "$RECORD"; then
+  # WRITTEN VIA A TEMPORARY, because `> "$RECORD"` is applied by the shell
+  # BEFORE the command runs. The first version of this guard was
+  #     if ! networks_of_strict "$CONTAINER" > "$RECORD"; then die ...
+  # which truncates $RECORD to zero bytes and only then discovers that docker
+  # could not answer — so the guard added to protect the restore record was the
+  # thing that destroyed it, and a second --retire after a transient docker
+  # failure would leave --restore with an empty list it considers valid.
+  # Demonstrated: a two-line record became zero lines before the die fired.
+  local nets_tmp
+  nets_tmp="$(mktemp "${TMPDIR:-/tmp}/nt-b4-nets.XXXXXX")"
+  if ! networks_of_strict "$CONTAINER" > "$nets_tmp"; then
+    rm -f "$nets_tmp"
     die "could not read $CONTAINER's networks — refusing to retire a container whose
        attachment state is unknown, because an unreadable list is indistinguishable
-       from an empty one and --restore would have nothing to put back"
+       from an empty one and --restore would have nothing to put back.
+       $RECORD was NOT modified."
   fi
+  mv -f "$nets_tmp" "$RECORD"
   local n; n="$(grep -c . "$RECORD" || true)"
   [[ "$n" -gt 0 ]] && ok "recorded $n network(s) for restore" "$RECORD" \
                    || note info "recorded networks" "none — docker answered, and the list is empty"
@@ -237,7 +250,12 @@ retire(){
 }
 
 restore(){
+  # An EMPTY file passes `-f`, and an empty record is exactly what the old
+  # truncating guard above used to leave behind. "Refusing to guess" has to mean
+  # refusing to reconnect nothing while reporting success.
   [[ -f "$RECORD" ]] || die "no network record at $RECORD — refusing to guess which networks it was on"
+  [[ -s "$RECORD" ]] || die "$RECORD is EMPTY — there is nothing to reattach, and reporting
+       'reconnected' from an empty record would assert a restore that did not happen"
   while read -r net; do
     [[ -n "$net" ]] || continue
     docker network connect "$net" "$CONTAINER" >/dev/null 2>&1 || true
@@ -245,8 +263,18 @@ restore(){
   docker start "$CONTAINER" >/dev/null
   local state; state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER")"
   [[ "$state" == "running" ]] && ok "restarted" "$CONTAINER" || bad "start left it '$state'"
-  local nets; nets="$(networks_of "$CONTAINER" | tr '\n' ' ')"
-  ok "reconnected" "${nets:-none}"
+  # networks_of (non-strict) returns "" when docker fails, which would report
+  # ok "reconnected  none" for a restore that reattached nothing. retire() was
+  # converted to the strict reader; this path is the one the whole plan depends
+  # on and was left behind.
+  local nets
+  if ! nets="$(networks_of_strict "$CONTAINER" | tr '\n' ' ')"; then
+    bad "could not read $CONTAINER's networks after restore" "the reattachment is unconfirmed"
+  elif [[ -z "${nets// /}" ]]; then
+    bad "restore reattached NO networks" "the record listed $(grep -c . "$RECORD" || echo 0)"
+  else
+    ok "reconnected" "$nets"
+  fi
   echo
   echo "NOTE: this only brings the container back. Traffic still points at the"
   echo "bridge, and the unwind has an ORDER:"

@@ -109,13 +109,28 @@ anon_key(){ [[ -r "$ANON_FILE" ]] && tr -d '\r\n' < "$ANON_FILE" || echo ""; }
 # both 0600, both on tmpfs when there is one, both removed on exit. The JSON is
 # built through STDIN rather than python's argv, because moving the password
 # from curl's command line to python's would not be a fix.
-SECRET_FILES=()
-secret_tmp(){ # -> prints a path to a fresh 0600 file, tracked for cleanup
-  local d="/dev/shm"; [[ -d "$d" && -w "$d" ]] || d="${TMPDIR:-/tmp}"
-  local f; f="$(umask 077; mktemp "$d/nt-b4-secret.XXXXXX")"
-  SECRET_FILES+=("$f"); printf '%s' "$f"
+# A DIRECTORY, not an array. The first version tracked the files in
+# SECRET_FILES and appended from inside secret_tmp — but secret_tmp is called as
+# `hdrf="$(secret_tmp)"`, so the append ran in a COMMAND-SUBSTITUTION SUBSHELL
+# and the parent's array stayed empty. Demonstrated: two files created, parent
+# array length 0, the EXIT trap removed nothing, and both files — one of them
+# holding a bearer token — were still on disk afterwards. The cleanup added to
+# stop secrets persisting was itself a no-op.
+#
+# The directory is created once, at script scope, where nothing is a subshell,
+# and the trap removes the whole directory. There is no per-file bookkeeping to
+# get wrong.
+SECRET_DIR=""
+_secret_dir(){
+  if [[ -z "$SECRET_DIR" ]]; then
+    local d="/dev/shm"; [[ -d "$d" && -w "$d" ]] || d="${TMPDIR:-/tmp}"
+    SECRET_DIR="$(umask 077; mktemp -d "$d/nt-b4-secrets.XXXXXX")"
+  fi
+  printf '%s' "$SECRET_DIR"
 }
-drop_secrets(){ local f; for f in "${SECRET_FILES[@]:-}"; do [[ -n "$f" ]] && rm -f "$f"; done; SECRET_FILES=(); }
+SECRET_DIR="$(_secret_dir)"          # in the PARENT, so the trap can see it
+secret_tmp(){ (umask 077; mktemp "$SECRET_DIR/s.XXXXXX"); }
+drop_secrets(){ [[ -n "$SECRET_DIR" && -d "$SECRET_DIR" ]] && rm -rf "$SECRET_DIR"; return 0; }
 trap drop_secrets EXIT
 
 # ── pre-checks ──────────────────────────────────────────────────────────────

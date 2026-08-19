@@ -286,6 +286,38 @@ grep -q 'probe@example.invalid' "$ARGV" \
   && fail "C9: the probe identity appeared on a curl command line" \
   || pass "C9: the probe identity never reaches argv"
 
+# ── C9b: the cleanup must actually remove the files ────────────────────────
+# The first version tracked secret files in a bash array appended from inside
+# `secret_tmp` — which is called as `hdrf="$(secret_tmp)"`, so the append ran in
+# a COMMAND-SUBSTITUTION SUBSHELL and the parent's array stayed empty. The EXIT
+# trap then removed nothing. Measured: 32 files, mode 0600, one of them holding
+# a bearer token, left on /dev/shm after the rehearsals. The cleanup written to
+# stop secrets persisting was itself a no-op, and nothing noticed because no
+# test looked at the filesystem afterwards.
+#
+# Counting leftovers is the assertion; the control below proves the run created
+# any in the first place, because "no files left" is also what a run that never
+# made one produces.
+# `ls` exits 2 when a glob matches nothing, and this file runs under
+# `set -Eeuo pipefail`, so the obvious one-liner ABORTED the whole rehearsal
+# (rc 2) instead of answering "zero". Counted with find, which reports an empty
+# result as success.
+leftovers(){
+  { find /dev/shm -maxdepth 1 -name 'nt-b4-secret*' 2>/dev/null
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'nt-b4-secret*' 2>/dev/null
+  } | grep -c . || true
+}
+before_leftovers="$(leftovers)"
+fresh; healthy_world
+run_script --cutover >/dev/null 2>&1 || true
+after_leftovers="$(leftovers)"
+grep -q -- '--config' "$STUB_STATE/argv.log" \
+  && pass "C9b control: the run really did create curl --config secret files" \
+  || fail "C9b control: no --config was used, so 'nothing left behind' is vacuous"
+[[ "$after_leftovers" -eq "$before_leftovers" ]] \
+  && pass "C9b: the run left no secret file behind (${before_leftovers} before, ${after_leftovers} after)" \
+  || fail "C9b: the run leaked $(( after_leftovers - before_leftovers )) secret file(s) onto tmpfs"
+
 echo
 echo "stage 2 rehearsal: $OK ok, $BAD not-ok"
 [[ $BAD -eq 0 ]] && { echo "REHEARSAL GREEN — cutover and rollback both exercised"; exit 0; } \
