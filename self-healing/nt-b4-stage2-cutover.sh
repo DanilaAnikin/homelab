@@ -314,6 +314,13 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
 # denials that rollback exists to remove, so a perfectly good rollback reported
 # failure. The mode's own message always said "ROLLBACK DID NOT RESTORE
 # SERVICE"; the implementation just did not check that.
+# NOTE ON SCOPE, because an earlier commit said "verify_service in both cutovers
+# … now asserts the bridge's role is ABSENT". That is true of STAGE 1 only, and
+# it should be: after a Stage 2 rollback the bridge is supposed to still be
+# serving, so asserting its absence here would be asserting the opposite of the
+# desired state. What this function gained instead is a grep of $LIVE for the
+# Stage 2 markers plus a hard requirement on the anon key — a different check,
+# appropriate to a different question.
 verify_service(){
   echo "SERVICE VERIFICATION (post-rollback)"
   local before=$FAIL

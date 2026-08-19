@@ -18,9 +18,15 @@
 # real gateway. Pretending a scratch network could answer for that would be the
 # same overclaim the seal script is careful about.
 #
-# The retire half IS fully covered, because stopping, detaching, resolving and
-# restoring are all local docker behaviour.
-# ============================================================================
+# The retire half is covered HERE ONLY AS INLINE DOCKER BEHAVIOUR. This file
+# seds networks_of() out of the retire script and reimplements stop, update and
+# disconnect itself, so it exercises NONE of retire()'s post-checks and never
+# calls retire() or restore() at all. The sentence that stood here claimed the
+# retire half was fully covered; it was false when written and became more so
+# once those post-checks were repaired. What actually covers them is
+# nt-b4-retire-d11.test.sh, which executes --retire with twelve cases including
+# each of the four fail-open assertions reproduced red-before.
+# ==========================================================================
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
