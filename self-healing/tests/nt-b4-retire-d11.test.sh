@@ -125,7 +125,7 @@ while [[ $# -gt 0 ]]; do
 done
 case "$url" in
   */api/health)       key=dash ;;
-  */auth/v1/settings) key=auth ;;
+  */auth/v1/verify)   key=auth ;;
   *) key=other ;;
 esac
 if [[ "$want" == 1 ]]; then cat "$S/code_$key" 2>/dev/null || echo 200
@@ -145,7 +145,7 @@ healthy(){
   echo running > "$STUB_STATE/old_state"
   echo 200 > "$STUB_STATE/code_dash"
   echo '{"artifact_role":"frozen-containment-bridge","writes_enabled":false}' > "$STUB_STATE/body_dash"
-  echo 200 > "$STUB_STATE/code_auth"
+  echo 400 > "$STUB_STATE/code_auth"
   printf '%s\n' "$CONTAINED" > "$LIVE"
 }
 

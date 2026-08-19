@@ -126,7 +126,12 @@ case "$url" in
   */api/health)    key=health ;;
   */login)         key=login ;;
   */api/accounts)  key="accounts_$method" ;;
-  */auth/v1/settings) key=auth ;;
+  # MEASURED against production: /auth/v1/verify is an open Kong route and
+  # answers 400 (GoTrue rejecting the missing token). /auth/v1/settings sits
+  # behind key-auth and answers 401 unauthenticated — the stub used to say
+  # 200 for it, which is why eight probes asserting 200 looked fine here and
+  # would every one of them have failed against the real host.
+  */auth/v1/verify)   key=auth ;;
   *) key=other ;;
 esac
 code="$(cat "$S/code_$key" 2>/dev/null || echo 200)"
@@ -159,7 +164,7 @@ healthy_world(){
   echo 401                     > "$STUB_STATE/internal_protected"
   echo 200 > "$STUB_STATE/code_health";       echo "$bridge_body" > "$STUB_STATE/body_health"
   echo 200 > "$STUB_STATE/code_login"
-  echo 200 > "$STUB_STATE/code_auth"
+  echo 400 > "$STUB_STATE/code_auth"
   echo 401 > "$STUB_STATE/code_accounts_GET"
   for v in POST PUT PATCH DELETE; do echo 503 > "$STUB_STATE/code_accounts_$v"; done
   echo '{"reason":"FROZEN_CONTAINMENT_BRIDGE"}' > "$STUB_STATE/body_accounts_POST"

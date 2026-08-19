@@ -84,7 +84,11 @@ while [[ $# -gt 0 ]]; do
 done
 key=other
 case "$url" in
-  */auth/v1/settings)  key=auth_settings ;;
+  # MEASURED: /auth/v1/verify is an open Kong route (400 from GoTrue);
+  # /auth/v1/settings is behind key-auth (401 unauthenticated). The scripts
+  # now probe the former, because the latter made every liveness assertion
+  # here pass on a fiction and fail against the real host.
+  */auth/v1/verify)    key=auth_settings ;;
   */auth/v1/token*)    key=auth_token ;;
   */auth/v1/user)      key=auth_user ;;
   */auth/v1/logout)    key=auth_logout ;;
@@ -106,7 +110,7 @@ EOF
 chmod +x "$STUB_BIN/curl"
 
 healthy_world(){
-  echo 200 > "$STUB_STATE/code_auth_settings"
+  echo 400 > "$STUB_STATE/code_auth_settings"
   echo 200 > "$STUB_STATE/code_auth_token"
   echo '{"access_token":"stub-token"}' > "$STUB_STATE/body_auth_token"
   echo 200 > "$STUB_STATE/code_auth_user"

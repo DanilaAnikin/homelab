@@ -133,6 +133,26 @@ secret_tmp(){ (umask 077; mktemp "$SECRET_DIR/s.XXXXXX"); }
 drop_secrets(){ [[ -n "$SECRET_DIR" && -d "$SECRET_DIR" ]] && rm -rf "$SECRET_DIR"; return 0; }
 trap drop_secrets EXIT
 
+# ── the Auth liveness probe, and why it is not /auth/v1/settings ───────────
+# MEASURED against the live host on 2026-08-19:
+#     GET https://ntapi.anikin.cz/auth/v1/settings            -> 401
+#     GET https://ntapi.anikin.cz/auth/v1/settings  + apikey  -> 200
+#     GET https://ntapi.anikin.cz/auth/v1/verify              -> 400
+# Kong's `auth-v1` route carries key-auth, so /settings answers 401
+# (`www-authenticate: Key`) to an unauthenticated caller. Every probe in these
+# scripts asserted `== 200` and sent no key, so against production they would
+# all have scored a failure: --cutover would have rolled back a cutover that
+# worked, --rollback would have reported ROLLBACK DID NOT RESTORE SERVICE, and
+# retire would have refused claiming Auth was down. Not one rehearsal could see
+# it, because every stub answers 200 by fixture.
+#
+# /auth/v1/verify is one of Kong's `auth-v1-open` routes: no key-auth, so the
+# request reaches GoTrue, which rejects the missing token with 400. That 400 is
+# a stronger liveness signal than a 200 from a gateway plugin — it proves the
+# whole chain answered, Traefik -> Kong -> GoTrue. A 404 means the route is
+# gone; 5xx or a curl error means Auth is down; both are failures.
+AUTH_PROBE_PATH="/auth/v1/verify"
+AUTH_PROBE_OK="400"
 # ── pre-checks ──────────────────────────────────────────────────────────────
 pre_checks(){
   echo "PRE-CHECKS"
@@ -157,9 +177,9 @@ pre_checks(){
 
   # Auth must be healthy BEFORE, or the post-checks cannot tell this change
   # from a fault that was already there.
-  local s; s="$(status "$API_HOST/auth/v1/settings")"
-  [[ "$s" == "200" ]] && ok "Auth /settings healthy before" "http 200" \
-                      || bad "Auth /settings is not healthy" "http $s"
+  local s; s="$(status "$API_HOST$AUTH_PROBE_PATH")"
+  [[ "$s" == "$AUTH_PROBE_OK" ]] && ok "Auth healthy before" "$AUTH_PROBE_PATH -> http $s" \
+                      || bad "Auth is not healthy" "$AUTH_PROBE_PATH -> http $s (want $AUTH_PROBE_OK)"
 
   # And the data plane must currently be REACHABLE. If it is already denied by
   # something else, every post-check below would pass without this change
@@ -232,8 +252,8 @@ verify(){
 
   # AUTH FIRST. This is the flow that must not break, so it is the first thing
   # checked and the first thing a failure rolls back.
-  local s; s="$(status "$API_HOST/auth/v1/settings")"
-  [[ "$s" == "200" ]] && ok "auth /settings" "http 200" || bad "auth /settings" "http $s"
+  local s; s="$(status "$API_HOST$AUTH_PROBE_PATH")"
+  [[ "$s" == "$AUTH_PROBE_OK" ]] && ok "auth reachable" "$AUTH_PROBE_PATH -> http $s" || bad "auth NOT reachable" "$AUTH_PROBE_PATH -> http $s (want $AUTH_PROBE_OK)"
 
   if [[ -r "$PROBE_CRED" ]]; then
     local tok hdrf bodyf
@@ -306,8 +326,8 @@ verify_service(){
   [[ -n "$key" ]] || bad "no anon key readable at $ANON_FILE" "the data-plane probe below cannot be trusted without one"
 
   local s
-  s="$(status "$API_HOST/auth/v1/settings")"
-  [[ "$s" == "200" ]] && ok "auth /settings" "http 200" || bad "auth /settings" "http $s"
+  s="$(status "$API_HOST$AUTH_PROBE_PATH")"
+  [[ "$s" == "$AUTH_PROBE_OK" ]] && ok "auth reachable" "$AUTH_PROBE_PATH -> http $s" || bad "auth NOT reachable" "$AUTH_PROBE_PATH -> http $s (want $AUTH_PROBE_OK)"
   s="$(status "$DASH_HOST/api/health")"
   [[ "$s" == "200" ]] && ok "dashboard /api/health" "http 200" || bad "dashboard /api/health" "http $s"
 

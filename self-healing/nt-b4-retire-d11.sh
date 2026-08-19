@@ -77,6 +77,26 @@ networks_of_strict(){ # <container> -> prints the list, rc 1 if docker failed
   return 0
 }
 
+# ── the Auth liveness probe, and why it is not /auth/v1/settings ───────────
+# MEASURED against the live host on 2026-08-19:
+#     GET https://ntapi.anikin.cz/auth/v1/settings            -> 401
+#     GET https://ntapi.anikin.cz/auth/v1/settings  + apikey  -> 200
+#     GET https://ntapi.anikin.cz/auth/v1/verify              -> 400
+# Kong's `auth-v1` route carries key-auth, so /settings answers 401
+# (`www-authenticate: Key`) to an unauthenticated caller. Every probe in these
+# scripts asserted `== 200` and sent no key, so against production they would
+# all have scored a failure: --cutover would have rolled back a cutover that
+# worked, --rollback would have reported ROLLBACK DID NOT RESTORE SERVICE, and
+# retire would have refused claiming Auth was down. Not one rehearsal could see
+# it, because every stub answers 200 by fixture.
+#
+# /auth/v1/verify is one of Kong's `auth-v1-open` routes: no key-auth, so the
+# request reaches GoTrue, which rejects the missing token with 400. That 400 is
+# a stronger liveness signal than a 200 from a gateway plugin — it proves the
+# whole chain answered, Traefik -> Kong -> GoTrue. A 404 means the route is
+# gone; 5xx or a curl error means Auth is down; both are failures.
+AUTH_PROBE_PATH="/auth/v1/verify"
+AUTH_PROBE_OK="400"
 pre_checks(){
   echo "PRE-CHECKS"
 
@@ -139,8 +159,8 @@ pre_checks(){
   local b; b="$(body "$DASH_HOST/api/health")"
   [[ "$b" == *'"artifact_role":"frozen-containment-bridge"'* ]] \
     && ok "the bridge is what is serving" || bad "the bridge is not what is serving"
-  s="$(status "$API_HOST/auth/v1/settings")"
-  [[ "$s" == "200" ]] && ok "Auth reachable" "http 200" || bad "Auth" "http $s"
+  s="$(status "$API_HOST$AUTH_PROBE_PATH")"
+  [[ "$s" == "$AUTH_PROBE_OK" ]] && ok "Auth reachable" "$AUTH_PROBE_PATH -> http $s" || bad "Auth" "$AUTH_PROBE_PATH -> http $s (want $AUTH_PROBE_OK)"
 
   local nets; nets="$(networks_of "$CONTAINER" | tr '\n' ' ')"
   note info "networks it is on" "${nets:-none}"
@@ -245,8 +265,8 @@ retire(){
   local s; s="$(status "$DASH_HOST/api/health")"
   [[ "$s" == "200" ]] && ok "public dashboard still healthy after retire" "http 200" \
                       || bad "the site broke when the old container was retired" "http $s"
-  s="$(status "$API_HOST/auth/v1/settings")"
-  [[ "$s" == "200" ]] && ok "Auth still reachable" "http 200" || bad "Auth broke" "http $s"
+  s="$(status "$API_HOST$AUTH_PROBE_PATH")"
+  [[ "$s" == "$AUTH_PROBE_OK" ]] && ok "Auth still reachable" "$AUTH_PROBE_PATH -> http $s" || bad "Auth broke" "$AUTH_PROBE_PATH -> http $s (want $AUTH_PROBE_OK)"
 }
 
 restore(){

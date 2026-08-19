@@ -101,7 +101,8 @@ while [[ $# -gt 0 ]]; do
 done
 code=200; body='{}'
 case "$url" in
-  */auth/v1/settings) code=200 ;;
+  */auth/v1/verify)   code=400 ;;   # measured: open route, GoTrue answers 400
+  */auth/v1/settings) code=401 ;;   # measured: behind Kong key-auth
   */auth/v1/token*)   code=200; body='{"access_token":"stub"}' ;;
   */auth/v1/user)     code=200 ;;
   */auth/v1/logout)   code=204 ;;
@@ -168,7 +169,7 @@ grep -q '!PathRegexp(`%`)' "$LIVE" && pass "the percent guard is present" || fai
 CODE(){ PATH="$STUB_BIN:$PATH" NT_TEST_LIVE="$LIVE" curl -sS -o /dev/null -w '%{http_code}' "$1" ${2:+-X "$2"}; }
 [[ "$(CODE https://ntapi.anikin.cz/rest/v1/accounts)" == "403" ]] \
   && pass "end state: the data plane is denied" || fail "end state: the data plane is open"
-[[ "$(CODE https://ntapi.anikin.cz/auth/v1/settings)" == "200" ]] \
+[[ "$(CODE https://ntapi.anikin.cz/auth/v1/verify)" == "400" ]] \
   && pass "end state: Auth still works" || fail "end state: Auth is broken"
 [[ "$(CODE https://nate-trader.anikin.cz/api/accounts POST)" == "503" ]] \
   && pass "end state: writes are frozen" || fail "end state: writes are not frozen"
