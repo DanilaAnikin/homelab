@@ -67,6 +67,20 @@ die(){  echo; echo "ABORT: $*"; exit 1; }
 # to decide — this only stops the decision being taken before the answer could
 # possibly be right. The matcher rehearsal already polls; the production
 # scripts were the ones still sleeping.
+# VALIDATED AT STARTUP, not at the first call site.
+#
+# The check lived inside wait_for, and in do_cutover that call is six lines
+# AFTER the atomic rename — so a junk bound still flipped the live Traefik
+# config and only then died, with verify() never running and the automatic
+# rollback never firing. That is verbatim the failure the comment inside
+# wait_for describes as closed. A bound that cannot be used is knowable before
+# anything is touched, so it is checked before anything is touched.
+if [[ -n "${NT_B4_WAIT_SECONDS:-}" && ! "${NT_B4_WAIT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ABORT: NT_B4_WAIT_SECONDS='${NT_B4_WAIT_SECONDS}' is not a positive integer;" >&2
+  echo "       refusing to start with an unusable synchronisation bound. Nothing was changed." >&2
+  exit 1
+fi
+
 wait_for(){ # <seconds> <description> <predicate...>
   # A WALL-CLOCK bound, not an iteration count. Each predicate makes a curl
   # call with --max-time 15, so `wait_for 30` counting iterations could block
@@ -380,11 +394,25 @@ verify_service(){
   fi
 
   # the data plane should be reachable again; that is what was undone
+  # WIRE EVIDENCE, WITH OR WITHOUT A KEY. Skipping the probe when no key is
+  # readable left the verdict resting on `grep -qE '<stage 2 markers>' "$LIVE"` —
+  # and rollback() has just mv-ed over $LIVE a backup that by construction has
+  # no Stage 2 markers, so that grep can only fail if the restore itself failed.
+  # It is a tautology on the DEFAULT path, because $ANON_FILE does not exist on
+  # the host.
+  #
+  # A keyless probe still discriminates, which is the whole point. MEASURED
+  # against the live host: an unauthenticated /rest/v1/ answers 401 when the
+  # data plane is open (Kong's key-auth rejecting the caller) and 403 when the
+  # Stage 2 deny middleware is in front of it. 403 is the denial; anything else
+  # means the denial is gone, which is what a rollback is for.
   if [[ -n "$key" ]]; then
     s="$(status "$API_HOST/rest/v1/" -H "apikey: $key")"
-    [[ "$s" == "403" ]] && bad "/rest/v1 still denied after rollback" "the overlay may still be live" \
-                        || ok "data plane reachable again" "/rest/v1 -> http $s"
+  else
+    s="$(status "$API_HOST/rest/v1/")"
   fi
+  [[ "$s" == "403" ]] && bad "/rest/v1 still denied after rollback" "the overlay may still be live" \
+                      || ok "data plane reachable again" "/rest/v1 -> http $s${key:+ (keyed)}${key:+}"
   echo
   [[ $FAIL -eq $before ]]
 }

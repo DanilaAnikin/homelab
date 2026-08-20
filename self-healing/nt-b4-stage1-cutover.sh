@@ -79,6 +79,20 @@ die(){  echo; echo "ABORT: $*"; exit 1; }
 # to decide — this only stops the decision being taken before the answer could
 # possibly be right. The matcher rehearsal already polls; the production
 # scripts were the ones still sleeping.
+# VALIDATED AT STARTUP, not at the first call site.
+#
+# The check lived inside wait_for, and in do_cutover that call is six lines
+# AFTER the atomic rename — so a junk bound still flipped the live Traefik
+# config and only then died, with verify() never running and the automatic
+# rollback never firing. That is verbatim the failure the comment inside
+# wait_for describes as closed. A bound that cannot be used is knowable before
+# anything is touched, so it is checked before anything is touched.
+if [[ -n "${NT_B4_WAIT_SECONDS:-}" && ! "${NT_B4_WAIT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ABORT: NT_B4_WAIT_SECONDS='${NT_B4_WAIT_SECONDS}' is not a positive integer;" >&2
+  echo "       refusing to start with an unusable synchronisation bound. Nothing was changed." >&2
+  exit 1
+fi
+
 wait_for(){ # <seconds> <description> <predicate...>
   # A WALL-CLOCK bound, not an iteration count. Each predicate makes a curl
   # call with --max-time 15, so `wait_for 30` counting iterations could block

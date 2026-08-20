@@ -338,6 +338,10 @@ case "${1:---check}" in
   --retire)  pre_checks; echo; echo "RETIRE"; retire; echo
              echo "retire: $PASS ok, $FAIL failed"
              [[ $FAIL -eq 0 ]] || exit 1 ;;
-  --restore) echo "RESTORE"; restore ;;
+  # GATED, like --retire. This round added two `bad` branches to restore() — the
+  # path the whole plan depends on to undo a retire — and without a gate they
+  # could not reach the caller: --restore exited 0 whatever it found, and then
+  # printed the unwind instructions as though the container were back.
+  --restore) echo "RESTORE"; restore; [[ $FAIL -eq 0 ]] || exit 1 ;;
   *) die "unknown mode: $1" ;;
 esac

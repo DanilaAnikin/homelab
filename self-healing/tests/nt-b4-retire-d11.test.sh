@@ -301,18 +301,36 @@ elif grep -qF "cannot read" "$WORK/out.txt"; then pass "RET3a: an unreadable con
 else fail "RET3a: refused, but not for unreadability"; tail -3 "$WORK/out.txt"; fi
 chmod 644 "$LIVE"
 
+# THE BRIDGE ROUTE STAYS. The first version of this case REPLACED the bridge
+# URL, which removed the only occurrence of `natetrader-dashboard-bridge` from
+# the fixture — so an earlier pre-check ("Traefik does not point at $BRIDGE")
+# failed the run first, for every form, and the case passed without the guard
+# under test ever being reached. It also had no message assertion at all, so it
+# could not tell which check had refused. Both fixed: a SECOND service pointing
+# at $CONTAINER is added alongside the bridge, and the message is required.
 for form in "'http://natetrader-dashboard:3000'" "http://natetrader-dashboard" '"http://natetrader-dashboard:3000"'; do
   healthy
   python3 - "$LIVE" "$form" <<'PYX'
-import sys, pathlib, re
-p = pathlib.Path(sys.argv[1]); s = p.read_text()
-# point the dashboard service back at the OLD container, in the given form
-s = re.sub(r'url:\s*"http://natetrader-dashboard-bridge:3000"', "url: " + sys.argv[2], s)
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text().rstrip("\n")
+s += ("\n    natetrader-legacy:\n"
+      "      loadBalancer:\n"
+      "        servers: [{ url: " + sys.argv[2] + " }]\n")
 p.write_text(s)
 PYX
-  if run; then fail "RET3b: a live route in the form ${form} was not seen"
-  else pass "RET3b: a live route written as ${form} is caught"; fi
+  if run; then
+    fail "RET3b: a live route in the form ${form} was not seen"
+  elif grep -qF "still routes to natetrader-dashboard" "$WORK/out.txt"; then
+    pass "RET3b: a live route written as ${form} is caught, and named"
+  else
+    fail "RET3b: refused for some other reason with ${form}"; tail -3 "$WORK/out.txt"
+  fi
 done
+# NON-VACUITY: with no such route the same fixture must PASS, or the three cases
+# above would be satisfied by any refusal at all.
+healthy
+if run; then pass "RET3b control: the unmodified fixture still passes"
+else fail "RET3b control: the fixture fails even without a legacy route"; tail -3 "$WORK/out.txt"; fi
 
 # ── RET-4: a failing docker call must report, not abort ────────────────────
 # `docker stop` and the state inspect were bare under `set -e`, so a daemon

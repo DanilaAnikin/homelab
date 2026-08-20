@@ -99,7 +99,13 @@ cat > "$STUB_BIN/curl" <<'EOF'
 # $S/curl_fails makes every request fail the way a real one can — connection
 # reset, a stall past --max-time. That is the only way to test a check which
 # must not read a failed request as an answer.
+# $S/curl_fails fails EVERYTHING. $S/curl_body_fails fails only the requests
+# that ask for a BODY — which is what isolates the absence check: the three
+# status probes in verify_service still answer 200, so they cannot score `bad`
+# on their own, and the only thing that can decide the verdict is whether a
+# failed body read is treated as "the bridge is gone".
 if [[ -f "$STUB_STATE/curl_fails" ]]; then exit 7; fi
+if [[ -f "$STUB_STATE/curl_body_fails" && "$*" != *"%{http_code}"* ]]; then exit 7; fi
 S="$STUB_STATE"
 LIVE="$NT_TEST_LIVE"
 # The file says one thing; what Traefik is SERVING can lag it. $S/reload_lag,
@@ -345,16 +351,24 @@ grep -qi 'rolling back\|rolled back' "$WORK/out.txt" \
 # result that cannot distinguish absence from failure is not a test.
 fresh_dyn; healthy_world
 run_script --cutover >/dev/null 2>&1 || true
-: > "$STUB_STATE/curl_fails"
+# ONLY the body request fails. With every request failing, the three status
+# probes score `bad` on their own and the rollback exits non-zero whether or not
+# http_body_ok exists — so the headline assertion would have been decorative,
+# passing for a reason unrelated to the defect. Here the status probes all
+# answer 200 and the absence check is the only thing that can decide.
+: > "$STUB_STATE/curl_body_fails"
 if run_script --rollback; then
-  fail "F1: --rollback reported success while every request was failing"
+  fail "F1: --rollback reported success on a health BODY that never arrived"
 else
-  pass "F1: a failing health request is not read as 'the bridge is gone'"
+  pass "F1: a failing health body is not read as 'the bridge is gone'"
 fi
 grep -qi 'cannot tell whether the bridge is gone' "$WORK/out.txt" \
   && pass "F1: and it says it could not tell, rather than asserting absence" \
   || { fail "F1: refused, but not for the right reason"; tail -4 "$WORK/out.txt"; }
-rm -f "$STUB_STATE/curl_fails"
+grep -qi 'http curl-error' "$WORK/out.txt" \
+  && fail "F1 control: the STATUS probes failed too, so this case is not isolated" \
+  || pass "F1 control: the status probes all succeeded, so only the body check decided"
+rm -f "$STUB_STATE/curl_body_fails"
 
 # ── the synchronisation bound must be a bound ──────────────────────────────
 # `${NT_B4_WAIT_SECONDS:-$1}` went straight into `(( i < limit ))`. An
