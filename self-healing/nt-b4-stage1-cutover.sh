@@ -426,6 +426,25 @@ stage2_markers_in_live(){ grep -qE 'natetrader-api-auth|natetrader-deny-data-pla
 
 rollback(){
   if stage2_markers_in_live; then
+    # AND CHECK THAT THE STEP WE PRESCRIBE CAN ACTUALLY RUN. Stage 2's rollback
+    # dies if its recorded target is missing or fails its own checksum, so
+    # telling the operator "run Stage 2's rollback first" without looking can
+    # leave BOTH scripted paths refusing, mid-incident, with no next step named.
+    local s2t s2ok="yes"
+    s2t="$(cat "$BACKUP_DIR/stage2-rollback-target" 2>/dev/null || true)"
+    if [[ -z "$s2t" || ! -f "$s2t" ]]; then s2ok="no — no Stage 2 rollback target is recorded"
+    elif ! sha256sum -c "$s2t.sha256" >/dev/null 2>&1; then s2ok="no — the Stage 2 backup fails its own checksum"
+    fi
+    if [[ "$s2ok" != yes ]]; then
+      die "the live config still carries the Stage 2 containment boundary, AND
+       Stage 2's own rollback cannot run: $s2ok
+       Both scripted paths are therefore refusing. Recover by hand, in this order:
+         1. find the newest $BACKUP_DIR/natetrader.yml.pre-stage2.* whose .sha256 verifies
+         2. cp -p it over $LIVE, preserving mode and owner
+         3. confirm https://ntapi.anikin.cz/rest/v1/ is reachable again
+         4. then re-run $0 --rollback
+       Refusing to restore the pre-Stage-1 file, which would reopen the public data plane."
+    fi
     die "the live config still carries the Stage 2 containment boundary.
        Rolling Stage 1 back now would restore the pre-Stage-1 file, which has no
        auth-only router and no deny middleware — the public data plane would be

@@ -349,8 +349,18 @@ verify_service(){
   # unreadable key made /rest/v1 answer 401 — which is "not 403", which scored
   # ok "data plane reachable again". The check passed *because* it could not be
   # performed.
+  # A MISSING KEY IS NOT A FAILED ROLLBACK. Making it `bad` here turned a
+  # rollback that demonstrably succeeded — the overlay is gone from $LIVE, which
+  # the file assertion below proves and no credential can affect — into
+  # "ROLLBACK DID NOT RESTORE SERVICE" and exit 1, because this function's
+  # verdict is `[[ $FAIL -eq $before ]]`. And --rollback runs no pre-checks, so
+  # an unreadable $ANON_FILE (a path outside these scripts' control) was enough
+  # to do it, mid-incident. The keyed probe is SKIPPED and said to be skipped;
+  # the hard requirement stays where the matrix actually depends on it.
   local key; key="$(anon_key)"
-  [[ -n "$key" ]] || bad "no anon key readable at $ANON_FILE" "the data-plane probe below cannot be trusted without one"
+  if [[ -z "$key" ]]; then
+    note info "no anon key readable at $ANON_FILE" "the keyed data-plane probe is SKIPPED; the file assertion below still decides"
+  fi
 
   local s
   s="$(status "$API_HOST$AUTH_PROBE_PATH")"
@@ -370,9 +380,11 @@ verify_service(){
   fi
 
   # the data plane should be reachable again; that is what was undone
-  s="$(status "$API_HOST/rest/v1/" -H "apikey: $key")"
-  [[ "$s" == "403" ]] && bad "/rest/v1 still denied after rollback" "the overlay may still be live" \
-                      || ok "data plane reachable again" "/rest/v1 -> http $s"
+  if [[ -n "$key" ]]; then
+    s="$(status "$API_HOST/rest/v1/" -H "apikey: $key")"
+    [[ "$s" == "403" ]] && bad "/rest/v1 still denied after rollback" "the overlay may still be live" \
+                        || ok "data plane reachable again" "/rest/v1 -> http $s"
+  fi
   echo
   [[ $FAIL -eq $before ]]
 }
