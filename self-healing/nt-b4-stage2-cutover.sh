@@ -68,14 +68,34 @@ die(){  echo; echo "ABORT: $*"; exit 1; }
 # possibly be right. The matcher rehearsal already polls; the production
 # scripts were the ones still sleeping.
 wait_for(){ # <seconds> <description> <predicate...>
+  # A WALL-CLOCK bound, not an iteration count. Each predicate makes a curl
+  # call with --max-time 15, so `wait_for 30` counting iterations could block
+  # for ~480s while printing "NOT observed within 30s" — and in do_cutover that
+  # window sits between the atomic rename and `verify`, delaying the automatic
+  # rollback of a broken public host by up to eight minutes.
+  #
+  # And the bound is VALIDATED. It used to be `${NT_B4_WAIT_SECONDS:-$1}` fed
+  # straight into `(( i < limit ))`: an identifier-like value (`fast`, `auto`)
+  # is an unbound variable inside (( )), which under `set -u` kills the shell —
+  # on the statement immediately after `mv -f "$staged" "$LIVE"`, so the config
+  # is already flipped, verify never runs and the rollback never fires. Junk
+  # like `30s` or `0` silently made the loop body run zero times, removing all
+  # synchronisation with Traefik's watcher, which is the failure this function
+  # was written to remove.
   local limit="${NT_B4_WAIT_SECONDS:-$1}" desc="$2"; shift 2
-  local i=0
-  while (( i < limit )); do
+  if [[ ! "$limit" =~ ^[1-9][0-9]*$ ]]; then
+    die "NT_B4_WAIT_SECONDS='${NT_B4_WAIT_SECONDS:-}' is not a positive integer;
+       refusing to run with an unusable synchronisation bound"
+  fi
+  local deadline=$(( SECONDS + limit ))
+  local waited
+  while (( SECONDS < deadline )); do
     if "$@" >/dev/null 2>&1; then
-      [[ $i -gt 0 ]] && note ok "$desc" "observed after ${i}s" || note ok "$desc" "observed immediately"
+      waited=$(( SECONDS - (deadline - limit) ))
+      note ok "$desc" "observed after ${waited}s"
       return 0
     fi
-    sleep 1; i=$(( i + 1 ))
+    sleep 1
   done
   note info "$desc" "NOT observed within ${limit}s — continuing to verification, which decides"
   return 1

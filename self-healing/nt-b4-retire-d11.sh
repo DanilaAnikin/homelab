@@ -42,7 +42,13 @@ BRIDGE="${NT_BRIDGE_CONTAINER:-natetrader-dashboard-bridge}"
 RECORD="$STATE_DIR/d11-networks.txt"
 # Read-only here: the retire step never writes routing. It is consulted so the
 # script can refuse to stop a container that public traffic still points at.
-LIVE_CONFIG="${NT_TEST_LIVE:-${DYN:-/etc/dokploy/traefik/dynamic}/natetrader.yml}"
+# The SAME path the other two checks read. This used to be
+#   "${NT_TEST_LIVE:-${DYN:-…}/natetrader.yml}"
+# — a second, undocumented seam in production code, so exporting NT_TEST_LIVE to
+# a nonexistent path silently disabled the guard below while the checks around
+# it kept reading the real $DYN/natetrader.yml and the run still reported 8 ok.
+# One source of truth, and $DYN is already the seam the rehearsals use.
+LIVE_CONFIG="${DYN:-/etc/dokploy/traefik/dynamic}/natetrader.yml"
 DASH_HOST="${NT_DASH_HOST:-https://nate-trader.anikin.cz}"
 API_HOST="${NT_API_HOST:-https://ntapi.anikin.cz}"
 DYN="${DYN:-/etc/dokploy/traefik/dynamic}"
@@ -140,7 +146,15 @@ pre_checks(){
   # third router, and the second question is the one whose wrong answer takes
   # the site down. It runs AFTER the check above so that "Stage 1 was never
   # applied" keeps its own diagnosis rather than being reported as this.
-  if [[ -r "$LIVE_CONFIG" ]] && grep -qE "url:[[:space:]]*\"?http://${CONTAINER}:" "$LIVE_CONFIG"; then
+  # UNREADABLE IS NOT CLEAN. `[[ -r … ]] &&` used to short-circuit into the
+  # else branch, so "no live route points at $CONTAINER" was a positive
+  # assertion produced by never having opened the file.
+  if [[ ! -r "$LIVE_CONFIG" ]]; then
+    bad "cannot read $LIVE_CONFIG" "cannot tell whether a live route still points at $CONTAINER"
+  # Quoting and the port are both optional in Traefik's YAML: `url: 'http://x'`
+  # and `url: http://x` are valid and the earlier regex — which required a
+  # double quote and a trailing colon — matched neither.
+  elif grep -qE "url:[[:space:]]*[\"']?http://${CONTAINER}([:/\"' ]|$)" "$LIVE_CONFIG"; then
     bad "$LIVE_CONFIG still routes to $CONTAINER" "retiring it would take that route down"
   else
     ok "no live route points at $CONTAINER"
@@ -194,9 +208,24 @@ retire(){
   [[ "$n" -gt 0 ]] && ok "recorded $n network(s) for restore" "$RECORD" \
                    || note info "recorded networks" "none — docker answered, and the list is empty"
 
-  docker stop "$CONTAINER" >/dev/null
-  local state; state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER")"
-  [[ "$state" == "exited" ]] && ok "stopped" "$CONTAINER" || bad "stop left it '$state'"
+  # NEITHER OF THESE MAY ABORT THE SCRIPT. Both were bare under `set -e`, so a
+  # daemon hiccup — the exact scenario the comments in this file keep naming —
+  # killed the run at the single worst point: after the container is stopped,
+  # before the restart policy is cleared and before the disconnect loop. The
+  # operator saw no FAIL line, no summary and no diagnosis, and was left with a
+  # stopped container still attached to dokploy-network with `unless-stopped`
+  # intact, which is precisely the state this step exists to prevent.
+  if ! docker stop "$CONTAINER" >/dev/null 2>&1; then
+    bad "docker stop failed" "$CONTAINER may still be running; continuing so the remaining steps still report"
+  fi
+  local state
+  if ! state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null)"; then
+    bad "could not read $CONTAINER's state after stop" "cannot confirm it is down"
+  elif [[ "$state" == "exited" ]]; then
+    ok "stopped" "$CONTAINER"
+  else
+    bad "stop left it '$state'"
+  fi
 
   # A restart policy would undo this the next time the daemon restarts.
   # Read, act, then RE-READ. This used to be `docker update … || true` followed

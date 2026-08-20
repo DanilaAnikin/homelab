@@ -95,6 +95,11 @@ cat > "$STUB_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 # Answers by URL and method, from state files. -w '%{http_code}' means the
 # caller wants the status; otherwise it wants the body.
+#
+# $S/curl_fails makes every request fail the way a real one can — connection
+# reset, a stall past --max-time. That is the only way to test a check which
+# must not read a failed request as an answer.
+if [[ -f "$STUB_STATE/curl_fails" ]]; then exit 7; fi
 S="$STUB_STATE"
 LIVE="$NT_TEST_LIVE"
 # The file says one thing; what Traefik is SERVING can lag it. $S/reload_lag,
@@ -331,6 +336,60 @@ grep -q 'observed after' "$WORK/out.txt" \
 grep -qi 'rolling back\|rolled back' "$WORK/out.txt" \
   && fail "C8: the lagging reload triggered a rollback" \
   || pass "C8: no rollback was triggered"
+
+# ── the rollback assertion must not read a FAILED request as absence ───────
+# The post-rollback check asks whether the bridge's role is GONE. It used to
+# read `http_body`, which returns "" on any curl failure — and "" contains no
+# role — so a request that never completed scored ok "the bridge is no longer
+# serving" and the script printed ROLLBACK VERIFIED. An absence test run on a
+# result that cannot distinguish absence from failure is not a test.
+fresh_dyn; healthy_world
+run_script --cutover >/dev/null 2>&1 || true
+: > "$STUB_STATE/curl_fails"
+if run_script --rollback; then
+  fail "F1: --rollback reported success while every request was failing"
+else
+  pass "F1: a failing health request is not read as 'the bridge is gone'"
+fi
+grep -qi 'cannot tell whether the bridge is gone' "$WORK/out.txt" \
+  && pass "F1: and it says it could not tell, rather than asserting absence" \
+  || { fail "F1: refused, but not for the right reason"; tail -4 "$WORK/out.txt"; }
+rm -f "$STUB_STATE/curl_fails"
+
+# ── the synchronisation bound must be a bound ──────────────────────────────
+# `${NT_B4_WAIT_SECONDS:-$1}` went straight into `(( i < limit ))`. An
+# identifier-like value is an unbound variable inside (( )), which under
+# `set -u` kills the shell — and in do_cutover that is the statement right
+# after `mv -f "$staged" "$LIVE"`, so the live config is already flipped,
+# verify never runs, and the automatic rollback never fires.
+fresh_dyn; healthy_world
+if NT_B4_WAIT_SECONDS=fast run_script --cutover; then
+  fail "F2: an unusable wait bound was accepted"
+else
+  pass "F2: a non-numeric NT_B4_WAIT_SECONDS is refused"
+fi
+grep -qi 'is not a positive integer' "$WORK/out.txt" \
+  && pass "F2: and it names the bound rather than dying inside (( ))" \
+  || { fail "F2: refused, but not for the bound"; tail -4 "$WORK/out.txt"; }
+for junk in 0 -1 30s abc 1.5; do
+  fresh_dyn; healthy_world
+  if NT_B4_WAIT_SECONDS="$junk" run_script --cutover >/dev/null 2>&1; then
+    fail "F2: NT_B4_WAIT_SECONDS='$junk' was accepted"
+  fi
+done
+pass "F2: 0, -1, 30s, abc and 1.5 are all refused"
+
+# EMPTY is not junk. `${NT_B4_WAIT_SECONDS:-$1}` treats an empty value as unset
+# and falls back to the call-site default, which is the shell's own convention
+# and the behaviour an operator clearing the variable would expect. Asserted
+# rather than assumed, because the validation above could easily have made
+# `VAR=` a hard error by accident.
+fresh_dyn; healthy_world
+if NT_B4_WAIT_SECONDS="" run_script --cutover; then
+  pass "F2: an EMPTY NT_B4_WAIT_SECONDS falls back to the default rather than failing"
+else
+  fail "F2: clearing the variable broke the cutover"; tail -4 "$WORK/out.txt"
+fi
 
 echo
 echo "stage 1 rehearsal: $OK ok, $BAD not-ok"

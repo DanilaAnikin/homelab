@@ -169,6 +169,17 @@ case "${1:---verify}" in
   PUBLISHED="$(docker port "$BRIDGE" 2>/dev/null || true)"
   [[ -z "$PUBLISHED" ]] && ok "no published ports" "reachable only inside $NETWORK" \
                         || bad "container publishes ports" "$PUBLISHED"
+
+  # THE GATE BELONGS AT THE END, which is what its own comment says and where
+  # it was not. The earlier placement sat before `docker run`, so the published-
+  # ports check above — the one the comment beside it calls security-relevant,
+  # "publishing would expose a pre-cutover artifact to the host's interfaces" —
+  # could record a `bad` and the branch would still hand the operator exit 0.
+  # That is the identical shape the gate was added to close. And the branch
+  # printed no summary, so a FAIL line scrolled past with nothing tallying it.
+  echo
+  echo "start: $PASS ok, $FAIL failed"
+  [[ $FAIL -eq 0 ]] || exit 1
   echo "  next: $0 --verify"
   ;;
 

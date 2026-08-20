@@ -80,14 +80,34 @@ die(){  echo; echo "ABORT: $*"; exit 1; }
 # possibly be right. The matcher rehearsal already polls; the production
 # scripts were the ones still sleeping.
 wait_for(){ # <seconds> <description> <predicate...>
+  # A WALL-CLOCK bound, not an iteration count. Each predicate makes a curl
+  # call with --max-time 15, so `wait_for 30` counting iterations could block
+  # for ~480s while printing "NOT observed within 30s" — and in do_cutover that
+  # window sits between the atomic rename and `verify`, delaying the automatic
+  # rollback of a broken public host by up to eight minutes.
+  #
+  # And the bound is VALIDATED. It used to be `${NT_B4_WAIT_SECONDS:-$1}` fed
+  # straight into `(( i < limit ))`: an identifier-like value (`fast`, `auto`)
+  # is an unbound variable inside (( )), which under `set -u` kills the shell —
+  # on the statement immediately after `mv -f "$staged" "$LIVE"`, so the config
+  # is already flipped, verify never runs and the rollback never fires. Junk
+  # like `30s` or `0` silently made the loop body run zero times, removing all
+  # synchronisation with Traefik's watcher, which is the failure this function
+  # was written to remove.
   local limit="${NT_B4_WAIT_SECONDS:-$1}" desc="$2"; shift 2
-  local i=0
-  while (( i < limit )); do
+  if [[ ! "$limit" =~ ^[1-9][0-9]*$ ]]; then
+    die "NT_B4_WAIT_SECONDS='${NT_B4_WAIT_SECONDS:-}' is not a positive integer;
+       refusing to run with an unusable synchronisation bound"
+  fi
+  local deadline=$(( SECONDS + limit ))
+  local waited
+  while (( SECONDS < deadline )); do
     if "$@" >/dev/null 2>&1; then
-      [[ $i -gt 0 ]] && note ok "$desc" "observed after ${i}s" || note ok "$desc" "observed immediately"
+      waited=$(( SECONDS - (deadline - limit) ))
+      note ok "$desc" "observed after ${waited}s"
       return 0
     fi
-    sleep 1; i=$(( i + 1 ))
+    sleep 1
   done
   note info "$desc" "NOT observed within ${limit}s — continuing to verification, which decides"
   return 1
@@ -113,9 +133,24 @@ http_status(){ # <url> [extra curl args...]
   echo "$out"
 }
 
-http_body(){ # <url> [extra curl args...]
+http_body(){ # <url> [extra curl args...]  -> body, "" on any failure
   local url="$1"; shift
   curl -sS --max-time 15 "$@" "$url" 2>/dev/null || true
+}
+
+# The same request, but able to distinguish a body from a failure.
+#
+# `http_body` returns "" when curl fails, and an ABSENCE test over "" succeeds:
+# the post-rollback check asks whether the bridge's role is gone, and a request
+# that never completed contains no role, so a connection reset, a Traefik reload
+# window or a stall past --max-time all scored ok "the bridge is no longer
+# serving" and the script printed ROLLBACK VERIFIED. An absence test must never
+# be run on a result that cannot tell absence from failure.
+http_body_ok(){ # <url> [extra curl args...]  -> body on stdout, rc 1 if the request failed
+  local url="$1"; shift
+  local out
+  out="$(curl -sS --fail-with-body --max-time 15 "$@" "$url" 2>/dev/null)" || return 1
+  printf '%s' "$out"
 }
 
 # ── the Auth liveness probe, and why it is not /auth/v1/settings ───────────
@@ -359,8 +394,11 @@ verify_service(){
   # body is {"status":"ok","service":"nate-trader-dashboard",...} — but keying
   # on the bare field name would also fail an honest successor that reported
   # some other role, and the question here is only ever "is the BRIDGE gone".
-  local body; body="$(http_body "$DASH_HOST/api/health")"
-  if [[ "$body" == *"\"artifact_role\":\"$WANT_ROLE\""* ]]; then
+  local body
+  if ! body="$(http_body_ok "$DASH_HOST/api/health")"; then
+    bad "could not read $DASH_HOST/api/health" "cannot tell whether the bridge is gone; NOT treating a failed request as absence"
+    body=""
+  elif [[ "$body" == *"\"artifact_role\":\"$WANT_ROLE\""* ]]; then
     bad "the BRIDGE is still serving $DASH_HOST" "artifact_role is still $WANT_ROLE — the rollback did not take effect"
   else
     ok "the bridge is no longer serving $DASH_HOST" "no $WANT_ROLE in the health body"
@@ -403,7 +441,12 @@ rollback(){
   chmod --reference="$LIVE" "$staged"; chown --reference="$LIVE" "$staged"
   mv -f "$staged" "$LIVE"
   echo "rolled back to $target"
-  not_serving_bridge(){ [[ "$(http_body "$DASH_HOST/api/health")" != *"\"artifact_role\":\"$WANT_ROLE\""* ]]; }
+  # Requires a SUCCESSFUL response that lacks the role — not merely the absence
+  # of the role, which every failed request also satisfies.
+  not_serving_bridge(){
+    local b; b="$(http_body_ok "$DASH_HOST/api/health")" || return 1
+    [[ "$b" != *"\"artifact_role\":\"$WANT_ROLE\""* ]]
+  }
   wait_for 30 "the bridge has stopped answering on $DASH_HOST" not_serving_bridge || true
 }
 

@@ -289,6 +289,46 @@ grep -q 'the container still exists' "$WORK/out.txt" \
   && pass "R8 non-vacuity: the retire path really executed to its end" \
   || fail "R8 non-vacuity: the happy path never reached its final assertion"
 
+# ── RET-3: the live-route guard must not pass by not looking ───────────────
+# `[[ -r "$LIVE_CONFIG" ]] && grep …` short-circuited into the else branch, so
+# "no live route points at $CONTAINER" was a positive assertion produced by
+# never opening the file. And the regex required a double quote and a trailing
+# colon, so two forms Traefik accepts — `url: 'http://x:3000'` and
+# `url: http://x` — did not match.
+healthy; chmod 000 "$LIVE"
+if run; then fail "RET3a: an unreadable config was treated as clean"
+elif grep -qF "cannot read" "$WORK/out.txt"; then pass "RET3a: an unreadable config is not 'no route points here'"
+else fail "RET3a: refused, but not for unreadability"; tail -3 "$WORK/out.txt"; fi
+chmod 644 "$LIVE"
+
+for form in "'http://natetrader-dashboard:3000'" "http://natetrader-dashboard" '"http://natetrader-dashboard:3000"'; do
+  healthy
+  python3 - "$LIVE" "$form" <<'PYX'
+import sys, pathlib, re
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+# point the dashboard service back at the OLD container, in the given form
+s = re.sub(r'url:\s*"http://natetrader-dashboard-bridge:3000"', "url: " + sys.argv[2], s)
+p.write_text(s)
+PYX
+  if run; then fail "RET3b: a live route in the form ${form} was not seen"
+  else pass "RET3b: a live route written as ${form} is caught"; fi
+done
+
+# ── RET-4: a failing docker call must report, not abort ────────────────────
+# `docker stop` and the state inspect were bare under `set -e`, so a daemon
+# hiccup killed the run after the container was stopped but before the restart
+# policy was cleared and before the disconnect loop — no FAIL line, no summary,
+# and the container left exactly in the state the disconnect exists to prevent.
+healthy; touch "$STUB_STATE/stop_fails"
+if run_retire; then fail "RET4: a failed docker stop was reported as success"
+else pass "RET4: a failed docker stop is a reported failure"; fi
+grep -qF "docker stop failed" "$WORK/out.txt" \
+  && pass "RET4: and it says so" || { fail "RET4: no diagnosis"; tail -3 "$WORK/out.txt"; }
+grep -qE 'retire: [0-9]+ ok' "$WORK/out.txt" \
+  && pass "RET4: the run still reaches its summary instead of aborting mid-way" \
+  || { fail "RET4: the run aborted before summarising"; tail -3 "$WORK/out.txt"; }
+rm -f "$STUB_STATE/stop_fails"
+
 echo
 echo "retire pre-checks: $OK ok, $BAD not-ok"
 [[ $BAD -eq 0 ]] && { echo "REHEARSAL GREEN"; exit 0; } || { echo "REHEARSAL RED"; exit 1; }
