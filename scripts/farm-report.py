@@ -29,13 +29,26 @@ if not TG_TOKEN and os.environ.get("TELEGRAM_TOKEN_FILE"):
         pass
 
 
+# `docker` bez sudo selže, když skript neběží pod rootem ani ve skupině docker.
+DOCKER = ["docker"] if os.geteuid() == 0 else ["sudo", "-n", "docker"]
+
+
 def q(sql, db, container):
+    """Nedostupná databáze MUSÍ skončit chybou, ne prázdným výsledkem.
+
+    Původně se chyba spolkla a vrátilo se []. Report pak vypsal samé nuly —
+    „0 pokusů, 0 úkolů, fronta ?" — což vypadá jako mrtvá farma, ale znamená to
+    jen, že se skript nedostal k DB. Takový přehled je horší než žádný: tvrdí
+    něco o stavu, který vůbec nezměřil.
+    """
     r = subprocess.run(
-        ["docker", "exec", "-i", container, "psql", "-U", "postgres" if "supabase" in container else "postiz",
-         "-d", db, "-tAF", "\t", "-c", sql],
+        DOCKER + ["exec", "-i", container, "psql", "-U", "postgres" if "supabase" in container else "postiz",
+                  "-d", db, "-tAF", "\t", "-c", sql],
         capture_output=True, text=True, timeout=90)
     if r.returncode != 0:
-        return []
+        print(f"CHYBA: nedostupná databáze {db} ({container}): "
+              f"{(r.stderr or '').strip()[:160]}", file=sys.stderr)
+        sys.exit(2)
     return [ln.split("\t") for ln in r.stdout.strip().split("\n") if ln]
 
 
