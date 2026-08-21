@@ -34,14 +34,14 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--claude-auth-mode",
-        choices=("api-key",),
-        help="Explicit Claude authentication mode. Only api-key is supported.",
+        choices=("subscription",),
+        help="Explicit Claude authentication mode. Only subscription is supported.",
     )
     parser.add_argument(
-        "--anthropic-api-key-file",
+        "--claude-oauth-token-file",
         type=Path,
         help=(
-            "A discovery-only Anthropic API key file. Never use a submit HMAC "
+            "A Claude Code OAuth token file (subscription). Never use a submit HMAC "
             "credential here."
         ),
     )
@@ -76,16 +76,16 @@ def read_input(path: Path) -> bytes:
 
 def validate_claude_auth_arguments(arguments: argparse.Namespace) -> None:
     has_auth_mode = arguments.claude_auth_mode is not None
-    has_api_key_file = arguments.anthropic_api_key_file is not None
+    has_oauth_token_file = arguments.claude_oauth_token_file is not None
     if not arguments.claude:
-        if has_auth_mode or has_api_key_file:
+        if has_auth_mode or has_oauth_token_file:
             raise ValidationError("Claude authentication options require --claude")
         return
-    if arguments.claude_auth_mode != "api-key":
-        raise ValidationError("--claude requires --claude-auth-mode api-key")
-    if not has_api_key_file:
+    if arguments.claude_auth_mode != "subscription":
+        raise ValidationError("--claude requires --claude-auth-mode subscription")
+    if not has_oauth_token_file:
         raise ValidationError(
-            "--claude-auth-mode api-key requires --anthropic-api-key-file"
+            "--claude-auth-mode subscription requires --claude-oauth-token-file"
         )
 
 
@@ -126,7 +126,7 @@ def main() -> int:
                 prompt_path=arguments.prompt,
                 schema_path=arguments.schema,
                 auth_mode=arguments.claude_auth_mode,
-                anthropic_api_key_path=arguments.anthropic_api_key_file,
+                claude_secret_path=arguments.claude_oauth_token_file,
                 state_home=arguments.claude_home,
                 timeout_seconds=claude_timeout,
             )

@@ -209,11 +209,11 @@ def _read_bounded_text(path: Path, label: str, maximum: int) -> str:
     return value
 
 
-def _load_anthropic_api_key(path: Path) -> str:
+def _load_claude_oauth_token(path: Path) -> str:
     try:
         metadata = path.lstat()
     except OSError as exc:
-        raise ValidationError("cannot inspect Anthropic API key") from exc
+        raise ValidationError("cannot inspect Claude OAuth token") from exc
     permissions = stat.S_IMODE(metadata.st_mode)
     credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
     systemd_delivered = (
@@ -228,19 +228,19 @@ def _load_anthropic_api_key(path: Path) -> str:
         or (permissions not in (0o400, 0o600) and not systemd_delivered)
         or not 32 <= metadata.st_size <= 4097
     ):
-        raise ValidationError("Anthropic API key must be a private regular file")
+        raise ValidationError("Claude OAuth token must be a private regular file")
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise ValidationError("Anthropic API key is not readable") from exc
+        raise ValidationError("Claude OAuth token is not readable") from exc
     if raw.endswith(b"\n"):
         raw = raw[:-1]
     if not 32 <= len(raw) <= 4096 or any(byte < 33 or byte > 126 for byte in raw):
-        raise ValidationError("Anthropic API key has an unsafe value")
+        raise ValidationError("Claude OAuth token has an unsafe value")
     try:
         return raw.decode("ascii")
     except UnicodeDecodeError as exc:
-        raise ValidationError("Anthropic API key must be ASCII") from exc
+        raise ValidationError("Claude OAuth token must be ASCII") from exc
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -325,7 +325,7 @@ def run_claude_discovery(
     claude_binary: Path,
     prompt_path: Path,
     schema_path: Path,
-    anthropic_api_key_path: Path,
+    claude_oauth_token_path: Path,
     state_home: Path,
     timeout_seconds: int = CLAUDE_TIMEOUT_SECONDS,
 ) -> bytes:
@@ -350,7 +350,7 @@ def run_claude_discovery(
     prompt = _read_bounded_text(prompt_path, "prompt", MAX_PROMPT_BYTES)
     schema = _read_bounded_text(schema_path, "schema", MAX_SCHEMA_BYTES)
     structured_schema = _prepare_structured_schema(schema)
-    api_key = _load_anthropic_api_key(anthropic_api_key_path)
+    oauth_token = _load_claude_oauth_token(claude_oauth_token_path)
     state_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         state_metadata = state_home.lstat()
@@ -377,7 +377,9 @@ def run_claude_discovery(
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "NO_COLOR": "1",
-        "ANTHROPIC_API_KEY": api_key,
+        # Předplatné (Claude Code CLI), NE API klíč — ANTHROPIC_API_KEY by
+        # účtoval per-token z kreditu. Do prostředí jde jen tenhle token.
+        "CLAUDE_CODE_OAUTH_TOKEN": oauth_token,
     }
     command = [
         str(resolved_claude),

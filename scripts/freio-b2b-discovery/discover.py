@@ -37,7 +37,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--claude-bin", type=Path, default=Path("/usr/local/bin/claude")
     )
-    parser.add_argument("--anthropic-api-key-file", type=Path)
+    parser.add_argument("--claude-oauth-token-file", type=Path)
     parser.add_argument(
         "--claude-home", type=Path, default=Path("/run/freio-b2b-discovery/claude-home")
     )
@@ -77,8 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.input_json is not None:
             raw = _read_input(arguments.input_json)
         else:
-            if arguments.anthropic_api_key_file is None:
-                raise ValidationError("--claude requires --anthropic-api-key-file")
+            if arguments.claude_oauth_token_file is None:
+                raise ValidationError("--claude requires --claude-oauth-token-file")
             remaining = deadline - time.monotonic()
             timeout = min(CLAUDE_TIMEOUT_SECONDS, int(remaining - 30))
             if timeout < 1:
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
                 claude_binary=arguments.claude_bin,
                 prompt_path=arguments.prompt,
                 schema_path=arguments.schema,
-                anthropic_api_key_path=arguments.anthropic_api_key_file,
+                claude_oauth_token_path=arguments.claude_oauth_token_file,
                 state_home=arguments.claude_home,
                 timeout_seconds=timeout,
             )
