@@ -231,10 +231,31 @@ retire(){
        from an empty one and --restore would have nothing to put back.
        $RECORD was NOT modified."
   fi
-  mv -f "$nets_tmp" "$RECORD"
-  local n; n="$(grep -c . "$RECORD" || true)"
-  [[ "$n" -gt 0 ]] && ok "recorded $n network(s) for restore" "$RECORD" \
-                   || note info "recorded networks" "none — docker answered, and the list is empty"
+  # DO NOT OVERWRITE A GOOD RECORD WITH AN EMPTY ONE. The strict reader now
+  # distinguishes "docker failed" (rc 1) from "answered, empty" (rc 0) — but a
+  # container retire() already detached IS the rc-0-empty case, so a SECOND
+  # --retire would mv a zero-byte list over a record that still holds the real
+  # networks, and every later check passes in the already-retired state, so the
+  # run reports 0 failures while destroying --restore's only input.
+  #
+  # A retire is idempotent: if the new list is empty AND a non-empty record
+  # already exists, the container was already retired and the existing record is
+  # the one to keep. The temp is discarded, not moved.
+  local new_n; new_n="$(grep -c . "$nets_tmp" || true)"
+  if [[ "$new_n" -eq 0 && -s "$RECORD" ]]; then
+    rm -f "$nets_tmp"
+    ok "already retired — kept the existing restore record" "$(tr '\n' ' ' < "$RECORD")"
+  else
+    mv -f "$nets_tmp" "$RECORD"
+    local n; n="$(grep -c . "$RECORD" || true)"
+    if [[ "$n" -gt 0 ]]; then
+      ok "recorded $n network(s) for restore" "$RECORD"
+    else
+      # First retire and the container is genuinely on no network: nothing to
+      # restore, and no prior record to protect. Recorded honestly, not as ok.
+      note info "recorded networks" "none — docker answered, the list is empty, and no prior record existed"
+    fi
+  fi
 
   # NEITHER OF THESE MAY ABORT THE SCRIPT. Both were bare under `set -e`, so a
   # daemon hiccup — the exact scenario the comments in this file keep naming —
@@ -352,8 +373,37 @@ restore(){
     docker network connect "$net" "$CONTAINER" >/dev/null 2>&1 || true
   done < "$RECORD"
   docker start "$CONTAINER" >/dev/null
-  local state; state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER")"
-  [[ "$state" == "running" ]] && ok "restarted" "$CONTAINER" || bad "start left it '$state'"
+  # `Status==running` reads true the instant the process is created, before the
+  # app inside can serve — so it cannot tell "back in service" from "started and
+  # will crash in 2s". Wait for the container to REPORT running for a few
+  # consecutive samples, and surface its health if it declares one.
+  local state health i
+  for i in 1 2 3 4 5 6; do
+    state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo '?')"
+    [[ "$state" != "running" ]] && break
+    sleep 1
+  done
+  if [[ "$state" != "running" ]]; then
+    bad "restore left it '$state'" "the container did not stay up"
+  else
+    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER" 2>/dev/null || echo '?')"
+    case "$health" in
+      healthy|none) ok "restarted and stayed up" "$CONTAINER (health=$health)" ;;
+      starting)     ok "restarted; health still starting" "$CONTAINER — re-check before relying on it" ;;
+      *)            bad "restarted but unhealthy" "$CONTAINER health=$health" ;;
+    esac
+  fi
+  # --retire cleared the restart policy to `no` so a daemon restart could not
+  # revive the container behind the bridge. --restore must put it back, or the
+  # restored container silently will not survive a reboot.
+  local want_policy="${NT_RESTORE_POLICY:-unless-stopped}"
+  if docker update "--restart=$want_policy" "$CONTAINER" >/dev/null 2>&1; then
+    local got; got="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER" 2>/dev/null || echo '?')"
+    [[ "$got" == "$want_policy" ]] && ok "restart policy restored" "$got" \
+                                   || bad "restart policy NOT restored" "wanted $want_policy, is $got"
+  else
+    bad "could not restore the restart policy" "the container will not survive a daemon restart"
+  fi
   # networks_of (non-strict) returns "" when docker fails, which would report
   # ok "reconnected  none" for a restore that reattached nothing. retire() was
   # converted to the strict reader; this path is the one the whole plan depends
@@ -365,6 +415,16 @@ restore(){
     bad "restore reattached NO networks" "the record listed $(grep -c . "$RECORD" || echo 0)"
   else
     ok "reconnected" "$nets"
+  fi
+  # Only when the restore actually succeeded. The gate below (exit 1 on FAIL) is
+  # in the dispatch, AFTER this function returns, so without this guard the NOTE
+  # printed "the container is back, now unwind" over a restore that had failed —
+  # the exact misleading output the gate was added to stop.
+  if [[ $FAIL -ne 0 ]]; then
+    echo
+    echo "RESTORE INCOMPLETE ($FAIL failed) — do NOT proceed to the traffic unwind;"
+    echo "the container is not confirmed back in service. Resolve the failures above first."
+    return 0
   fi
   echo
   echo "NOTE: this only brings the container back. Traffic still points at the"

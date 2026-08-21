@@ -181,10 +181,32 @@ for name in "${!PATHS[@]}"; do
   fi
 done
 
-# path-traversal shapes that a sloppy matcher would let through
+# The retired pre-containment dashboard must stay retired. Nothing here can stop
+# a `compose up` or a swarm reconcile from reviving it behind the same name, but
+# the monitor must NOTICE: a running natetrader-dashboard while the boundary is
+# up is a writable dashboard back on the network.
+if [[ "$EXPECT_FREEZE" == frozen ]]; then
+  retired_state="$(docker inspect natetrader-dashboard --format '{{.State.Status}}' 2>/dev/null || echo absent)"
+  case "$retired_state" in
+    running) bad "the RETIRED dashboard is running again" "natetrader-dashboard is $retired_state while the boundary is up" ;;
+    absent)  ok "the retired dashboard is gone" "natetrader-dashboard: absent" ;;
+    *)       ok "the retired dashboard stays retired" "natetrader-dashboard: $retired_state" ;;
+  esac
+fi
+
+# path-traversal shapes that a sloppy matcher would let through.
+#
+# SENT RAW. The shared CURL/code() has no --path-as-is, so curl COLLAPSES dot
+# segments before sending: /auth/v1/../rest/v1/accounts leaves the client as a
+# plain /rest/v1/accounts and the traversal the percent-guard exists to stop is
+# never put on the wire — the one bypass class the boundary was built for went
+# untested every five minutes. code_raw() keeps the path verbatim and adds the
+# encoded forms the overlay's !PathRegexp(%) guard targets.
+code_raw(){ curl -sS -o /dev/null -m 15 -w '%{http_code}' --path-as-is -H "$(akey)" "$@" 2>/dev/null || echo 000; }
 if [[ "$EXPECT_REST" == denied ]]; then
-  for probe in /auth/v1evil //rest/v1/accounts /auth/v1/../rest/v1/accounts /REST/v1/accounts; do
-    c="$(code "$API_HOST$probe")"
+  for probe in /auth/v1evil //rest/v1/accounts /auth/v1/../rest/v1/accounts /REST/v1/accounts \
+               '/auth/v1/..%2Frest%2Fv1%2Faccounts' '/auth/v1/%252e%252e/rest/v1/accounts'; do
+    c="$(code_raw "$API_HOST$probe")"
     if [[ "$c" == 200 || "$c" == 401 ]]; then bad "denied variant $probe" "http $c"
     else ok "denied variant $probe" "http $c"; fi
   done
@@ -232,7 +254,7 @@ else
 fi
 
 # ── 6. container churn ──────────────────────────────────────────────────────
-for c in natetrader-supabase-auth-1 natetrader-supabase-kong natetrader-dashboard; do
+for c in natetrader-supabase-auth-1 natetrader-supabase-kong natetrader-dashboard-bridge; do
   if ! docker inspect "$c" >/dev/null 2>&1; then bad "container $c present" "absent"; continue; fi
   rc="$(docker inspect "$c" --format '{{.RestartCount}}')"
   started="$(docker inspect "$c" --format '{{.State.StartedAt}}')"
@@ -246,7 +268,7 @@ done
   echo "checked_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "pass=$PASS fail=$FAIL unknown=$UNKNOWN"
   echo "expect_build=$EXPECT_BUILD_SHA expect_rest=$EXPECT_REST expect_freeze=$EXPECT_FREEZE"
-  for c in natetrader-supabase-auth-1 natetrader-supabase-kong natetrader-dashboard; do
+  for c in natetrader-supabase-auth-1 natetrader-supabase-kong natetrader-dashboard-bridge; do
     printf '%s_restarts=%s\n' "$c" "$(docker inspect "$c" --format '{{.RestartCount}}' 2>/dev/null || echo absent)"
   done
 } > "$LAST.tmp"

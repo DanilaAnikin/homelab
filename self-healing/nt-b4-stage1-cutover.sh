@@ -491,12 +491,46 @@ rollback(){
        Rolling Stage 1 back now would restore the pre-Stage-1 file, which has no
        auth-only router and no deny middleware — the public data plane would be
        open again, and this script's own verification would not notice.
-       Unwind in order:  nt-b4-stage2-cutover.sh --rollback   then   $0 --rollback"
+       Unwind in order:
+         1. nt-b4-retire-d11.sh --restore        (bring the pre-Stage-1 dashboard
+                                                  BACK UP first — Stage 1 rollback
+                                                  routes to it, and if it is still
+                                                  retired the public site 502s)
+         2. nt-b4-stage2-cutover.sh --rollback   (remove the containment boundary)
+         3. $0 --rollback                         (point traffic back at it)"
   fi
   local target; target="$(cat "$BACKUP_DIR/stage1-rollback-target" 2>/dev/null || true)"
   [[ -n "$target" && -f "$target" ]] || die "no rollback target recorded — refusing to guess"
   sha256sum -c "$target.sha256" >/dev/null 2>&1 \
     || die "backup $target failed its own checksum — refusing to restore a corrupt file"
+  # BEFORE routing to it: the backend the restored file names must be able to
+  # serve. The pre-Stage-1 file points at http://natetrader-dashboard:3000, and
+  # after --retire that container is stopped and detached — so a rollback that
+  # blindly restores it hands Traefik a dead backend and the public site 502s,
+  # detected only afterwards by verify_service, after a wait and after the
+  # outage. The file's own header makes "do not route to a container that is not
+  # serving" a hard precondition for the FORWARD cut; it must hold here too.
+  #
+  # The backend host is read from the file being restored, resolved on
+  # dokploy-network, and required to answer before the rename. NT_SKIP_BACKEND_PROBE=1
+  # is the documented escape for a restore where the backend is deliberately
+  # elsewhere; it prints a warning rather than silently skipping.
+  local backend; backend="$(grep -oE 'http://[a-zA-Z0-9._-]+:[0-9]+' "$target" | grep -v 'supabase-kong' | head -1)"
+  if [[ "${NT_SKIP_BACKEND_PROBE:-0}" == 1 ]]; then
+    echo "WARNING: NT_SKIP_BACKEND_PROBE=1 — not checking that $backend can serve before routing to it"
+  elif [[ -n "$backend" ]]; then
+    local bhost bport; bhost="${backend#http://}"; bport="${bhost##*:}"; bhost="${bhost%%:*}"
+    if ! docker run --rm --network dokploy-network busybox:latest \
+           wget -q -T 5 -O /dev/null "http://${bhost}:${bport}/api/health" 2>/dev/null; then
+      die "the rollback target routes to ${backend}, but that backend is not answering on
+       dokploy-network — restoring it now would 502 the public site. It is almost
+       certainly the retired pre-Stage-1 dashboard; bring it back first:
+         nt-b4-retire-d11.sh --restore
+       then re-run $0 --rollback. (Set NT_SKIP_BACKEND_PROBE=1 only if the backend
+       is deliberately somewhere this host cannot reach.)"
+    fi
+    echo "backend reachable before routing to it: $backend"
+  fi
   local staged="$DYN/.natetrader.yml.rollback.$$"
   cp -p "$target" "$staged"
   chmod --reference="$LIVE" "$staged"; chown --reference="$LIVE" "$staged"

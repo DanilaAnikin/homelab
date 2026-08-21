@@ -486,6 +486,15 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
   # middleware reads an Authorization header or an apikey, so authentication
   # cannot change the outcome by construction. Measured here rather than argued:
   # every denied path, under three credential states.
+  # WITH A REAL KEY, or the three states are not three states. When
+  # $ANON_FILE is unreadable anon_key() returns "", so `-H "apikey: "` and
+  # `-H "Authorization: Bearer "` are empty headers — the keyed and bearer
+  # probes become identical to the no-auth one, and "all three agree" is
+  # vacuously true. Every other consumer of anon_key() guards this; this block
+  # was the one that did not.
+  if [[ -z "$key" ]]; then
+    bad "credential-independence UNVERIFIED" "no anon key at $ANON_FILE — the three credential states would be identical"
+  else
   local ci_ok=0 ci_bad=0 pth3 s_none s_key s_bearer
   for pth3 in "${DENY_PATHS[@]}"; do
     s_none="$(status "$API_HOST$pth3")"
@@ -510,6 +519,7 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
     ok "CONTROL: Auth is reachable in all three states" "$AUTH_PROBE_PATH -> $AUTH_PROBE_OK"
   else
     bad "CONTROL: Auth is not uniformly reachable" "no-auth=$s_none apikey=$s_key bearer=$s_bearer"
+  fi
   fi
 
   # The encoded forms that defeated the first draft of the overlay.

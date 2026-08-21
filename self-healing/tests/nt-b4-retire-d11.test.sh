@@ -81,16 +81,25 @@ case "$1" in
       *"RestartPolicy"*)
         [[ -f "$S/inspect_policy_fail" ]] && exit 1
         st policy || echo "unless-stopped" ;;
+      *".State.Health"*)
+        # No healthcheck by default (-> "none"); $S/health overrides.
+        st health || echo none ;;
       *) : ;;
     esac
     exit 0 ;;
+  start)
+    [[ -f "$S/start_fails" ]] && exit 1
+    echo "${STUB_START_STATE:-running}" > "$S/old_state"; exit 0 ;;
   stop)
     [[ -f "$S/stop_fails" ]] && exit 1
     echo exited > "$S/old_state"; exit 0 ;;
   update)
-    # A silent no-op update is the interesting case: rc 0 or rc 1, the policy
-    # simply does not change.
-    [[ -f "$S/update_noop" ]] || echo no > "$S/policy"
+    # Records the ACTUAL --restart=VALUE, so both --retire (--restart=no) and
+    # --restore (--restart=unless-stopped) are modelled. $S/update_noop makes it
+    # a silent no-op (policy unchanged), the interesting failure shape.
+    if [[ ! -f "$S/update_noop" ]]; then
+      for a in "$@"; do case "$a" in --restart=*) echo "${a#--restart=}" > "$S/policy" ;; esac; done
+    fi
     [[ -f "$S/update_fails" ]] && exit 1
     exit 0 ;;
   network)
@@ -368,6 +377,56 @@ grep -qE 'retire: [0-9]+ ok' "$WORK/out.txt" \
   && pass "RET4: the run still reaches its summary instead of aborting mid-way" \
   || { fail "RET4: the run aborted before summarising"; tail -3 "$WORK/out.txt"; }
 rm -f "$STUB_STATE/stop_fails"
+
+# ── B4-R1: a second --retire must NOT wipe the restore record ──────────────
+# The first --retire records the networks; the second runs in the already-
+# detached state, where docker answers with an EMPTY list. The old code mv'd
+# that empty list over the good record and reported 0 failures, destroying
+# --restore's only input. It must keep the existing record instead.
+healthy
+run_retire >/dev/null 2>&1 || true
+rec1="$(cat "$WORK/lib/d11-networks.txt" 2>/dev/null)"
+# now the container is retired: detached (nets empty) and exited
+printf '' > "$STUB_STATE/nets"
+if run_retire; then
+  rec2="$(cat "$WORK/lib/d11-networks.txt" 2>/dev/null)"
+  [[ -n "$rec1" && "$rec2" == "$rec1" ]] \
+    && pass "B4-R1: a second --retire kept the restore record ($rec2)" \
+    || fail "B4-R1: the record changed on re-retire ('$rec1' -> '$rec2')"
+else
+  fail "B4-R1: a second --retire in the already-retired state failed"; tail -4 "$WORK/out.txt"
+fi
+grep -qF "already retired — kept the existing restore record" "$WORK/out.txt" \
+  && pass "B4-R1: and it said so" || { fail "B4-R1: no idempotency message"; tail -3 "$WORK/out.txt"; }
+
+# ── B4-R5 + B4-R7: --restore restores the policy, and gates the NOTE ────────
+run_restore(){ PATH="$STUB_BIN:$PATH" STUB_STATE="$STUB_STATE" STATE_DIR="$WORK/lib" DYN="$WORK/dyn" \
+       NT_OLD_DASHBOARD=natetrader-dashboard NT_BRIDGE_CONTAINER=natetrader-dashboard-bridge \
+       bash "$SCRIPT" --restore >"$WORK/out.txt" 2>&1; }
+# healthy restore: policy goes back, NOTE prints
+healthy; echo "dokploy-network" > "$WORK/lib/d11-networks.txt"
+echo exited > "$STUB_STATE/old_state"; echo no > "$STUB_STATE/policy"; echo none > "$STUB_STATE/health"
+if run_restore; then pass "B4-R5: a healthy --restore succeeds"
+else fail "B4-R5: the healthy restore failed"; tail -5 "$WORK/out.txt"; fi
+grep -qE 'restart policy restored' "$WORK/out.txt" \
+  && pass "B4-R5: it restored the restart policy that --retire cleared" \
+  || { fail "B4-R5: the restart policy was not restored"; tail -3 "$WORK/out.txt"; }
+grep -qF "NOTE: this only brings the container back" "$WORK/out.txt" \
+  && pass "B4-R7: a successful restore prints the unwind NOTE" \
+  || fail "B4-R7: the NOTE was missing on success"
+
+# unhealthy restore: the NOTE must NOT print, and the run must fail
+healthy; echo "dokploy-network" > "$WORK/lib/d11-networks.txt"
+echo exited > "$STUB_STATE/old_state"; echo no > "$STUB_STATE/policy"; echo unhealthy > "$STUB_STATE/health"
+if run_restore; then fail "B4-R7: an unhealthy restore reported success"
+else pass "B4-R7: an unhealthy restore fails"; fi
+grep -qF "NOTE: this only brings the container back" "$WORK/out.txt" \
+  && fail "B4-R7: the 'container is back, now unwind' NOTE printed over a FAILED restore" \
+  || pass "B4-R7: the unwind NOTE is suppressed when the restore did not confirm service"
+grep -qF "RESTORE INCOMPLETE" "$WORK/out.txt" \
+  && pass "B4-R7: and it says the restore is incomplete instead" \
+  || { fail "B4-R7: no incomplete-restore message"; tail -3 "$WORK/out.txt"; }
+rm -f "$STUB_STATE/health"
 
 echo
 echo "retire pre-checks: $OK ok, $BAD not-ok"

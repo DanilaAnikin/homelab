@@ -234,7 +234,18 @@ for sev in ("CRITICAL","HIGH","MEDIUM","LOW","UNKNOWN"):
 PY
 CRIT="$(awk '$1=="CRITICAL"{print $2}' "$OUT/vuln-summary.txt")"
 HIGH="$(awk '$1=="HIGH"{print $2}' "$OUT/vuln-summary.txt")"
-note info "vulnerabilities" "CRITICAL=$CRIT HIGH=$HIGH (recorded, not gated here)"
+# GATED. A seal is a statement that this artifact is fit to deploy; printing
+# "SEAL GREEN" over a CRITICAL finding, as this used to ("recorded, not gated
+# here"), is the seal asserting something it did not check. The threshold is a
+# named default so an operator can seal a known-accepted image deliberately
+# (NT_SEAL_MAX_SEVERITY=high|critical|none) rather than by the tool looking away.
+SEAL_MAX="${NT_SEAL_MAX_SEVERITY:-high}"   # default: no CRITICAL and no HIGH
+case "$SEAL_MAX" in
+  none)     [[ "${CRIT:-0}" -eq 0 && "${HIGH:-0}" -eq 0 ]] && ok "no CRITICAL or HIGH vulnerabilities" "CRITICAL=$CRIT HIGH=$HIGH"                                                           || bad "vulnerabilities present" "CRITICAL=$CRIT HIGH=$HIGH (NT_SEAL_MAX_SEVERITY=none)" ;;
+  high)     [[ "${CRIT:-0}" -eq 0 && "${HIGH:-0}" -eq 0 ]] && ok "no CRITICAL or HIGH vulnerabilities" "CRITICAL=$CRIT HIGH=$HIGH"                                                           || bad "CRITICAL or HIGH vulnerabilities present" "CRITICAL=$CRIT HIGH=$HIGH — raise NT_SEAL_MAX_SEVERITY to accept them deliberately" ;;
+  critical) [[ "${CRIT:-0}" -eq 0 ]] && ok "no CRITICAL vulnerabilities" "CRITICAL=$CRIT (HIGH=$HIGH accepted by NT_SEAL_MAX_SEVERITY=critical)"                                      || bad "CRITICAL vulnerabilities present" "CRITICAL=$CRIT" ;;
+  *) bad "NT_SEAL_MAX_SEVERITY invalid" "got '$SEAL_MAX', want none|high|critical" ;;
+esac
 
 # ── 5. per-layer secret scan ────────────────────────────────────────────────
 # Filesystem-level, from an exported container rather than from the layer

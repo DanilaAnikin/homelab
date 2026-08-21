@@ -396,6 +396,23 @@ else
 fi
 rm -f "$STUB_STATE/pre_denied"
 
+# ── B4-R4: credential-independence must not pass vacuously without a key ────
+# With no anon key, all three "credential states" send empty headers and become
+# identical, so "all three agree" is trivially true. That must be a FAIL, not a
+# green — every other anon_key() consumer guards it; verify() was the gap.
+fresh; healthy_world
+run_script --cutover >/dev/null 2>&1 || true    # get to a contained live state
+rm -f "$WORK/secrets/anon.txt"                  # now the key is unreadable
+if run_script --verify; then
+  fail "B4-R4: --verify passed with no anon key — credential-independence was vacuous"
+else
+  pass "B4-R4: --verify fails when the anon key is missing"
+fi
+grep -qF "credential-independence UNVERIFIED" "$WORK/out.txt" \
+  && pass "B4-R4: and it names credential-independence as unverified" \
+  || { fail "B4-R4: it failed, but not for the vacuous-key reason"; tail -4 "$WORK/out.txt"; }
+fresh   # restore the key for any later cases
+
 echo
 echo "stage 2 rehearsal: $OK ok, $BAD not-ok"
 [[ $BAD -eq 0 ]] && { echo "REHEARSAL GREEN — cutover and rollback both exercised"; exit 0; } \
