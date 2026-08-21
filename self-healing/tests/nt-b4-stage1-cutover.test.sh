@@ -376,12 +376,22 @@ rm -f "$STUB_STATE/curl_body_fails"
 # `set -u` kills the shell — and in do_cutover that is the statement right
 # after `mv -f "$staged" "$LIVE"`, so the live config is already flipped,
 # verify never runs, and the automatic rollback never fires.
+# AND THE CONFIG MUST BE UNTOUCHED. Asserting only "the run exited non-zero"
+# certified a fix that did not remove the hazard: the validation used to live
+# inside wait_for, whose first call in do_cutover is AFTER `mv -f "$staged"
+# "$LIVE"`, so the public routing config was already flipped when the script
+# aborted — verify never ran and the rollback never fired. Exit status alone
+# cannot tell that apart from refusing before touching anything.
 fresh_dyn; healthy_world
+before_cfg="$(cat "$WORK/dyn/natetrader.yml")"
 if NT_B4_WAIT_SECONDS=fast run_script --cutover; then
   fail "F2: an unusable wait bound was accepted"
 else
   pass "F2: a non-numeric NT_B4_WAIT_SECONDS is refused"
 fi
+[[ "$(cat "$WORK/dyn/natetrader.yml")" == "$before_cfg" ]] \
+  && pass "F2: and the live config was left byte-identical" \
+  || { fail "F2: the config was FLIPPED before the bound was checked"; diff <(printf '%s' "$before_cfg") "$WORK/dyn/natetrader.yml" | head -5; }
 grep -qi 'is not a positive integer' "$WORK/out.txt" \
   && pass "F2: and it names the bound rather than dying inside (( ))" \
   || { fail "F2: refused, but not for the bound"; tail -4 "$WORK/out.txt"; }

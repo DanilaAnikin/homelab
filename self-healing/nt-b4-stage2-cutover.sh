@@ -411,8 +411,17 @@ verify_service(){
   else
     s="$(status "$API_HOST/rest/v1/")"
   fi
-  [[ "$s" == "403" ]] && bad "/rest/v1 still denied after rollback" "the overlay may still be live" \
-                      || ok "data plane reachable again" "/rest/v1 -> http $s${key:+ (keyed)}${key:+}"
+  # POSITIVE FORM. Written as "not 403", every transport failure, timeout, 502,
+  # 503 and 504 counted as evidence that the data plane came back — status()
+  # returns the sentinel `curl-error-N` for a request that never completed, and
+  # that is "not 403" too. The same inversion this round removed from Stage 1's
+  # post-rollback check. An open data plane answers 200 with a key or 401
+  # without one; anything else is not evidence of anything.
+  case "$s" in
+    403)     bad "/rest/v1 still denied after rollback" "the overlay may still be live" ;;
+    200|401) ok  "data plane reachable again" "/rest/v1 -> http $s${key:+ (keyed)}" ;;
+    *)       bad "/rest/v1 answered $s after rollback" "not a denial, but not evidence of recovery either" ;;
+  esac
   echo
   [[ $FAIL -eq $before ]]
 }

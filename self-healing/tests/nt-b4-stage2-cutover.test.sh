@@ -306,21 +306,28 @@ grep -q 'probe@example.invalid' "$ARGV" \
 # `set -Eeuo pipefail`, so the obvious one-liner ABORTED the whole rehearsal
 # (rc 2) instead of answering "zero". Counted with find, which reports an empty
 # result as success.
-leftovers(){
+# ATTRIBUTED TO THIS RUN. A global before/after count of everything matching
+# nt-b4-secret* is affected by any concurrent run and by stale files from an
+# earlier one, so it could pass or fail for reasons unrelated to the run under
+# test. Listing the actual entries and diffing the SETS attributes each leftover
+# to the run that created it.
+leftovers_list(){
   { find /dev/shm -maxdepth 1 -name 'nt-b4-secret*' 2>/dev/null
     find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'nt-b4-secret*' 2>/dev/null
-  } | grep -c . || true
+  } | LC_ALL=C sort
 }
-before_leftovers="$(leftovers)"
+before_list="$(leftovers_list)"
 fresh; healthy_world
 run_script --cutover >/dev/null 2>&1 || true
-after_leftovers="$(leftovers)"
+after_list="$(leftovers_list)"
+new_entries="$(comm -13 <(printf '%s\n' "$before_list") <(printf '%s\n' "$after_list") | grep -c . || true)"
 grep -q -- '--config' "$STUB_STATE/argv.log" \
   && pass "C9b control: the run really did create curl --config secret files" \
   || fail "C9b control: no --config was used, so 'nothing left behind' is vacuous"
-[[ "$after_leftovers" -eq "$before_leftovers" ]] \
-  && pass "C9b: the run left no secret file behind (${before_leftovers} before, ${after_leftovers} after)" \
-  || fail "C9b: the run leaked $(( after_leftovers - before_leftovers )) secret file(s) onto tmpfs"
+[[ "$new_entries" -eq 0 ]] \
+  && pass "C9b: the run left no secret file behind (no entry present after that was absent before)" \
+  || { fail "C9b: the run leaked ${new_entries} secret file(s) onto tmpfs"
+       comm -13 <(printf '%s\n' "$before_list") <(printf '%s\n' "$after_list") | head -3 | sed 's/^/           /'; }
 
 echo
 echo "stage 2 rehearsal: $OK ok, $BAD not-ok"

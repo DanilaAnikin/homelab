@@ -279,6 +279,17 @@ else
   fail "R7: refused, but not for being the bridge"; tail -4 "$WORK/out.txt"
 fi
 
+# The two remaining stub knobs, exercised rather than left as dead machinery.
+# `inspect_state_fail` and `update_fails` were wired into the stub and cleared
+# by healthy() but set by no case, so they looked like coverage and were not.
+r_blocks "R9 an unreadable state after stop is not 'stopped'" \
+  'touch "$STUB_STATE/inspect_state_fail"' \
+  "could not read"
+
+r_blocks "R10 a docker update that errors is not a cleared policy" \
+  'touch "$STUB_STATE/update_fails"; touch "$STUB_STATE/update_noop"' \
+  "restart policy NOT cleared"
+
 # 8. NON-VACUITY on this whole section. Every case above is "the run failed
 #    with a particular message", and a script that could not start at all would
 #    satisfy most of them. The happy path above is the control that it can
