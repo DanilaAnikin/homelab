@@ -54,6 +54,34 @@ ok(){   PASS=$((PASS+1)); note ok   "$1" "${2:-}"; }
 bad(){  FAIL=$((FAIL+1)); note FAIL "$1" "${2:-}"; }
 die(){  echo; echo "ABORT: $*"; exit 1; }
 
+# ── the containment monitor's expectation flips WITH the change ──────────────
+# The monitor (nt-containment-monitor.sh, systemd every 5 min) reads its
+# expected state from ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect. Its own header
+# says that file "flips atomically with each cutover stage" — but nothing flipped
+# it, so after a successful cutover the monitor kept asserting the PRE-cutover
+# world and alarmed on every cycle. An alarm that fires because the monitor was
+# never told the change happened trains the operator to ignore it, which is the
+# one thing a containment monitor must never do.
+#
+# Written via a temp + atomic rename, so a monitor run mid-flip reads one whole
+# state or the other, never half.
+flip_expectation(){ # <build_sha> <open|denied> <frozen|thawed>
+  local build="$1" rest="$2" freeze="$3"
+  local dir="${NT_MONITOR_STATE_DIR:-/var/lib/homelab}" exp
+  [[ -d "$dir" ]] || return 0            # no monitor installed here: nothing to flip
+  exp="$dir/nt-containment-expect"
+  local tmp; tmp="$(mktemp "$dir/.nt-containment-expect.XXXXXX")" || return 0
+  {
+    printf '# Written by %s at %s. Do not hand-edit during a cutover.\n' "${0##*/}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'EXPECT_BUILD_SHA=%s\n' "$build"
+    printf 'EXPECT_REST=%s\n' "$rest"
+    printf 'EXPECT_FREEZE=%s\n' "$freeze"
+  } > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$exp"
+  note ok "monitor expectation updated" "build=${build:0:12} rest=$rest freeze=$freeze"
+}
+
 # ── waiting for Traefik, by observing rather than by guessing ───────────────
 # `sleep 5` was the only synchronization with the file watcher. Traefik's
 # default providersThrottleDuration is 2s and applies AFTER the fsnotify
@@ -608,7 +636,16 @@ rollback(){
 case "${1:---check}" in
   --check)    pre_checks ;;
   --verify)   verify && echo "VERIFY OK ($PASS ok)" || { echo "VERIFY FAILED ($FAIL failed)"; exit 1; } ;;
-  --rollback) rollback; verify_service && echo "ROLLBACK VERIFIED" || { echo "ROLLBACK DID NOT RESTORE SERVICE"; exit 1; } ;;
+  --rollback)
+      rollback
+      if verify_service; then
+        # The overlay is gone; the data plane is open again. Freeze and build
+        # are unchanged by a Stage 2 rollback.
+        _cur_b=''; _cur_f='frozen'
+        [[ -f ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect ]] && { . ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect 2>/dev/null; _cur_b="$EXPECT_BUILD_SHA"; _cur_f="$EXPECT_FREEZE"; }
+        [[ "$_cur_b" =~ ^[0-9a-f]{40}$ ]] && flip_expectation "$_cur_b" open "$_cur_f" || true
+        echo "ROLLBACK VERIFIED"
+      else echo "ROLLBACK DID NOT RESTORE SERVICE"; exit 1; fi ;;
   --cutover)
       # pre_checks captures the baseline, BEFORE the change, so the verification
       # can tell a denial this change caused from one that was already there.
@@ -617,6 +654,12 @@ case "${1:---check}" in
       for _p in "${DENY_PATHS[@]}"; do note info "baseline $_p" "http ${DENY_BASELINE[$_p]}"; done
       echo; echo "CUTOVER"; do_cutover; echo
       if verify; then
+        # The data plane is now denied at the edge. Stage 2 does not touch the
+        # freeze or the build, so those are carried from the current expectation.
+        _cur_b=''; _cur_f='frozen'
+        [[ -f ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect ]] && { . ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect 2>/dev/null; _cur_b="$EXPECT_BUILD_SHA"; _cur_f="$EXPECT_FREEZE"; }
+        [[ "$_cur_b" =~ ^[0-9a-f]{40}$ ]] && flip_expectation "$_cur_b" denied "$_cur_f" \
+          || note info "monitor expectation NOT updated" "no valid build in the current expectation to carry"
         echo "STAGE 2 COMPLETE — $PASS ok, $FAIL failed"
       else
         echo; echo "POST-CHECK FAILED — rolling back automatically"; rollback

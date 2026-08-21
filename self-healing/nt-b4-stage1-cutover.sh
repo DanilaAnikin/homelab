@@ -66,6 +66,34 @@ ok(){   PASS=$((PASS+1)); note ok   "$1" "${2:-}"; }
 bad(){  FAIL=$((FAIL+1)); note FAIL "$1" "${2:-}"; }
 die(){  echo; echo "ABORT: $*"; exit 1; }
 
+# ── the containment monitor's expectation flips WITH the change ──────────────
+# The monitor (nt-containment-monitor.sh, systemd every 5 min) reads its
+# expected state from ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect. Its own header
+# says that file "flips atomically with each cutover stage" — but nothing flipped
+# it, so after a successful cutover the monitor kept asserting the PRE-cutover
+# world and alarmed on every cycle. An alarm that fires because the monitor was
+# never told the change happened trains the operator to ignore it, which is the
+# one thing a containment monitor must never do.
+#
+# Written via a temp + atomic rename, so a monitor run mid-flip reads one whole
+# state or the other, never half.
+flip_expectation(){ # <build_sha> <open|denied> <frozen|thawed>
+  local build="$1" rest="$2" freeze="$3"
+  local dir="${NT_MONITOR_STATE_DIR:-/var/lib/homelab}" exp
+  [[ -d "$dir" ]] || return 0            # no monitor installed here: nothing to flip
+  exp="$dir/nt-containment-expect"
+  local tmp; tmp="$(mktemp "$dir/.nt-containment-expect.XXXXXX")" || return 0
+  {
+    printf '# Written by %s at %s. Do not hand-edit during a cutover.\n' "${0##*/}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'EXPECT_BUILD_SHA=%s\n' "$build"
+    printf 'EXPECT_REST=%s\n' "$rest"
+    printf 'EXPECT_FREEZE=%s\n' "$freeze"
+  } > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$exp"
+  note ok "monitor expectation updated" "build=${build:0:12} rest=$rest freeze=$freeze"
+}
+
 # ── waiting for Traefik, by observing rather than by guessing ───────────────
 # `sleep 5` was the only synchronization with the file watcher. Traefik's
 # default providersThrottleDuration is 2s and applies AFTER the fsnotify
@@ -486,7 +514,16 @@ rollback(){
 case "${1:---check}" in
   --check)    pre_checks ;;
   --verify)   verify && echo "VERIFY OK ($PASS ok)" || { echo "VERIFY FAILED ($FAIL failed)"; exit 1; } ;;
-  --rollback) rollback; verify_service && echo "ROLLBACK VERIFIED" || { echo "ROLLBACK DID NOT RESTORE SERVICE"; exit 1; } ;;
+  --rollback)
+      rollback
+      if verify_service; then
+        # The pre-Stage-1 dashboard is serving again and is not frozen. Its build
+        # is whatever the restored container reports.
+        _b="$(http_body "$DASH_HOST/api/health" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("buildSha",""))' 2>/dev/null || true)"
+        _r="$( [[ -f ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect ]] && . ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect 2>/dev/null; echo "${EXPECT_REST:-open}" )"
+        [[ "$_b" =~ ^[0-9a-f]{40}$ ]] && flip_expectation "$_b" "$_r" thawed || true
+        echo "ROLLBACK VERIFIED"
+      else echo "ROLLBACK DID NOT RESTORE SERVICE"; exit 1; fi ;;
   --cutover)
       pre_checks
       echo
@@ -494,6 +531,13 @@ case "${1:---check}" in
       do_cutover
       echo
       if verify; then
+        # Flip the monitor's expectation to match what is now live: the bridge
+        # build (read from the container we just cut over to, the honest source)
+        # is frozen. REST is unchanged by Stage 1 and stays whatever it was.
+        _b="$(http_body "$DASH_HOST/api/health" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("buildSha",""))' 2>/dev/null || true)"
+        _r="$( [[ -f ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect ]] && . ${NT_MONITOR_STATE_DIR:-/var/lib/homelab}/nt-containment-expect 2>/dev/null; echo "${EXPECT_REST:-open}" )"
+        [[ "$_b" =~ ^[0-9a-f]{40}$ ]] && flip_expectation "$_b" "$_r" frozen \
+          || note info "monitor expectation NOT updated" "could not read a 40-char buildSha from the bridge"
         echo "STAGE 1 COMPLETE — $PASS ok, $FAIL failed"
       else
         echo

@@ -167,7 +167,7 @@ chmod +x "$STUB_BIN/docker" "$STUB_BIN/curl"
 
 # a world in which everything is fine
 healthy_world(){
-  local bridge_body='{"artifact_role":"frozen-containment-bridge","writes_enabled":false}'
+  local bridge_body='{"status":"ok","service":"nate-trader-dashboard","buildSha":"1e2331376c1694980cbc5248a85bff97621848b0","artifact_role":"frozen-containment-bridge","writes_enabled":false}'
   echo running                 > "$STUB_STATE/container_state"
   echo 0                       > "$STUB_STATE/restart_count"
   echo "dokploy-network "      > "$STUB_STATE/networks"
@@ -189,8 +189,10 @@ fresh_dyn(){
 }
 
 run_script(){ # <mode>
+  mkdir -p "$WORK/mon"
   PATH="$STUB_BIN:$PATH" STUB_STATE="$STUB_STATE" \
   DYN="$WORK/dyn" BACKUP_DIR="$WORK/backup" NT_TEST_LIVE="$WORK/dyn/natetrader.yml" \
+  NT_MONITOR_STATE_DIR="$WORK/mon" \
   bash "$SCRIPT" "$1" >"$WORK/out.txt" 2>&1
 }
 
@@ -414,6 +416,35 @@ if NT_B4_WAIT_SECONDS="" run_script --cutover; then
 else
   fail "F2: clearing the variable broke the cutover"; tail -4 "$WORK/out.txt"
 fi
+
+# ── M1: the cutover flips the monitor's expectation to frozen ──────────────
+# The containment monitor reads its expected state from a file its own header
+# says "flips atomically with each cutover stage" — but nothing flipped it, so
+# after the real cutover the monitor asserted the PRE-cutover world and alarmed
+# every five minutes. An alarm that fires because the monitor was never told the
+# change happened trains the operator to ignore it. The flip is now part of the
+# cutover, and here is where that is proved.
+fresh_dyn; healthy_world
+: > "$WORK/mon/nt-containment-expect" 2>/dev/null; mkdir -p "$WORK/mon"
+printf 'EXPECT_BUILD_SHA=%s\nEXPECT_REST=open\nEXPECT_FREEZE=thawed\n' "$(printf 'd%.0s' {1..40})" > "$WORK/mon/nt-containment-expect"
+run_script --cutover >/dev/null 2>&1 || true
+if [[ -f "$WORK/mon/nt-containment-expect" ]] && grep -q '^EXPECT_FREEZE=frozen$' "$WORK/mon/nt-containment-expect"; then
+  pass "M1: a successful cutover set EXPECT_FREEZE=frozen"
+else
+  fail "M1: the monitor expectation was not flipped to frozen"; sed 's/^/       /' "$WORK/mon/nt-containment-expect" 2>/dev/null
+fi
+grep -q '^EXPECT_BUILD_SHA=[0-9a-f]\{40\}$' "$WORK/mon/nt-containment-expect" \
+  && pass "M1: and it recorded the bridge build sha the monitor should now expect" \
+  || fail "M1: the expected build sha is missing or malformed"
+# NON-VACUITY: a rollback must flip it back, or "flips with the change" is only
+# half true.
+fresh_dyn; healthy_world
+printf 'EXPECT_BUILD_SHA=%s\nEXPECT_REST=open\nEXPECT_FREEZE=thawed\n' "$(printf 'd%.0s' {1..40})" > "$WORK/mon/nt-containment-expect"
+run_script --cutover >/dev/null 2>&1 || true
+run_script --rollback >/dev/null 2>&1 || true
+grep -q '^EXPECT_FREEZE=thawed$' "$WORK/mon/nt-containment-expect" \
+  && pass "M1: a rollback flips the expectation back to thawed" \
+  || fail "M1: the rollback did not restore the thawed expectation"
 
 echo
 echo "stage 1 rehearsal: $OK ok, $BAD not-ok"
