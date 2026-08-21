@@ -187,6 +187,42 @@ trap drop_secrets EXIT
 # gone; 5xx or a curl error means Auth is down; both are failures.
 AUTH_PROBE_PATH="/auth/v1/verify"
 AUTH_PROBE_OK="400"
+# The data-plane surface the overlay must deny, named once so the baseline and
+# the verification cannot drift apart.
+DENY_PATHS=( / /rest/v1/ /rest/v1/accounts /storage/v1/object/public/x
+             /realtime/v1/websocket /functions/v1/x /graphql/v1 /pg/ )
+declare -A DENY_BASELINE=()
+capture_deny_baseline(){
+  local key; key="$(anon_key)"
+  local p
+  for p in "${DENY_PATHS[@]}"; do
+    if [[ -n "$key" ]]; then DENY_BASELINE[$p]="$(status "$API_HOST$p" -H "apikey: $key")"
+    else DENY_BASELINE[$p]="$(status "$API_HOST$p")"; fi
+  done
+}
+
+SIGNIN_WORKED_BEFORE=0
+# Does the probe identity actually sign in? Asked before the change to decide
+# whether the authenticated half can be verified at all, and after it to decide
+# whether a failure is attributable to the change.
+probe_signin_works(){
+  [[ -r "$PROBE_CRED" ]] || return 1
+  local key; key="$(anon_key)"; [[ -n "$key" ]] || return 1
+  local hdrf bodyf tok
+  hdrf="$(secret_tmp)"; bodyf="$(secret_tmp)"
+  printf 'header = "apikey: %s"\n' "$key" > "$hdrf"
+  sed -n '1,2p' "$PROBE_CRED" | python3 -c '
+import json, sys
+e = sys.stdin.readline().rstrip("\r\n")
+p = sys.stdin.readline().rstrip("\r\n")
+sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
+  tok="$(body "$API_HOST/auth/v1/token?grant_type=password" \
+          --config "$hdrf" -H 'Content-Type: application/json' --data-binary "@$bodyf" \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)"
+  rm -f "$bodyf"
+  [[ -n "$tok" ]]
+}
+
 # ── pre-checks ──────────────────────────────────────────────────────────────
 pre_checks(){
   echo "PRE-CHECKS"
@@ -222,11 +258,31 @@ pre_checks(){
   if [[ -z "$key" ]]; then
     bad "no anon key at $ANON_FILE" "the denial checks would be indistinguishable from 401"
   else
-    s="$(status "$API_HOST/rest/v1/" -H "apikey: $key")"
-    if [[ "$s" == "403" ]]; then
-      bad "/rest/v1 already returns 403" "cannot attribute the denial to this change"
+    # ACROSS THE WHOLE SURFACE, not pinned to one path. This used to probe
+    # `/rest/v1/` alone and refuse if it was already 403 — and on the live host
+    # it IS 403, from Kong's ACL plugin ("You cannot consume this service"),
+    # with no containment deployed. So Stage 2 would have refused to run at all,
+    # for a denial that has nothing to do with it, while /rest/v1/accounts was
+    # answering 200 with a row set two paths away.
+    #
+    # The reasoning behind the old check is right and is kept: a post-change 403
+    # proves nothing on a path that was already 403. It is applied per path
+    # instead, and what the run requires is that ENOUGH of the surface is
+    # genuinely reachable for the change to be attributable.
+    capture_deny_baseline
+    local reachable=0 already=0 pth
+    for pth in "${DENY_PATHS[@]}"; do
+      if [[ "${DENY_BASELINE[$pth]}" == "403" ]]; then
+        already=$(( already + 1 )); note info "already denied before this change" "$pth -> 403"
+      else
+        reachable=$(( reachable + 1 ))
+      fi
+    done
+    if [[ "$reachable" -lt 4 ]]; then
+      bad "only $reachable of ${#DENY_PATHS[@]} data-plane paths are reachable" \
+          "$already are already denied by something else; this change could not be attributed"
     else
-      ok "data plane currently reachable" "/rest/v1 -> http $s"
+      ok "data plane currently reachable" "$reachable of ${#DENY_PATHS[@]} paths ($already already denied elsewhere)"
     fi
   fi
 
@@ -238,8 +294,27 @@ pre_checks(){
 
   # An authenticated probe identity, or the authenticated half of the matrix
   # reports UNKNOWN — and UNKNOWN is a coverage failure, not a pass.
-  [[ -r "$PROBE_CRED" ]] && ok "probe identity available" \
-                         || bad "no probe identity at $PROBE_CRED" "the authenticated matrix cannot run"
+  # THE FILE EXISTING IS NOT THE CREDENTIAL WORKING. This stopped at "readable",
+  # so a sign-in that was ALREADY broken got attributed to Stage 2 by the
+  # post-check, and a cutover whose containment had worked perfectly rolled
+  # itself back and escalated. Measured on the live host: the probe credential
+  # returns `invalid_credentials` with no overlay in place at all.
+  #
+  # Sign-in is exercised HERE, before the change. If it works, the post-check
+  # requires it to keep working — that is the property Stage 2 must not break.
+  # If it does not work now, Stage 2 cannot be blamed for it and is not blocked
+  # by it, but the authenticated half of the matrix is UNVERIFIABLE and the run
+  # says exactly that instead of reporting a pass.
+  if [[ ! -r "$PROBE_CRED" ]]; then
+    SIGNIN_WORKED_BEFORE=0
+    bad "no probe identity at $PROBE_CRED" "the authenticated matrix cannot run"
+  elif probe_signin_works; then
+    SIGNIN_WORKED_BEFORE=1
+    ok "probe identity signs in" "the authenticated half of the matrix can be verified"
+  else
+    SIGNIN_WORKED_BEFORE=0
+    note info "probe identity CANNOT sign in" "pre-existing, not caused by this change; the authenticated half will be UNVERIFIED"
+  fi
 
   echo
   [[ $FAIL -eq 0 ]] || die "$FAIL pre-check(s) failed — nothing was changed"
@@ -311,7 +386,11 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
       s="$(status "$API_HOST/auth/v1/logout" -X POST --config "$hdrf")"
       [[ "$s" == "204" ]] && ok "authenticated logout" "http 204" || bad "authenticated logout" "http $s"
     else
-      bad "sign-in FAILED through the new edge" "this is the failure Stage 2 must never cause"
+      if [[ "$SIGNIN_WORKED_BEFORE" -eq 1 ]]; then
+        bad "sign-in FAILED through the new edge" "it worked before this change — the failure Stage 2 must never cause"
+      else
+        note info "sign-in still does not work" "it did not work before this change either; not attributable to Stage 2, authenticated half stays UNVERIFIED"
+      fi
     fi
   else
     bad "no probe identity" "the authenticated half of the matrix did not run — that is a coverage failure, not a pass"
@@ -319,11 +398,40 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
 
   # The data plane, anonymous and authenticated. Both, because a rule that
   # denies only unauthenticated traffic is not containment.
-  for path in / /rest/v1/ /rest/v1/accounts /storage/v1/object/public/x \
-              /realtime/v1/websocket /functions/v1/x /graphql/v1 /pg/; do
+  # A 403 IS ONLY EVIDENCE IF IT WAS NOT 403 BEFORE.
+  #
+  # MEASURED against the live, UNCONTAINED host: with the anon key,
+  # /rest/v1/ answers 403 and /pg/ answers 403 already — Kong's ACL plugin
+  # ("You cannot consume this service"), nothing to do with containment, which
+  # is not deployed. Asserting `== 403` as proof of denial therefore passed for
+  # two of the eight paths BEFORE the overlay existed. Meanwhile
+  # /rest/v1/accounts answers 200 with a row set, which is the thing actually
+  # being closed.
+  #
+  # So each path is compared against what it answered before the change. A path
+  # that was already denied is reported and explicitly NOT counted as evidence,
+  # and the run requires a minimum number of paths that really did change.
+  local changed=0 preexisting=0
+  for path in "${DENY_PATHS[@]}"; do
     s="$(status "$API_HOST$path" -H "apikey: $key")"
-    [[ "$s" == "403" ]] && ok "anon DENY $path" "http 403" || bad "anon DENY $path" "http $s (expected 403)"
+    local was="${DENY_BASELINE[$path]:-unknown}"
+    if [[ "$s" != "403" ]]; then
+      bad "anon DENY $path" "http $s (expected 403; was $was before the change)"
+    elif [[ "$was" == "403" ]]; then
+      preexisting=$(( preexisting + 1 ))
+      note info "anon DENY $path" "403, but it was ALREADY 403 before the change — not evidence"
+    else
+      changed=$(( changed + 1 ))
+      ok "anon DENY $path" "$was -> 403"
+    fi
   done
+  # Non-vacuity for the matrix as a whole: if every path had already been denied
+  # by something else, eight green lines would prove nothing at all.
+  if [[ "$changed" -lt 4 ]]; then
+    bad "the deny matrix proved little" "only $changed of ${#DENY_PATHS[@]} path(s) actually changed to 403 ($preexisting were already denied)"
+  else
+    ok "the deny matrix is evidence" "$changed of ${#DENY_PATHS[@]} paths changed to 403; $preexisting were already denied"
+  fi
 
   # The encoded forms that defeated the first draft of the overlay.
   for path in '/auth/v1/../rest/v1/accounts' '/auth/v1/..%2Frest%2Fv1%2Faccounts' \
@@ -371,6 +479,12 @@ verify_service(){
   # an unreadable $ANON_FILE (a path outside these scripts' control) was enough
   # to do it, mid-incident. The keyed probe is SKIPPED and said to be skipped;
   # the hard requirement stays where the matrix actually depends on it.
+  # A PATH THAT IS GENUINELY OPEN. /rest/v1/ answers 403 from Kong's ACL always
+  # — before, during and after — so probing it here reported "still denied after
+  # rollback" over a rollback that had demonstrably succeeded, and escalated.
+  # Measured live: /rest/v1/accounts is 200 keyed, 401 anonymous when open, and
+  # 403 when the overlay denies it.
+  local probe="/rest/v1/accounts"
   local key; key="$(anon_key)"
   if [[ -z "$key" ]]; then
     note info "no anon key readable at $ANON_FILE" "the keyed data-plane probe is SKIPPED; the file assertion below still decides"
@@ -407,9 +521,9 @@ verify_service(){
   # Stage 2 deny middleware is in front of it. 403 is the denial; anything else
   # means the denial is gone, which is what a rollback is for.
   if [[ -n "$key" ]]; then
-    s="$(status "$API_HOST/rest/v1/" -H "apikey: $key")"
+    s="$(status "$API_HOST$probe" -H "apikey: $key")"
   else
-    s="$(status "$API_HOST/rest/v1/")"
+    s="$(status "$API_HOST$probe")"
   fi
   # POSITIVE FORM. Written as "not 403", every transport failure, timeout, 502,
   # 503 and 504 counted as evidence that the data plane came back — status()
@@ -418,9 +532,9 @@ verify_service(){
   # post-rollback check. An open data plane answers 200 with a key or 401
   # without one; anything else is not evidence of anything.
   case "$s" in
-    403)     bad "/rest/v1 still denied after rollback" "the overlay may still be live" ;;
-    200|401) ok  "data plane reachable again" "/rest/v1 -> http $s${key:+ (keyed)}" ;;
-    *)       bad "/rest/v1 answered $s after rollback" "not a denial, but not evidence of recovery either" ;;
+    403)     bad "$probe still denied after rollback" "the overlay may still be live" ;;
+    200|401) ok  "data plane reachable again" "$probe -> http $s${key:+ (keyed)}" ;;
+    *)       bad "$probe answered $s after rollback" "not a denial, but not evidence of recovery either" ;;
   esac
   echo
   [[ $FAIL -eq $before ]]
@@ -445,7 +559,12 @@ case "${1:---check}" in
   --verify)   verify && echo "VERIFY OK ($PASS ok)" || { echo "VERIFY FAILED ($FAIL failed)"; exit 1; } ;;
   --rollback) rollback; verify_service && echo "ROLLBACK VERIFIED" || { echo "ROLLBACK DID NOT RESTORE SERVICE"; exit 1; } ;;
   --cutover)
-      pre_checks; echo; echo "CUTOVER"; do_cutover; echo
+      # pre_checks captures the baseline, BEFORE the change, so the verification
+      # can tell a denial this change caused from one that was already there.
+      pre_checks
+      echo; echo "BASELINE (what the data plane answered BEFORE the change)"
+      for _p in "${DENY_PATHS[@]}"; do note info "baseline $_p" "http ${DENY_BASELINE[$_p]}"; done
+      echo; echo "CUTOVER"; do_cutover; echo
       if verify; then
         echo "STAGE 2 COMPLETE — $PASS ok, $FAIL failed"
       else

@@ -101,12 +101,23 @@ case "$1" in
     esac
     exit 0 ;;
   run)
-    # `docker run --rm --network … busybox nslookup NAME`
+    # `docker run --rm --network … busybox nslookup -type=a NAME.`
+    #
+    # MEASURED on the host: busybox nslookup appends the DNS search domains and
+    # exits 0 even on NXDOMAIN, so the probe asks for the FQDN form (trailing
+    # dot) and looks for an A RECORD rather than trusting the exit status. The
+    # stub answers the same shape, or the fixture would be testing a protocol
+    # the real prober does not speak.
     [[ -f "$S/docker_run_fails" ]] && exit 1     # e.g. busybox absent, offline
     local_name=""
     for a in "$@"; do local_name="$a"; done
-    [[ -f "$S/resolves_$local_name" ]] && exit 0
-    exit 1 ;;
+    local_name="${local_name%.}"                 # the probe passes NAME.
+    if [[ -f "$S/resolves_$local_name" ]]; then
+      printf 'Server:\t\t127.0.0.11\nAddress:\t127.0.0.11:53\n\nName:\t%s\nAddress: 10.0.1.7\n' "$local_name"
+      exit 0
+    fi
+    printf '** server can'"'"'t find %s: NXDOMAIN\n' "$local_name"
+    exit 0 ;;
 esac
 exit 0
 EOF

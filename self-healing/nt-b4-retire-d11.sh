@@ -273,7 +273,21 @@ retire(){
   # reason, including busybox:latest being absent on an offline host. So the
   # prober is first pointed at a name that MUST resolve. If that fails, the
   # prober is broken and neither answer means anything.
-  resolves(){ docker run --rm --network dokploy-network busybox:latest nslookup "$1" >/dev/null 2>&1; }
+  # A TRAILING DOT, AND AN ACTUAL A RECORD.
+  #
+  # `nslookup NAME` inside busybox appends the host's DNS search domains and
+  # never tries the bare name, so on this host every lookup came back
+  # "can't find NAME.tail235616.ts.net: NXDOMAIN" — for the BRIDGE too. The
+  # positive control then failed and the run correctly reported that it could
+  # not tell detached from unprobeable. Measured: `nslookup natetrader-dashboard-bridge.`
+  # (FQDN form, search suppressed) resolves, and the retired container does not.
+  #
+  # busybox nslookup also exits 0 on NXDOMAIN, so the exit status is not the
+  # answer either — the presence of an A record is.
+  resolves(){
+    docker run --rm --network dokploy-network busybox:latest nslookup -type=a "$1." 2>/dev/null \
+      | grep -qE '^Address: +[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
+  }
   if ! resolves "$BRIDGE"; then
     bad "the DNS prober is not working" "$BRIDGE does not resolve either — cannot tell detached from unprobeable"
   else

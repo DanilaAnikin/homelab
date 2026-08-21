@@ -89,13 +89,33 @@ case "$url" in
   # now probe the former, because the latter made every liveness assertion
   # here pass on a fiction and fail against the real host.
   */auth/v1/verify)    key=auth_settings ;;
-  */auth/v1/token*)    key=auth_token ;;
+  */auth/v1/token*)    key=auth_token
+                       # $S/token_breaks_when_contained models the case that
+                       # matters: sign-in WORKED before the change and stops
+                       # working after it. Breaking it for the whole run instead
+                       # makes the fixture indistinguishable from a credential
+                       # that was already invalid — which is the real state of
+                       # the live probe identity, and which must NOT be blamed
+                       # on the cutover.
+                       if [[ -f "$STUB_STATE/token_breaks_when_contained" ]] && contained; then
+                         if [[ "$want_code" == 1 ]]; then printf '400'; else printf '{}'; fi
+                         exit 0
+                       fi ;;
   */auth/v1/user)      key=auth_user ;;
   */auth/v1/logout)    key=auth_logout ;;
   */api/health)        key=dash_health ;;
   */rest/v1/)          key=rest_root ;;
   *) key=deny ;;
 esac
+# MEASURED on the live host: some data-plane paths are ALREADY 403 before any
+# containment exists — /rest/v1/ and /pg/ answer 403 from Kong's ACL plugin.
+# $S/pre_denied lists paths that answer 403 regardless of the overlay, so the
+# production shape can be reproduced here instead of assumed away.
+if [[ -f "$STUB_STATE/pre_denied" ]]; then
+  while IFS= read -r pd; do
+    [[ -n "$pd" && "$url" == *"$pd" ]] && { [[ "$want_code" == 1 ]] && printf '403' || printf '{}'; exit 0; }
+  done < "$STUB_STATE/pre_denied"
+fi
 if [[ "$key" == rest_root || "$key" == deny ]]; then
   # a data-plane path: denied only when the overlay is actually live
   if contained; then code="$(cat "$S/code_deny" 2>/dev/null || echo 403)"
@@ -211,7 +231,7 @@ else fail "re-apply: the file changed"; fi
 # ── 5. a failing post-check rolls itself back ───────────────────────────────
 # The dangerous case, and the specific one that matters: sign-in stops working.
 fresh; healthy_world
-echo 400 > "$STUB_STATE/code_auth_token"; echo '{}' > "$STUB_STATE/body_auth_token"
+: > "$STUB_STATE/token_breaks_when_contained"
 if run_script --cutover; then
   fail "sign-in broke and the script reported success"
 elif diff -q <(printf '%s\n' "$STAGE1_YML") "$WORK/dyn/natetrader.yml" >/dev/null; then
@@ -219,6 +239,22 @@ elif diff -q <(printf '%s\n' "$STAGE1_YML") "$WORK/dyn/natetrader.yml" >/dev/nul
 else
   fail "sign-in broke and the change was LEFT IN PLACE"
 fi
+rm -f "$STUB_STATE/token_breaks_when_contained"
+
+# THE CONVERSE, which is the live state: a credential that was ALREADY invalid
+# must not be attributed to the cutover. Measured on the host — the probe
+# identity returns invalid_credentials with no overlay in place — and a
+# perfectly good containment change rolled itself back and escalated over it.
+fresh; healthy_world
+echo 400 > "$STUB_STATE/code_auth_token"; echo '{}' > "$STUB_STATE/body_auth_token"
+if run_script --cutover; then
+  pass "a pre-existing bad credential does not roll back working containment"
+else
+  fail "a sign-in that was already broken was blamed on the cutover"; tail -6 "$WORK/out.txt"
+fi
+grep -qF "authenticated half" "$WORK/out.txt" \
+  && pass "and the run says the authenticated half is UNVERIFIED" \
+  || { fail "the run did not disclose that the authenticated half is unverified"; tail -4 "$WORK/out.txt"; }
 
 # and the same for a data-plane path that is NOT denied after the change
 fresh; healthy_world
@@ -328,6 +364,37 @@ grep -q -- '--config' "$STUB_STATE/argv.log" \
   && pass "C9b: the run left no secret file behind (no entry present after that was absent before)" \
   || { fail "C9b: the run leaked ${new_entries} secret file(s) onto tmpfs"
        comm -13 <(printf '%s\n' "$before_list") <(printf '%s\n' "$after_list") | head -3 | sed 's/^/           /'; }
+
+# ── the production shape: SOME paths already denied, others open ───────────
+# On the live host /rest/v1/ and /pg/ answer 403 from Kong's ACL with no
+# containment deployed, while /rest/v1/accounts answers 200 with rows. The old
+# pre-check pinned on /rest/v1/ alone and refused the whole cutover for a
+# denial that had nothing to do with it; the old matrix then counted those two
+# 403s as proof. Both are per-path now, and the run must still proceed.
+fresh; healthy_world
+printf '/rest/v1/\n/pg/\n' > "$STUB_STATE/pre_denied"
+if run_script --cutover; then
+  pass "P1: a partially pre-denied surface does not block the cutover"
+else
+  fail "P1: the cutover refused because two paths were already denied"; tail -5 "$WORK/out.txt"
+fi
+grep -qF "already denied before this change" "$WORK/out.txt" \
+  && pass "P1: the pre-existing denials are named, not silently counted" \
+  || { fail "P1: the pre-existing denials were not reported"; tail -3 "$WORK/out.txt"; }
+grep -qE "the deny matrix is evidence.*6 of 8" "$WORK/out.txt" \
+  && pass "P1: exactly the six that changed are counted as evidence" \
+  || { fail "P1: the evidence count is wrong"; grep -i 'deny matrix' "$WORK/out.txt" | head -2; }
+
+# And if EVERYTHING is already denied, the cutover must refuse: eight green
+# lines would otherwise prove nothing at all.
+fresh; healthy_world
+printf '/\n/rest/v1/\n/rest/v1/accounts\n/storage/v1/object/public/x\n/realtime/v1/websocket\n/functions/v1/x\n/graphql/v1\n/pg/\n' > "$STUB_STATE/pre_denied"
+if run_script --cutover; then
+  fail "P2: a fully pre-denied surface was accepted"
+else
+  pass "P2: a fully pre-denied surface is refused — the change could not be attributed"
+fi
+rm -f "$STUB_STATE/pre_denied"
 
 echo
 echo "stage 2 rehearsal: $OK ok, $BAD not-ok"
