@@ -411,12 +411,19 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
   # So each path is compared against what it answered before the change. A path
   # that was already denied is reported and explicitly NOT counted as evidence,
   # and the run requires a minimum number of paths that really did change.
-  local changed=0 preexisting=0
+  local changed=0 preexisting=0 unknown_base=0
   for path in "${DENY_PATHS[@]}"; do
     s="$(status "$API_HOST$path" -H "apikey: $key")"
     local was="${DENY_BASELINE[$path]:-unknown}"
     if [[ "$s" != "403" ]]; then
       bad "anon DENY $path" "http $s (expected 403; was $was before the change)"
+    elif [[ "$was" == "unknown" ]]; then
+      # --verify run on its own captures no baseline, so there is nothing to
+      # compare against. Counting these as "changed to 403" claimed evidence the
+      # run did not have — it printed "8 of 8 paths changed" from a baseline of
+      # `unknown`. A 403 with no before-value is a fact, not a demonstration.
+      unknown_base=$(( unknown_base + 1 ))
+      note info "anon DENY $path" "403, but no pre-change baseline was taken — a fact, not evidence of a change"
     elif [[ "$was" == "403" ]]; then
       preexisting=$(( preexisting + 1 ))
       note info "anon DENY $path" "403, but it was ALREADY 403 before the change — not evidence"
@@ -427,10 +434,54 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
   done
   # Non-vacuity for the matrix as a whole: if every path had already been denied
   # by something else, eight green lines would prove nothing at all.
-  if [[ "$changed" -lt 4 ]]; then
-    bad "the deny matrix proved little" "only $changed of ${#DENY_PATHS[@]} path(s) actually changed to 403 ($preexisting were already denied)"
+  if [[ "$unknown_base" -gt 0 && "$changed" -eq 0 ]]; then
+    # Standalone --verify: the denials are real and reported, but this run did
+    # not observe the before-state, so it cannot claim to have caused them. Said
+    # rather than quietly counted, because "8 of 8 changed" from an unknown
+    # baseline is the shape of a proof that did not happen.
+    note info "the deny matrix is a snapshot, not evidence of a change" \
+      "$unknown_base of ${#DENY_PATHS[@]} paths are 403 with no baseline; run --cutover for the before/after"
+  elif [[ "$changed" -lt 4 ]]; then
+    bad "the deny matrix proved little" "only $changed of ${#DENY_PATHS[@]} path(s) actually changed to 403 ($preexisting already denied, $unknown_base with no baseline)"
   else
     ok "the deny matrix is evidence" "$changed of ${#DENY_PATHS[@]} paths changed to 403; $preexisting were already denied"
+  fi
+
+  # ── the denial does not depend on WHO is asking ───────────────────────────
+  #
+  # A signed-in probe shows that ONE identity is denied. This shows the decision
+  # cannot depend on identity at all, which is the property the containment
+  # claim actually needs — and it is checkable without a working credential.
+  #
+  # The rule is `Host(...) && (Path(/auth/v1) || PathPrefix(/auth/v1/)) &&
+  # !PathRegexp(%)` with an `ipAllowList` middleware. Neither the router nor the
+  # middleware reads an Authorization header or an apikey, so authentication
+  # cannot change the outcome by construction. Measured here rather than argued:
+  # every denied path, under three credential states.
+  local ci_ok=0 ci_bad=0 pth3 s_none s_key s_bearer
+  for pth3 in "${DENY_PATHS[@]}"; do
+    s_none="$(status "$API_HOST$pth3")"
+    s_key="$(status "$API_HOST$pth3" -H "apikey: $key")"
+    s_bearer="$(status "$API_HOST$pth3" -H "apikey: $key" -H "Authorization: Bearer $key")"
+    if [[ "$s_none" == "403" && "$s_key" == "403" && "$s_bearer" == "403" ]]; then
+      ci_ok=$(( ci_ok + 1 ))
+    else
+      ci_bad=$(( ci_bad + 1 ))
+      bad "denial depends on the caller at $pth3" "no-auth=$s_none apikey=$s_key bearer=$s_bearer"
+    fi
+  done
+  if [[ "$ci_bad" -eq 0 ]]; then
+    ok "the denial is credential-independent" "$ci_ok paths x {no-auth, apikey, apikey+Bearer} all 403"
+  fi
+  # The control, in the same three states: Auth must be reachable regardless,
+  # or "everything is 403" would be indistinguishable from a broken edge.
+  s_none="$(status "$API_HOST$AUTH_PROBE_PATH")"
+  s_key="$(status "$API_HOST$AUTH_PROBE_PATH" -H "apikey: $key")"
+  s_bearer="$(status "$API_HOST$AUTH_PROBE_PATH" -H "apikey: $key" -H "Authorization: Bearer $key")"
+  if [[ "$s_none" == "$AUTH_PROBE_OK" && "$s_key" == "$AUTH_PROBE_OK" && "$s_bearer" == "$AUTH_PROBE_OK" ]]; then
+    ok "CONTROL: Auth is reachable in all three states" "$AUTH_PROBE_PATH -> $AUTH_PROBE_OK"
+  else
+    bad "CONTROL: Auth is not uniformly reachable" "no-auth=$s_none apikey=$s_key bearer=$s_bearer"
   fi
 
   # The encoded forms that defeated the first draft of the overlay.
