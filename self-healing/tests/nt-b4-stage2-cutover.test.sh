@@ -71,12 +71,16 @@ printf '%s\n' "$*" >> "$STUB_STATE/argv.log"
 S="$STUB_STATE"
 LIVE="$NT_TEST_LIVE"
 contained(){ grep -q 'natetrader-deny-data-plane' "$LIVE" 2>/dev/null; }
-url=""; method=GET; want_code=0
+url=""; method=GET; want_code=0; hdrs=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -X) method="$2"; shift 2 ;;
     -w) [[ "$2" == *"http_code"* ]] && want_code=1; shift 2 ;;
-    -o|-d|-H|--max-time) shift 2 ;;
+    -H) hdrs="${hdrs}${2};"; shift 2 ;;   # RECORDED, not discarded — the
+                                          # credential matrix varies these, so
+                                          # the stub must be able to react to
+                                          # them or that matrix cannot fail
+    -o|-d|--max-time) shift 2 ;;
     -sS|-s|-S|--path-as-is) shift ;;
     http*) url="$1"; shift ;;
     *) shift ;;
@@ -118,7 +122,18 @@ if [[ -f "$STUB_STATE/pre_denied" ]]; then
 fi
 if [[ "$key" == rest_root || "$key" == deny ]]; then
   # a data-plane path: denied only when the overlay is actually live
-  if contained; then code="$(cat "$S/code_deny" 2>/dev/null || echo 403)"
+  if contained; then
+    # $S/deny_depends_on_bearer models a denial that is NOT identity-independent:
+    # a caller presenting `Authorization: Bearer` is let through while others are
+    # denied. The credential matrix exists to catch exactly this, so the stub
+    # must be able to PRODUCE it. Before -H was recorded the three credential
+    # states were identical by construction and the matrix could never fail
+    # (audit F3).
+    if [[ -f "$STUB_STATE/deny_depends_on_bearer" && "$hdrs" == *"Authorization: Bearer "* ]]; then
+      code="$(cat "$S/code_open" 2>/dev/null || echo 200)"
+    else
+      code="$(cat "$S/code_deny" 2>/dev/null || echo 403)"
+    fi
   else code="$(cat "$S/code_open" 2>/dev/null || echo 200)"; fi
 else
   code="$(cat "$S/code_$key" 2>/dev/null || echo 200)"
@@ -263,6 +278,26 @@ if run_script --cutover; then fail "the data plane stayed open and the script sa
 elif diff -q <(printf '%s\n' "$STAGE1_YML") "$WORK/dyn/natetrader.yml" >/dev/null; then
   pass "data plane not denied -> automatic rollback"
 else fail "data plane not denied and the change was left in place"; fi
+
+# the credential matrix must be able to FAIL (audit F3). The stub used to
+# discard -H, so no-auth/apikey/apikey+Bearer returned the identical status by
+# construction and the "denial depends on the caller" branch was unreachable —
+# the matrix asserted a property it could not have falsified. Model a denial
+# that DOES depend on the caller (open to a Bearer, denied otherwise) and
+# require the run to catch it and roll back.
+fresh; healthy_world
+: > "$STUB_STATE/deny_depends_on_bearer"
+if run_script --cutover; then
+  fail "a caller-dependent denial was NOT caught — the credential matrix is vacuous"
+else
+  grep -q 'denial depends on the caller' "$WORK/out.txt" \
+    && pass "the credential matrix catches a denial that depends on the caller" \
+    || { fail "cutover failed, but not because the denial depended on the caller"; tail -6 "$WORK/out.txt"; }
+  diff -q <(printf '%s\n' "$STAGE1_YML") "$WORK/dyn/natetrader.yml" >/dev/null \
+    && pass "a caller-dependent denial -> automatic rollback" \
+    || fail "caller-dependent denial caught but the change was left in place"
+fi
+rm -f "$STUB_STATE/deny_depends_on_bearer"
 
 # ── 6. non-vacuity ──────────────────────────────────────────────────────────
 # Stage 2 REPLACES the file from the overlay rather than editing it in place,

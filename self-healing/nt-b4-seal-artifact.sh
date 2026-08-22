@@ -247,6 +247,39 @@ case "$SEAL_MAX" in
   *) bad "NT_SEAL_MAX_SEVERITY invalid" "got '$SEAL_MAX', want none|high|critical" ;;
 esac
 
+# ── 4b. scan-scope caveat ───────────────────────────────────────────────────
+# trivy can only match a CVE to a package that HAS a version. syft records many
+# of Next's vendored dependencies (under next/dist/compiled/) with no version at
+# all, so those components are outside the scan the "0 findings" above reports —
+# including Next's own bundled copies of packages that DID carry CVEs elsewhere.
+# Reporting the severity block without this is the seal claiming clean over a
+# surface it did not fully see (audit F2). Computed from the SBOM, not hardcoded.
+python3 - "$OUT/sbom.cyclonedx.json" > "$OUT/scan-scope.txt" <<'PY'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    print("UNREADABLE"); raise SystemExit
+comps=d.get("components",[])
+def nover(c): return c.get("version","UNKNOWN") in ("", "UNKNOWN", None)
+npm=[c for c in comps if str(c.get("purl","")).startswith("pkg:npm")]
+tot, tot_nv = len(comps), sum(1 for c in comps if nover(c))
+npm_n, npm_nv = len(npm), sum(1 for c in npm if nover(c))
+print(f"components {tot}")
+print(f"components_no_version {tot_nv}")
+print(f"npm {npm_n}")
+print(f"npm_no_version {npm_nv}")
+PY
+SCOPE_TOT="$(awk '$1=="components"{print $2}' "$OUT/scan-scope.txt")"
+SCOPE_TOT_NV="$(awk '$1=="components_no_version"{print $2}' "$OUT/scan-scope.txt")"
+SCOPE_NPM="$(awk '$1=="npm"{print $2}' "$OUT/scan-scope.txt")"
+SCOPE_NPM_NV="$(awk '$1=="npm_no_version"{print $2}' "$OUT/scan-scope.txt")"
+if [[ -n "${SCOPE_TOT_NV:-}" && "${SCOPE_TOT_NV:-0}" -gt 0 ]]; then
+  ok "scan scope recorded" "$SCOPE_TOT_NV/$SCOPE_TOT components ($SCOPE_NPM_NV/$SCOPE_NPM npm) unversioned — outside the CVE scan"
+else
+  ok "scan scope recorded" "every SBOM component carries a version"
+fi
+
 # ── 5. per-layer secret scan ────────────────────────────────────────────────
 # Filesystem-level, from an exported container rather than from the layer
 # blobs: an earlier attempt scanned the blobs directly, extracted zero files,
@@ -484,8 +517,15 @@ ok "provenance recorded"
   echo "This is NOT a registry digest and NOT a signed registry artifact."
   echo "Nothing was pushed. Every digest here was computed from local bytes."
   echo
-  echo "vulnerabilities:"
+  echo "vulnerabilities (trivy, over versioned components only):"
   sed 's/^/  /' "$OUT/vuln-summary.txt"
+  if [[ "${SCOPE_TOT_NV:-0}" -gt 0 ]]; then
+    echo "  scope: ${SCOPE_TOT_NV} of ${SCOPE_TOT} SBOM components (${SCOPE_NPM_NV} of ${SCOPE_NPM} npm)"
+    echo "         carry no version and cannot be matched to a CVE — most are Next's"
+    echo "         vendored deps under next/dist/compiled/. The counts above are over"
+    echo "         the scannable remainder only; a 0 is not proof of absence in the"
+    echo "         unversioned set."
+  fi
   echo
   for f in image.tar manifest.json sbom.spdx.json sbom.cyclonedx.json vulns.json provenance.json layer-digests.txt; do
     [[ -f "$OUT/$f" ]] && echo "DIGEST $(sha256sum "$OUT/$f" | cut -d' ' -f1)  $f"

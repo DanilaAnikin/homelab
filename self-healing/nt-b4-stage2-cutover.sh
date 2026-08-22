@@ -477,15 +477,20 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
 
   # ── the denial does not depend on WHO is asking ───────────────────────────
   #
-  # A signed-in probe shows that ONE identity is denied. This shows the decision
-  # cannot depend on identity at all, which is the property the containment
-  # claim actually needs — and it is checkable without a working credential.
+  # A signed-in probe would show that ONE identity is denied. The property the
+  # containment claim actually needs is stronger — the decision cannot depend on
+  # identity at all — and the ROUTER RULE is what guarantees it, not this probe:
+  # `Host(...) && (Path(/auth/v1) || PathPrefix(/auth/v1/)) && !PathRegexp(%)`
+  # with an `ipAllowList` middleware reads no Authorization header and no apikey,
+  # so by construction authentication cannot change the outcome.
   #
-  # The rule is `Host(...) && (Path(/auth/v1) || PathPrefix(/auth/v1/)) &&
-  # !PathRegexp(%)` with an `ipAllowList` middleware. Neither the router nor the
-  # middleware reads an Authorization header or an apikey, so authentication
-  # cannot change the outcome by construction. Measured here rather than argued:
-  # every denied path, under three credential states.
+  # What the loop below adds is CORROBORATION, and only for the one credential
+  # this host can present — the publishable anon key — across header-presence
+  # states (none / apikey / apikey+Bearer). It does NOT vary the caller's
+  # identity: all three carry the same publishable value, because the probe
+  # identity cannot sign in (the token cases above). So this measures that the
+  # edge ignores those header NAMES for the anon key; identity-independence
+  # itself is the router-rule argument, not something measured here.
   # WITH A REAL KEY, or the three states are not three states. When
   # $ANON_FILE is unreadable anon_key() returns "", so `-H "apikey: "` and
   # `-H "Authorization: Bearer "` are empty headers — the keyed and bearer
@@ -508,7 +513,8 @@ sys.stdout.write(json.dumps({"email": e, "password": p}))' > "$bodyf"
     fi
   done
   if [[ "$ci_bad" -eq 0 ]]; then
-    ok "the denial is credential-independent" "$ci_ok paths x {no-auth, apikey, apikey+Bearer} all 403"
+    ok "the denial ignores the apikey/Bearer headers (publishable anon key)" \
+       "$ci_ok paths x {none, apikey, apikey+Bearer} all 403 — router-rule identity-independence corroborated, not measured"
   fi
   # The control, in the same three states: Auth must be reachable regardless,
   # or "everything is 403" would be indistinguishable from a broken edge.
