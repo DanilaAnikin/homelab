@@ -46,6 +46,12 @@ problems=()
 [ "${MAXDUP:-0}" -gt 3 ] && problems+=("fan-out fronty: ${MAXDUP} zpráv na jeden task (rozbitá dedup v reconciliation)")
 [ "${ATT_6H:-0}" -eq 0 ] && [ "${READY:-0}" -gt 0 ] && problems+=("uvázlý dispatch: 0 pokusů za 6 h, přitom čeká ${READY} tasků")
 
+# Zaseknutá PŘÍPRAVA pokusu: běží dlouho, ale neudělal ani krok. Tenhle stav
+# 22. 8. položil farmu na 15 hodin — dva takové pokusy obsadily obě místa workerů.
+# Hlídač to tehdy nahlásil jen jako "uvázlý dispatch", což neřeklo, kde hledat.
+STUCK_SETUP="$(DBQ "select count(*) from attempts where status='running' and steps_used = 0 and started_at < now() - interval '45 minutes';")"
+[ "${STUCK_SETUP:-0}" -gt 0 ] && problems+=("${STUCK_SETUP} pokusů visí v přípravě přes 45 min s 0 kroky (zabírají místa workerů — zabij jim kontejnery a ukonči pokusy)")
+
 if [ ${#problems[@]} -gt 0 ]; then
   alert "$(printf '%s; ' "${problems[@]}")— zkontroluj orchestrátor"
   exit 1
