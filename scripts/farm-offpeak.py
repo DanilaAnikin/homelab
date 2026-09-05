@@ -46,6 +46,17 @@ def get(key, fallback=None):
         return rows[0][0]
 
 
+def _vlastnik_zastavil():
+    """Zastavil farmu člověk? Jeho pauzu žádný hlídač rušit nesmí.
+
+    `owner_pause` je samostatný klíč právě proto, aby se nedal splést s provozní
+    pauzou hlídačů. Ti si svou vlastní poznají podle `pause_source`, jenže tu
+    aplikace (dashboard, /kill) nikdy nezapisovala — a tak se stávalo, že hlídač
+    zrušil pauzu, kterou nezpůsobil.
+    """
+    return bool(get("owner_pause", False))
+
+
 def put(key, value):
     v = json.dumps(value).replace("'", "''")
     sql(f"""insert into farm_settings (key, value) values ('{key}', '{v}'::jsonb)
@@ -71,6 +82,9 @@ if in_peak and not paused:
 elif not in_peak and paused and source == MARK:
     if DRY:
         print("[náhled] pustil bych farmu"); sys.exit(0)
+    if _vlastnik_zastavil():
+        print("farmu zastavil člověk (owner_pause) — nepouštím ji")
+        sys.exit(0)
     put("global_pause", False)
     put("pause_source", None)
     print("→ špička skončila, farma jede")

@@ -95,6 +95,27 @@ def probe():
         if re.search(r"insufficient\s*balance|exceeded your current quota|billing", blob, re.I):
             return False, "došel kredit u poskytovatele modelů"
         if re.search(r"401|403|authenticationerror|invalid api key", blob, re.I):
+            # 401 může znamenat dvě ÚPLNĚ jiné poruchy a splácnout je do jedné
+            # hlášky stálo 3.–5. 9. 2026 dva dny slepoty: LiteLLM tehdy přišel
+            # o master klíč (prázdná interpolace v compose) a hlídač to hlásil
+            # jako „poskytovatel odmítá klíč". Poskytovatel byl přitom v pořádku
+            # a hláška vedla k hledání na špatném místě.
+            #
+            # Rozliší se to druhým, levným dotazem: /models potřebuje jen náš
+            # klíč k LiteLLM a vůbec nesahá na poskytovatele. Když 401 vrátí
+            # i on, nepouští nás dovnitř LiteLLM — poskytovatel s tím nemá nic
+            # společného.
+            try:
+                probe_req = urllib.request.Request(
+                    f"{BASE.rstrip('/')}/models",
+                    headers={"Authorization": f"Bearer {KEY}"})
+                urllib.request.urlopen(probe_req, timeout=20).read()
+            except Exception as inner:
+                if re.search(r"401|403", f"{inner}", re.I):
+                    return False, ("LiteLLM nás nepouští dovnitř (401 i na /models) — "
+                                   "nejspíš prázdný LITELLM_MASTER_KEY. Zkontroluj "
+                                   "`docker exec agent-farm-litellm-1 printenv LITELLM_MASTER_KEY` "
+                                   "a interpolaci ${} v infra/compose/docker-compose.farm.yml")
             return False, "poskytovatel odmítá klíč (401/403)"
         return None, f"nedostupné: {str(e)[:80]}"  # None = neurčité, nezasahuj
 
@@ -107,6 +128,17 @@ def get(key, fallback=None):
         return json.loads(rows[0][0])
     except Exception:
         return rows[0][0]
+
+
+def _vlastnik_zastavil():
+    """Zastavil farmu člověk? Jeho pauzu žádný hlídač rušit nesmí.
+
+    `owner_pause` je samostatný klíč právě proto, aby se nedal splést s provozní
+    pauzou hlídačů. Ti si svou vlastní poznají podle `pause_source`, jenže tu
+    aplikace (dashboard, /kill) nikdy nezapisovala — a tak se stávalo, že hlídač
+    zrušil pauzu, kterou nezpůsobil.
+    """
+    return bool(get("owner_pause", False))
 
 
 def put(key, value):
@@ -160,6 +192,9 @@ if not ok and not paused:
 elif ok and paused and source == MARK:
     if DRY:
         print("[náhled] pustil bych farmu"); sys.exit(0)
+    if _vlastnik_zastavil():
+        print("farmu zastavil člověk (owner_pause) — nepouštím ji")
+        sys.exit(0)
     put("global_pause", False)
     put("pause_source", None)
     print("→ farma zase běží")
