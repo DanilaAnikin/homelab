@@ -94,6 +94,28 @@ last_h = float(last_h)
 gate("soak", last_h >= SOAK_HOURS, f"{last_h:.0f} h od posledního zapnutí (min {SOAK_HOURS})")
 
 # --- Rozhodnutí ---------------------------------------------------------------
+# --- Vypnutá farma znamená vypnutá i tady -------------------------------------
+# Tenhle skript volá placený model MIMO orchestrátor i mimo LiteLLM, takže se ho
+# `global_pause` sám od sebe netýká. Bez téhle kontroly by po zastavení farmy dál
+# utrácel podle svého timeru — přesně to majitel zastavením zakázal.
+def _farma_je_vypnuta():
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-i", "agentfarm-supabase-db-1", "psql", "-U", "postgres",
+             "-d", "postgres", "-tAc",
+             "select value from farm_settings where key = 'global_pause';"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except Exception:
+        return False   # nedostupná DB nesmí skript umlčet natrvalo
+
+
+if _farma_je_vypnuta():
+    print("farma je zastavená (global_pause) — nic nedělám")
+    sys.exit(0)
+# ------------------------------------------------------------------------------
+
 waiting = psql("select id::text, name from projects where status='stopped' order by created_at limit 1;")
 active_n = int(one("select count(*) from projects where status='active';"))
 waiting_n = int(one("select count(*) from projects where status='stopped';"))
