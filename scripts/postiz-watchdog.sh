@@ -46,7 +46,14 @@ alert_once() {
   local f="$STATE/alert_$key"
   local now
   now=$(date +%s)
-  if [ -f "$f" ] && [ $(( now - $(cat "$f" 2>/dev/null || echo 0) )) -lt "$ALERT_REPEAT_SEC" ]; then
+  local last=0
+  # Obsah nemusí být číslo (přerušený zápis, ruční zásah). Neověřený vstup
+  # do aritmetiky by pod `set -u` shodil celý hlídač — a ten by pak nehlásil nic.
+  if [ -f "$f" ]; then
+    last=$(cat "$f" 2>/dev/null || echo 0)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  fi
+  if [ "$last" -gt 0 ] && [ $(( now - last )) -lt "$ALERT_REPEAT_SEC" ]; then
     return 0
   fi
   echo "$now" > "$f"
@@ -61,11 +68,22 @@ fi
 clear_alert down
 
 # ---------- 1) posty po splatnosti ----------
+# Nedostupná databáze MUSÍ být hlášená, ne přejitá mlčky. Původně tady stačilo,
+# aby psql neodpověděl, a `$OVERDUE` prostě nebyl číslo — podmínka neprošla,
+# hlídač skončil s kódem 0 a tvářil se, že je vše v pořádku. Přesně tak vypadá
+# hlídač, který nehlídá: zeleně.
 OVERDUE=$(docker exec -i "$DB_CONTAINER" psql -U postiz -d postiz -tAc \
   "select count(*) from \"Post\" where state='QUEUE' and \"deletedAt\" is null
      and \"publishDate\" < now() - interval '$OVERDUE_MIN minutes';" 2>/dev/null | tr -d ' ')
 
-if [[ "$OVERDUE" =~ ^[0-9]+$ ]] && [ "$OVERDUE" -ge "$OVERDUE_COUNT" ]; then
+if ! [[ "$OVERDUE" =~ ^[0-9]+$ ]]; then
+  alert_once dbdown "🔴 Postiz: databáze $DB_CONTAINER neodpovídá — hlídač nemůže nic zkontrolovat.
+Ověř: docker exec $DB_CONTAINER psql -U postiz -d postiz -c 'select 1'"
+  exit 1
+fi
+clear_alert dbdown
+
+if [ "$OVERDUE" -ge "$OVERDUE_COUNT" ]; then
   OLDEST=$(docker exec -i "$DB_CONTAINER" psql -U postiz -d postiz -tAc \
     "select min(\"publishDate\")::timestamp(0) from \"Post\" where state='QUEUE'
        and \"deletedAt\" is null and \"publishDate\" < now();" 2>/dev/null | tr -d ' ')
@@ -86,22 +104,25 @@ if [ -n "$JLIST" ]; then
     delta=$(( restarts - prev ))
     [ "$delta" -ge "$RESTART_STORM" ] || continue
 
-    # Samooprava jen pro frontend — jen tam víme, že příčinou je osiřelý
-    # posluchač na 4200, a jen tam je restart bezpečný. Backend ani
-    # orchestrátor se nikdy nesahá: tam by restart mohl rozbít běžící publikaci.
+    # ŽÁDNÁ SAMOOPRAVA. Dřív se tu zabíjel „osiřelý posluchač na 4200" — jenže
+    # ten kód bral `head -1` ze VŠECH naslouchajících soketů v kontejneru, tedy
+    # klidně nginx (5000) nebo backend (3000), a pak ho poslal SIGKILLem k zemi.
+    # Pojistka, která to měla hlídat, porovnávala PID z hostitele s PID z PID
+    # namespace kontejneru — dvě různá číslování, takže se nemohly nikdy rovnat
+    # a pojistka nikdy nezabrala. Nikdy to nevystřelilo jen proto, že se lavina
+    # restartů od té doby neopakovala.
+    #
+    # Hlídač proto jen hlásí a přikládá, kdo drží který port. Zásah patří člověku:
+    # trvá půl minuty a nehrozí, že složí celý Postiz.
     if [ "$name" = "frontend" ]; then
       cpid=$(docker inspect -f '{{.State.Pid}}' "$CONTAINER" 2>/dev/null)
-      owner=$(nsenter -t "$cpid" -n ss -tlnp 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
-      pm2_pid=$(printf '%s' "$JLIST" | python3 -c \
-        'import json,sys;print(next((str(p.get("pid")) for p in json.load(sys.stdin) if p["name"]=="frontend"),""))' 2>/dev/null)
-      if [ -n "${owner:-}" ] && [ "$owner" != "${pm2_pid:-x}" ]; then
-        docker exec "$CONTAINER" pm2 stop frontend >/dev/null 2>&1
-        kill -TERM "$owner" 2>/dev/null; sleep 5; kill -KILL "$owner" 2>/dev/null
-        docker exec "$CONTAINER" pm2 start frontend >/dev/null 2>&1
-        notify "🔧 Postiz: frontend restartoval ${delta}× za interval kvůli obsazenému portu 4200.
-Osiřelý proces $owner ukončen, frontend nastartován znovu."
-        continue
-      fi
+      holders=$(nsenter -t "${cpid:-0}" -n ss -tlnp 2>/dev/null \
+        | awk '{print $4, $NF}' | sed 's/.*://; s/users:((//' | head -5 | tr '\n' ' ')
+      alert_once "storm_$name" "⚠️ Postiz: frontend restartoval ${delta}× za interval (celkem $restarts).
+Nejspíš mu port 4200 drží osiřelý proces. Kdo teď poslouchá: ${holders:-nezjištěno}
+
+Ruční oprava: docker exec $CONTAINER pm2 stop frontend, zabít držitele 4200, pak pm2 start frontend."
+      continue
     fi
     alert_once "storm_$name" "⚠️ Postiz: proces '$name' restartoval ${delta}× za interval (celkem $restarts)."
   done < <(printf '%s' "$JLIST" | python3 -c \
@@ -115,6 +136,7 @@ ERRORS=$(docker exec -i "$DB_CONTAINER" psql -U postiz -d postiz -tAc \
   "select count(*) from \"Post\" where state='ERROR' and \"deletedAt\" is null
      and \"publishDate\" > now() - interval '2 hours';" 2>/dev/null | tr -d ' ')
 if [[ "$ERRORS" =~ ^[0-9]+$ ]] && [ "$ERRORS" -ge 5 ]; then
+  # (nedostupnou DB odchytila už sekce 1, sem se s ní nedojde)
   alert_once errors "⚠️ Postiz: $ERRORS postů selhalo za poslední 2 h — možný limit ze strany sítě."
 else
   clear_alert errors

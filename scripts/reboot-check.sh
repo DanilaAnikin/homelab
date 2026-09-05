@@ -38,12 +38,30 @@ notify() {
 normalize() { sed -E 's/\.[0-9]+\.[a-z0-9]{20,}$//'; }
 
 snapshot_containers() { "${DOCKER[@]}" ps --format '{{.Names}}' 2>/dev/null | normalize | sort -u; }
-snapshot_failed()     { systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | sort -u; }
-snapshot_ports()      { ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un; }
+# Session scopes a instance šablonových unitů mají v názvu pořadové číslo, které
+# se po restartu změní. Bez normalizace by se každý takový hlásil jako „nově
+# rozbitý", ačkoli je to tentýž starý problém pod jiným jménem.
+snapshot_failed()     {
+  systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' \
+    | sed -E 's/^session-[0-9]+\.scope$/session-N.scope/; s/@[0-9-]+\.service$/@N.service/' \
+    | sort -u
+}
+# `comm` porovnává bajtově, takže vstup MUSÍ být seřazený bajtově. `sort -un`
+# řadí číselně (8080 < 9), což `comm` rozhodí a nahlásí kaskádu ztrát, které
+# nenastaly — a to zrovna při restartu, kvůli kterému tenhle skript existuje.
+snapshot_ports()      { ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u; }
 
 case "$MODE" in
   capture)
-    mkdir -p "$STATE" 2>/dev/null || { echo "nelze zapisovat do $STATE (spusť pod rootem)"; exit 1; }
+    mkdir -p "$STATE" 2>/dev/null
+    # `mkdir -p` na existující adresář uspěje i bez práva zápisu do něj, takže
+    # sám o sobě nic negarantuje. Rozhoduje až skutečný zápis — jinak by capture
+    # pod běžným uživatelem ohlásil úspěch a nechal na místě STARÝ základ, proti
+    # kterému by se pak po restartu porovnávalo.
+    if ! : > "$STATE/.writetest" 2>/dev/null; then
+      echo "do $STATE nejde zapisovat — spusť pod rootem (sudo)"; exit 1
+    fi
+    rm -f "$STATE/.writetest"
     snapshot_containers > "$STATE/containers"
     snapshot_failed     > "$STATE/failed"
     snapshot_ports      > "$STATE/ports"
@@ -59,7 +77,22 @@ case "$MODE" in
     ;;
 
   verify)
-    [ -f "$STATE/containers" ] || { echo "není s čím porovnávat — nejdřív 'capture'"; exit 1; }
+    for need in containers failed ports captured_at kernel; do
+      [ -s "$STATE/$need" ] || {
+        echo "základ je neúplný (chybí nebo je prázdný $need) — nejdřív 'capture'"; exit 1; }
+    done
+
+    # Základ starší než poslední start stroje popisuje jiný běh; porovnávat proti
+    # němu nedává smysl. A základ starší než den nejspíš nikdo nepořizoval kvůli
+    # tomuhle restartu — mlčky ho použít by znamenalo hlásit týden starý drift
+    # jako následek restartu.
+    cap_epoch=$(date -d "$(cat "$STATE/captured_at")" +%s 2>/dev/null || echo 0)
+    boot_epoch=$(date -d "$(uptime -s)" +%s 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    if [ "$cap_epoch" -lt "$boot_epoch" ] && [ "$((now_epoch - cap_epoch))" -gt 86400 ]; then
+      echo "základ je z $(cat "$STATE/captured_at" | cut -c1-16), starší než den a než poslední start — nepoužívám ho"
+      exit 1
+    fi
 
     missing_c=$(comm -23 "$STATE/containers" <(snapshot_containers))
     # Jednotky, které jsou rozbité TEĎ a nebyly rozbité PŘED restartem.

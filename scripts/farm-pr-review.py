@@ -144,6 +144,28 @@ create table if not exists farm_pr_reviews (
 create index if not exists ix_fpr on farm_pr_reviews(repo, pr, reviewed_at desc);
 """, tuples=False)
 
+# --- Vypnutá farma znamená vypnutá i tady -------------------------------------
+# Tenhle skript volá placený model MIMO orchestrátor i mimo LiteLLM, takže se ho
+# `global_pause` sám od sebe netýká. Bez téhle kontroly by po zastavení farmy dál
+# utrácel podle svého timeru — přesně to majitel zastavením zakázal.
+def _farma_je_vypnuta():
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-i", "agentfarm-supabase-db-1", "psql", "-U", "postgres",
+             "-d", "postgres", "-tAc",
+             "select value from farm_settings where key = 'global_pause';"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except Exception:
+        return False   # nedostupná DB nesmí skript umlčet natrvalo
+
+
+if _farma_je_vypnuta():
+    print("farma je zastavená (global_pause) — nic nedělám")
+    sys.exit(0)
+# ------------------------------------------------------------------------------
+
 repos = [ONLY] if ONLY else REPOS
 rows, harmful, checked = [], [], 0
 for repo in repos:
