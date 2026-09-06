@@ -82,16 +82,22 @@ case "$MODE" in
         echo "základ je neúplný (chybí nebo je prázdný $need) — nejdřív 'capture'"; exit 1; }
     done
 
-    # Základ starší než poslední start stroje popisuje jiný běh; porovnávat proti
-    # němu nedává smysl. A základ starší než den nejspíš nikdo nepořizoval kvůli
-    # tomuhle restartu — mlčky ho použít by znamenalo hlásit týden starý drift
-    # jako následek restartu.
+    # Stáří základu se HLÁSÍ, ale nikdy kvůli němu neodmítáme porovnat.
+    #
+    # Původní verze odmítala základ starší než den. Jenže „starší než poslední
+    # start" platí po restartu VŽDY (základ se pořizuje před ním), takže z toho
+    # zbylo prosté „starší než 24 h" — a základ pořízený den před plánovaným
+    # restartem je úplně normální případ. Přesně to se 6. 9. stalo: základ byl
+    # o 40 minut za prahem, kontrola odmítla a po jediném restartu, kvůli kterému
+    # celý skript vznikl, nedala žádnou informaci. Odmítnout srovnání je horší než
+    # srovnat proti staršímu základu a říct, jak je starý — to druhé si čtenář umí
+    # zvážit, z prvního nemá nic.
     cap_epoch=$(date -d "$(cat "$STATE/captured_at")" +%s 2>/dev/null || echo 0)
-    boot_epoch=$(date -d "$(uptime -s)" +%s 2>/dev/null || echo 0)
     now_epoch=$(date +%s)
-    if [ "$cap_epoch" -lt "$boot_epoch" ] && [ "$((now_epoch - cap_epoch))" -gt 86400 ]; then
-      echo "základ je z $(cat "$STATE/captured_at" | cut -c1-16), starší než den a než poslední start — nepoužívám ho"
-      exit 1
+    age_h=$(( (now_epoch - cap_epoch) / 3600 ))
+    stale_note=""
+    if [ "$cap_epoch" -gt 0 ] && [ "$age_h" -ge 24 ]; then
+      stale_note="⚠️ Základ je ${age_h} h starý — část rozdílů může být běžný provoz, ne následek restartu."
     fi
 
     missing_c=$(comm -23 "$STATE/containers" <(snapshot_containers))
@@ -104,7 +110,8 @@ case "$MODE" in
 
     out="Kontrola po restartu ($(date '+%d.%m. %H:%M'))"
     out="$out"$'\n'"Jádro: $old_kernel → $now_kernel"
-    out="$out"$'\n'"Základ z: $(cat "$STATE/captured_at" 2>/dev/null | cut -c1-16)"
+    out="$out"$'\n'"Základ z: $(cat "$STATE/captured_at" 2>/dev/null | cut -c1-16) (stáří ${age_h} h)"
+    [ -n "$stale_note" ] && out="$out"$'\n'"$stale_note"
     out="$out"$'\n'
 
     if [ -z "$missing_c" ] && [ -z "$new_failed" ] && [ -z "$missing_p" ]; then
