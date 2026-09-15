@@ -65,6 +65,32 @@ if "kong" in svcs:
     elif isinstance(nets, dict):
         nets["dokploy-network"] = {}
 
+# realtime: alias "realtime-dev.supabase-realtime" na VLASTNÍ síti stacku.
+# Upstream kong.yml míří na tohle jméno a není to jen DNS — Realtime z prvního
+# labelu hostname odvozuje tenanta, a seedovaný tenant se jmenuje "realtime-dev".
+# Výš všem službám mažeme container_name (kvůli kolizím mezi stacky), takže bez
+# aliasu Kong jméno nepřeloží a živé aktualizace přes WebSocket jsou mrtvé
+# (klient dostane 1006). Přepsat upstream na "realtime" nejde: DNS pak projde,
+# ale Realtime odpoví TenantNotFound. Alias na "default" síti nekoliduje s jinými
+# stacky na dokploy-network. Zjištěno 15. 9. 2026 na dashboardu farmy.
+if "realtime" in svcs:
+    rt = svcs["realtime"]
+    alias = "realtime-dev.supabase-realtime"
+    nets = rt.get("networks")
+    if nets is None:
+        rt["networks"] = {"default": {"aliases": [alias]}}
+    elif isinstance(nets, list):
+        rt["networks"] = {n: {} for n in nets}
+        rt["networks"].setdefault("default", {})
+        rt["networks"]["default"]["aliases"] = [alias]
+    elif isinstance(nets, dict):
+        dflt = nets.get("default") or {}
+        al = list(dflt.get("aliases") or [])
+        if alias not in al:
+            al.append(alias)
+        dflt["aliases"] = al
+        nets["default"] = dflt
+
 # přidej externí dokploy-network do top-level networks
 d.setdefault("networks", {})
 d["networks"]["dokploy-network"] = {"external": True}
