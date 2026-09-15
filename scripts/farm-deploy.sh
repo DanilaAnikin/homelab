@@ -134,7 +134,16 @@ for p in d:
     if str(p.get("head",{}).get("ref","")).startswith("farm/"):
         print(p["number"])' 2>/dev/null)"
 MERGED=0; SKIPPED=0
+PESC="$(sql_escape "$PROJECT")"
 for n in $PR_NUMS; do
+  [[ "$n" =~ ^[0-9]+$ ]] || continue
+  # PR nedoručeného úkolu farmy (čeká v 'merging' na CI a merge bránu, nebo je
+  # zaparkovaný) slučuje JEN orchestrátor přes evaluateMergeGate (CI na aktuální
+  # hlavě, sken tajemství, merge s sha). Tady by se squash-mergnul jen podle
+  # 'mergeable'. Fail-closed: bez odpovědi DB se PR nesloučí.
+  tracked="$(DBQ "select count(*) from attempts a join tasks t on t.id=a.task_id join projects p on p.id=t.project_id where p.name='$PESC' and a.pr_number=$n and t.status<>'done';")"
+  if [[ -z "$tracked" ]]; then log "PR #$n: stav úkolu nejde ověřit (DB neodpovídá) → přeskakuji"; SKIPPED=$((SKIPPED+1)); continue; fi
+  if [[ "$tracked" != "0" ]]; then log "PR #$n patří nedoručenému úkolu farmy — slučuje ho merge brána orchestrátoru → přeskakuji"; SKIPPED=$((SKIPPED+1)); continue; fi
   if [[ "$DRY_RUN" == "1" ]]; then log "DRY: zmerguju PR #$n"; MERGED=$((MERGED+1)); continue; fi
   # mergeable? GitHub počítá async, dej mu chvíli
   mstate=""
