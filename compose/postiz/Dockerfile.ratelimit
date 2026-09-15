@@ -1,0 +1,33 @@
+# Stavi se nad TIM, CO REALNE BEZI - ne nad ghcr tagem.
+#
+# Dockerfile.patch ma FROM ghcr.io/gitroomhq/postiz-app:v2.11.3, jenze bezici
+# postiz-freio:patched je novejsi: v base image ma funkce signaturu
+# handleErrors(body), v bezicim kontejneru handleErrors(body, status), a bezici
+# verze ma navic apps/orchestrator s Temporalem. Prestavba z Dockerfile.patch by
+# tedy Postiz srazila o verzi zpatky. Proto chainujeme odsud.
+FROM postiz-freio:patched
+
+# Meta vraci u app-level rate limitu HTTP 400 s "is_transient": true, tedy
+# "zkus to za chvili". Postiz na to nemel vetev -> spadlo to do bad-body, Temporal
+# to oznacil za neopakovatelne a prispevek se zahodil NAVZDY. 27. 8. 2026 se takhle
+# ztratilo 122 prispevku behem jednoho vyprazdneni fronty; 180 z 191 vsech chyb
+# Instagramu je "Application request limit reached".
+#
+# Subkod 2207051 je jina vec: per-ucet blok na publikovani, ktery Meta drzi radove
+# dny. Opakovat ho hned nema smysl, ale hlaska musi rikat pravdu misto zavadejiciho
+# "Instagram blocked your request", ktere poslalo vysetrovani spatnym smerem.
+#
+# Vetev se vklada na ZACATEK handleErrors, aby predbehla existujici test na 2207051.
+# Opakovani je shora omezene v social.abstract.js (totalRetries > 2 -> BadBody),
+# takze tohle nemuze vyrobit nekonecnou smycku.
+RUN set -e; \
+  n=0; \
+  for f in $(find /app -name 'instagram.provider.js' -not -path '*/node_modules/*'); do \
+    if grep -q 'handleErrors(body, status) {' "$f"; then \
+      sed -i "s|handleErrors(body, status) {|handleErrors(body, status) { if (body.indexOf('Application request limit reached') > -1) { if (body.indexOf('2207051') > -1) { return { type: 'bad-body', value: 'Instagram docasne zablokoval publikovani na tomto uctu (vycerpana kvota Meta API). Obvykle povoli sam do nekolika dnu.' }; } return { type: 'retry', value: 'Meta API request limit reached, retrying shortly' }; }|" "$f"; \
+      node --check "$f"; \
+      n=$((n+1)); \
+    fi; \
+  done; \
+  if [ "$n" -eq 0 ]; then echo "PATCH SE NECHYTIL - kotva nenalezena" >&2; exit 1; fi; \
+  echo "patchnuto souboru: $n"
