@@ -57,7 +57,12 @@ test("passes a healthy origin response through unchanged", async () => {
   assert.equal(await response.text(), "primary");
 });
 
-for (const status of [500, 501, 502, 503, 504]) {
+// 520-530 generuje Cloudflare sám, když se na origin nedostane: 521 server
+// down, 522 connection timed out, 523 origin unreachable, 524 timeout,
+// 525/526 SSL, 530 chyba tunelu (Error 1033). Chyběly tu, a proto zůstala
+// díra otevřená: 9. 9. 2026 odpadl celý stroj ze sítě, Cloudflare vracel 530
+// a fallback ho pustil dál jako zdravou odpověď.
+for (const status of [500, 501, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530]) {
   test(`serves inline HTML fallback for navigation origin status ${status}`, async () => {
     const response = await handleRequest(
       request("/pricing", {
@@ -66,6 +71,18 @@ for (const status of [500, 501, 502, 503, 504]) {
       async () => originResponse(status),
     );
     await assertFallback(response);
+  });
+}
+
+// Hranice rozsahu Cloudflare chyb. 519 a 531 nejsou stavy, které by Cloudflare
+// generoval při nedostupném originu, takže musí projít beze změny.
+for (const status of [519, 531]) {
+  test(`passes ${status} through as a normal origin response`, async () => {
+    const origin = originResponse(status, "boundary");
+    const response = await handleRequest(request(), async () => origin);
+    assert.equal(response, origin);
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get("x-freio-edge-fallback"), null);
   });
 }
 
