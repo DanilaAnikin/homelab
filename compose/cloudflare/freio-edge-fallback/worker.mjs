@@ -156,7 +156,18 @@ function isHtmlNavigation(request, url, method) {
 }
 
 function isFallbackStatus(status) {
-  return status >= 500 && status <= 504;
+  // 500-504 pokrývá chyby, které vygeneruje samotná aplikace na originu.
+  //
+  // 520-530 je řada, kterou generuje Cloudflare, KDYŽ SE NA ORIGIN NEDOSTANE:
+  // 521 server down, 522 connection timed out, 523 origin unreachable,
+  // 524 timeout, 525/526 SSL, 530 = chyba tunelu (Error 1033).
+  //
+  // Bez téhle druhé řady byl fallback slepý přesně v tom případě, kvůli kterému
+  // vznikl. 9. 9. 2026 odpadl celý homelab ze sítě, Cloudflare začal vracet 530
+  // a Worker to považoval za zdravou odpověď, takže návštěvníkům poslal holou
+  // chybovou stránku 1033. Fallback fungoval jen tehdy, když byla rozbitá
+  // aplikace, ale tunel žil — tedy v tom mírnějším z obou selhání.
+  return (status >= 500 && status <= 504) || (status >= 520 && status <= 530);
 }
 
 async function discardBody(response) {
