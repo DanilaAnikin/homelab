@@ -10,19 +10,25 @@ volumes:
   postiz-redis:
 services:
   postiz:
-    image: postiz-freio:patched
+    image: postiz-freio:ratelimit
     pull_policy: never
     container_name: postiz
     restart: unless-stopped
-    mem_limit: 1700m
+    mem_limit: 4096m
     env_file: /srv/postiz/postiz.env
     volumes:
       - postiz-config:/config/
       - postiz-uploads:/uploads/
     networks: [dokploy-network, postiz-internal]
-    depends_on: [postiz-postgres, postiz-redis]
+    depends_on:
+      postiz-postgres:
+        condition: service_healthy
+      postiz-redis:
+        condition: service_healthy
+      postiz-temporal:
+        condition: service_started
   postiz-postgres:
-    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    image: postgres:17-alpine
     container_name: postiz-postgres
     restart: unless-stopped
     mem_limit: 512m
@@ -39,15 +45,21 @@ services:
       timeout: 5s
       retries: 10
   postiz-redis:
-    image: redis:7.2@sha256:6372db89351b00ba0ddca437ff49ce2ed4beed8a961a27d8259060c9603c240d
+    image: redis:7.2
     container_name: postiz-redis
     restart: unless-stopped
     mem_limit: 256m
     volumes:
       - postiz-redis:/data
     networks: [postiz-internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
   postiz-temporal:
-    image: temporalio/auto-setup:1.25.2@sha256:b1edc1e20002d958c8182f2ae08dee877a125083683a627a44917683419ba6a8
+    image: temporalio/auto-setup:1.25.2
     container_name: postiz-temporal
     restart: unless-stopped
     mem_limit: 1024m
