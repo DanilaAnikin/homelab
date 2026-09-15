@@ -12,10 +12,12 @@ DBQ(){ sudo docker exec -i agentfarm-supabase-db-1 psql -U postgres -tAc "$1" 2>
 # "neznámý projekt", ale zbytečně by cyklil a plnil deploy_requests.
 DEPLOYABLE="contentgen ivanweb"
 
-# Projekty s autoDeliver a BEZ rozdělané práce (idle).
+# Projekty s autoDeliver a BEZ rozdělané práce (idle). 'merging' je rozdělaná práce:
+# úkol čeká na CI a merge bránu orchestrátoru (delivery.ts) — deploy by jinak PR
+# sloučil mimo bránu.
 PROJECTS="$(DBQ "select p.name from projects p
   where coalesce((p.autonomy->>'autoDeliver')::boolean,false)=true
-    and not exists (select 1 from tasks t where t.project_id=p.id and t.status in ('queued','running','judging'))
+    and not exists (select 1 from tasks t where t.project_id=p.id and t.status in ('queued','running','judging','merging'))
   ;" | grep -v '^$' || true)"
 
 for proj in $PROJECTS; do
