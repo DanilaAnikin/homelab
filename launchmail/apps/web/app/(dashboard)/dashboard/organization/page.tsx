@@ -12,6 +12,11 @@ import {
 import { MembersManager } from "./members-manager";
 import { OrgSettings } from "./org-settings";
 import { AuditLogTable, type AuditRow } from "./audit-log-table";
+import {
+  ApiKeysManager,
+  type ApiKeyRow,
+  type MailboxOption,
+} from "./api-keys-manager";
 
 export const dynamic = "force-dynamic";
 
@@ -36,12 +41,20 @@ interface FullOrg {
 export default async function OrganizationPage() {
   const ctx = await requireOrg();
 
-  const [org, audit] = await Promise.all([
+  const [org, audit, apiKeys, smtpConfigs] = await Promise.all([
     apiGet<FullOrg>(
       `/api/auth/organization/get-full-organization?organizationId=${ctx.organizationId}`,
     ),
     apiGet<AuditRow[]>("/api/audit").then((r) => r ?? []),
+    apiGet<ApiKeyRow[]>("/api/api-keys").then((r) => r ?? []),
+    apiGet<{ id: string; name: string; fromAddress: string }[]>(
+      "/api/smtp-configs",
+    ).then((r) => r ?? []),
   ]);
+
+  const mailboxes: MailboxOption[] = smtpConfigs
+    .map((c) => ({ id: c.id, label: c.fromAddress || c.name }))
+    .sort((a, b) => a.label.localeCompare(b.label));
 
   const members = (org?.members ?? []).map((m) => ({
     id: m.id,
@@ -86,6 +99,24 @@ export default async function OrganizationPage() {
             role={ctx.role}
             members={members}
             invitations={invitations}
+          />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-card-title">API keys</CardTitle>
+          <CardDescription>
+            Keys for agents, scripts and integrations. A whole-organization key
+            works across every mailbox; a mailbox key is limited to one mailbox.
+            The role bounds what the key can do.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <ApiKeysManager
+            role={ctx.role}
+            keys={apiKeys}
+            mailboxes={mailboxes}
           />
         </CardContent>
       </Card>
