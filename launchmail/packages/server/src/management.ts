@@ -47,6 +47,7 @@ import {
   createBroadcast,
   completeBroadcast,
   listBroadcasts,
+  getSmtpConfig,
   getSmtpConfigById,
   getDefaultSmtpConfig,
   enqueueEmail,
@@ -287,6 +288,11 @@ export const apiKeysRouter = new Hono<AppVariables>()
       const denied = requirePerm(c, "apiKey", "create");
       if (denied) return denied;
       const data = c.req.valid("json");
+      // A mailbox-scoped key must point at a mailbox of the caller's own organization.
+      if (data.smtpConfigId) {
+        const config = await getSmtpConfig(data.smtpConfigId, c.get("organizationId")!);
+        if (!config) return c.json({ error: "Mailbox not found" }, 404);
+      }
       // Clamp the granted role to the caller's: a writer must never be able to
       // mint an admin key. Default to the caller's own role when unspecified so
       // we never escalate above the caller.

@@ -13,7 +13,7 @@ COPY --from=pruner /app/out/json/ .
 COPY --from=pruner /app/out/pnpm-lock.yaml .
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store,id=pnpm \
     --mount=type=cache,target=/root/.npm \
-    npm install -g pnpm && pnpm install --frozen-lockfile
+    npm install -g pnpm@9.15.9 && pnpm install --frozen-lockfile
 
 FROM base AS builder
 WORKDIR /app
@@ -27,7 +27,7 @@ COPY --from=installer /app/node_modules ./node_modules
 COPY --from=pruner /app/out/full/ .
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store,id=pnpm \
     --mount=type=cache,target=/app/.turbo,id=turbo-web \
-    npm install -g pnpm turbo && pnpm install --offline && pnpm turbo run build --filter=web
+    npm install -g pnpm@9.15.9 turbo && pnpm install --offline && pnpm turbo run build --filter=web
 RUN mkdir -p apps/web/public
 
 FROM base AS runner
