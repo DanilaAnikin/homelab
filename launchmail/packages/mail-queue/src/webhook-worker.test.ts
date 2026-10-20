@@ -30,6 +30,7 @@ import {
 } from "./webhook-queue"
 import {
   processWebhookDelivery,
+  startWebhookWorker,
   type WebhookDeliveryDependencies,
 } from "./webhook-worker"
 
@@ -238,5 +239,45 @@ describe("processWebhookDelivery", () => {
       }),
       10_000
     )
+  })
+})
+
+describe("webhook worker logs never carry a database error's parameters", () => {
+  it("logs 'error' and 'failed' events via describeError", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    const log = vi.spyOn(console, "log").mockImplementation(() => {})
+    startWebhookWorker()
+    const handler = (event: string) =>
+      bull.on.mock.calls.find(([name]) => name === event)![1] as (
+        ...args: unknown[]
+      ) => void
+    const dbError = Object.assign(
+      new Error(
+        'Failed query: update "webhooks" set "last_status" = $1\nparams: SECRET-PAYLOAD'
+      ),
+      {
+        query: 'update "webhooks" set "last_status" = $1',
+        params: ["SECRET-PAYLOAD"],
+        cause: Object.assign(new Error("deadlock detected"), {
+          code: "40P01",
+          severity: "ERROR",
+        }),
+      }
+    )
+
+    handler("error")(dbError)
+    handler("failed")(
+      { id: "outbox-1", attemptsMade: 1, opts: { attempts: 8 }, data: job },
+      dbError
+    )
+
+    const logged = error.mock.calls.map((call) => call.map(String).join(" ")).join("\n")
+    expect(logged).toContain(
+      "[webhook-worker] Worker error: Database error 40P01: deadlock detected (update webhooks)"
+    )
+    expect(logged).toContain("[webhook-worker] Attempt failed: outbox-1: Database error 40P01")
+    expect(logged).not.toContain("SECRET")
+    error.mockRestore()
+    log.mockRestore()
   })
 })

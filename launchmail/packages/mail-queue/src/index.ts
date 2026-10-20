@@ -43,6 +43,11 @@ export type { InboxIdleManager } from "./inbox-idle";
 export { installProcessSafetyNet } from "./process-safety";
 export type { ProcessFailureKind } from "./process-safety";
 export { describeError } from "./safe-error";
+export { createWorkerShutdown } from "./worker-shutdown";
+export type {
+  WorkerShutdownResources,
+  WorkerShutdownOptions,
+} from "./worker-shutdown";
 
 // SMTP transport
 export {

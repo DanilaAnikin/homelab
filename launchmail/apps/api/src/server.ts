@@ -35,8 +35,8 @@ process.on("SIGINT", () => shutdown("SIGINT received", 0));
 
 // Same policy as the worker (see process-safety.ts): log with context, survive
 // an isolated IMAP connection error (the API opens IMAP for manual sync,
-// attachment download and the connection test), otherwise exit 1 so that
-// `start:all` restarts only the API.
+// attachment download and the connection test), otherwise exit 1. `start:all`
+// then stops the worker too and the container restarts (see README.md).
 installProcessSafetyNet({
   name: "api",
   onFatal: (kind) => shutdown(`fatal ${kind}`, 1),

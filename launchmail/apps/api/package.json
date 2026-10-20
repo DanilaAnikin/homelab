@@ -4,9 +4,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "dev": "concurrently -n api,worker -c blue,green \"tsx watch src/server.ts\" \"tsx watch src/worker.ts\"",
-    "start": "tsx src/server.ts",
-    "start:worker": "tsx src/worker.ts",
-    "start:all": "concurrently --kill-others --restart-tries 10 --restart-after 5000 -n api,worker -c blue,green \"tsx src/server.ts\" \"tsx src/worker.ts\""
+    "start": "node --import tsx src/server.ts",
+    "start:worker": "node --import tsx src/worker.ts",
+    "start:all": "concurrently --kill-others --kill-timeout 15000 -n api,worker -c blue,green \"node --import tsx src/server.ts\" \"node --import tsx src/worker.ts\""
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",

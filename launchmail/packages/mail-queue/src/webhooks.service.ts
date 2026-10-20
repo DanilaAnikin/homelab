@@ -9,6 +9,7 @@ import { db } from "@workspace/db"
 import { webhooks } from "@workspace/db/schemas"
 import type { Webhook, WebhookEvent } from "@workspace/db/schemas"
 import { and, desc, eq } from "drizzle-orm"
+import { describeError } from "./safe-error"
 import {
   persistWebhookEvent,
   relayWebhookOutboxRows,
@@ -376,9 +377,7 @@ export async function dispatchEvent(
   )
   await relayWebhookOutboxRows(rows).catch((error) => {
     console.error(
-      `[webhooks] Event persisted to outbox but immediate relay failed: ${
-        error instanceof Error ? error.message : String(error)
-      }`
+      `[webhooks] Event persisted to outbox but immediate relay failed: ${describeError(error)}`
     )
   })
 }

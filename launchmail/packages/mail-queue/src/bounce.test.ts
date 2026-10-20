@@ -101,3 +101,49 @@ describe("parseBounce", () => {
     expect(b.permanent).toBe(false);
   });
 });
+
+// The delivery-status part is quoted-printable: "=00" decodes to a NUL byte.
+function dsnWith(recipient: string, diagnostic: string): string {
+  return [
+    "From: Mail Delivery System <MAILER-DAEMON@mx.example.net>",
+    "To: bounces+0f7b2d7e-5a43-5b8b-9f0c-3a2f6e0d9c11@ripieno.xyz",
+    "Subject: Undelivered Mail Returned to Sender",
+    'Content-Type: multipart/report; report-type=delivery-status; boundary="D"',
+    "",
+    "--D",
+    "Content-Type: message/delivery-status",
+    "Content-Transfer-Encoding: quoted-printable",
+    "",
+    `Final-Recipient: rfc822; ${recipient}`,
+    "Action: failed",
+    "Status: 5.1.1",
+    `Diagnostic-Code: smtp; ${diagnostic}`,
+    "",
+    "--D--",
+    "",
+  ].join("\r\n");
+}
+
+describe("parseBounce output is safe for PostgreSQL", () => {
+  it("strips NULs from the diagnostic and bounds it", async () => {
+    const parsed = await simpleParser(
+      dsnWith("nobody@gmail.com", `550 5.1.1 no=00such=00user ${"x".repeat(3000)}`),
+    );
+    const b = parseBounce(parsed);
+    expect(b.permanent).toBe(true);
+    expect(b.diagnostic).toBeDefined();
+    expect(b.diagnostic).not.toContain("\u0000");
+    expect(b.diagnostic!.startsWith("smtp; 550 5.1.1 nosuchuser")).toBe(true);
+    expect(b.diagnostic!.length).toBeLessThanOrEqual(1000);
+    expect(b.recipient).toBe("nobody@gmail.com");
+    expect(b.verpToken).toBe("0f7b2d7e-5a43-5b8b-9f0c-3a2f6e0d9c11");
+  });
+
+  it("drops a recipient with a NUL instead of suppressing a different address", async () => {
+    const parsed = await simpleParser(dsnWith("dead=00@gmail.com", "550 5.1.1 user unknown"));
+    const b = parseBounce(parsed);
+    expect(b.isBounce).toBe(true);
+    expect(b.permanent).toBe(true);
+    expect(b.recipient).toBeUndefined();
+  });
+});

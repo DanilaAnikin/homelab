@@ -25,6 +25,7 @@ import {
   finalizeSuppressedEmail,
   handleEmailProcessingFailure,
   requireEmailJobId,
+  startWorker,
   type FailureHandlingDependencies,
 } from "./worker"
 
@@ -147,5 +148,68 @@ describe("accepted mail terminal finalization", () => {
     expect(shouldCommitEmailTerminal("failed", "failed")).toBe(false)
     expect(shouldCommitEmailTerminal("failed", "bounced")).toBe(false)
     expect(shouldCommitEmailTerminal("sent", "bounced")).toBe(true)
+  })
+})
+
+// drizzle's DrizzleQueryError: the message carries every bound parameter.
+function drizzleQueryError() {
+  return Object.assign(
+    new Error(
+      'Failed query: select "id" from "suppressions" where "email" in ($1)\nparams: SECRET-ADDRESS@example.cz'
+    ),
+    {
+      query: 'select "id" from "suppressions" where "email" in ($1)',
+      params: ["SECRET-ADDRESS@example.cz"],
+      cause: Object.assign(new Error("connection terminated unexpectedly"), {
+        code: "08006",
+        severity: "ERROR",
+      }),
+    }
+  )
+}
+
+function loggedErrors(spy: { mock: { calls: unknown[][] } }): string {
+  return spy.mock.calls.map((call) => call.map(String).join(" ")).join("\n")
+}
+
+describe("send worker logs never carry a database error's parameters", () => {
+  it("logs a failed attempt with SQLSTATE and statement, not params", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    await handleEmailProcessingFailure(
+      job(1),
+      "log-id-1",
+      data.to,
+      drizzleQueryError(),
+      dependencies()
+    )
+    const logged = loggedErrors(error)
+    expect(logged).toContain(
+      "Database error 08006: connection terminated unexpectedly"
+    )
+    expect(logged).not.toContain("SECRET")
+    expect(logged).not.toContain("params")
+    error.mockRestore()
+  })
+
+  it("logs BullMQ 'error' and 'failed' events the same way", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    const log = vi.spyOn(console, "log").mockImplementation(() => {})
+    const worker = startWorker() as unknown as {
+      on: { mock: { calls: Array<[string, (...args: unknown[]) => void]> } }
+    }
+    const handler = (event: string) =>
+      worker.on.mock.calls.find(([name]) => name === event)![1]
+
+    handler("error")(drizzleQueryError())
+    handler("failed")({ id: "mail-job-1" }, drizzleQueryError())
+
+    const logged = loggedErrors(error)
+    expect(logged).toContain("[worker] Worker error: Database error 08006")
+    expect(logged).toContain(
+      "[worker] Permanently failed: mail-job-1: Database error 08006"
+    )
+    expect(logged).not.toContain("SECRET")
+    error.mockRestore()
+    log.mockRestore()
   })
 })

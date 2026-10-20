@@ -22,6 +22,7 @@ import {
   type FinalizeEmailTerminalInput,
 } from "./email-terminal";
 import { emailLogIdForJob } from "./email-job-identity";
+import { describeError } from "./safe-error";
 
 // Kept as a named export for focused worker tests and compatibility with the
 // original helper name. New jobs receive globally unique UUID BullMQ ids in
@@ -214,8 +215,10 @@ export async function handleEmailProcessingFailure(
     });
   }
 
+  // describeError, not the raw message: a DrizzleQueryError's message carries
+  // every bound parameter (addresses, subjects, bodies) into `docker logs`.
   console.error(
-    `[worker] ${status}: ${job.id} (attempt ${attemptsMade}/${maxAttempts}): ${errorMessage}`,
+    `[worker] ${status}: ${job.id} (attempt ${attemptsMade}/${maxAttempts}): ${describeError(error)}`,
   );
   return { status, willRetry };
 }
@@ -383,9 +386,7 @@ export function startWorker() {
           });
         } catch (logErr) {
           console.error(
-            `[worker] Post-send terminal commit failed for ${job.id} (mail already sent, NOT retrying SMTP): ${
-              logErr instanceof Error ? logErr.message : String(logErr)
-            }`,
+            `[worker] Post-send terminal commit failed for ${job.id} (mail already sent, NOT retrying SMTP): ${describeError(logErr)}`,
           );
         }
 
@@ -417,7 +418,7 @@ export function startWorker() {
   // Surface infrastructure-level errors (Redis drops, etc.) instead of letting
   // them crash the process as unhandled. BullMQ recovers on reconnect.
   worker.on("error", (err) => {
-    console.error(`[worker] Worker error: ${err.message}`);
+    console.error(`[worker] Worker error: ${describeError(err)}`);
   });
 
   worker.on("completed", (job) => {
@@ -426,7 +427,7 @@ export function startWorker() {
 
   worker.on("failed", (job, err) => {
     if (job) {
-      console.error(`[worker] Permanently failed: ${job.id}: ${err.message}`);
+      console.error(`[worker] Permanently failed: ${job.id}: ${describeError(err)}`);
     }
   });
 

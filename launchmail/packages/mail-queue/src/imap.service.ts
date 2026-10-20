@@ -13,7 +13,7 @@ import { dispatchEvent } from "./webhooks.service";
 import { parseBounce, type BounceResult } from "./bounce";
 import { processBounce } from "./bounce-handler";
 import { createImapClient } from "./imap-client";
-import { boundPgText, isPermanentRowError } from "./pg-text";
+import { boundPgText, isPermanentRowError, pgErrorCode } from "./pg-text";
 import { describeError } from "./safe-error";
 import {
   INCOMING_ADDRESS_MAX_CHARS,
@@ -231,6 +231,13 @@ async function recordSyncHealth(
 export interface SyncResult {
   fetched: number;
   error?: string;
+  /**
+   * The sync succeeded, but not every message made it whole (stored without
+   * content, not stored, not returned by the server). Also written to
+   * imap_last_sync_error, so the UI and mail-agent see it; the next clean
+   * sync clears it. Never set together with `error`, never triggers backoff.
+   */
+  notice?: string;
 }
 
 type InsertRow = typeof incomingEmails.$inferInsert;
@@ -261,7 +268,10 @@ async function parseMessageToRow(
   } catch {
     // A partial MIME tail can be syntactically incomplete. Preserve a safe
     // envelope-only row for an oversized message instead of silently losing it.
-    if (!sourceTruncated) return null;
+    if (!sourceTruncated) {
+      console.warn(`[imap] ${config.name}: uid ${uid} is not a parseable message; not stored`);
+      return null;
+    }
   }
   // Bounce detection: collect DSNs so the caller can suppress dead recipients
   // after ingest. Never act on an incomplete DSN because its terminal fields
@@ -474,21 +484,32 @@ function envelopeOnlyRow(row: InsertRow): InsertRow {
   };
 }
 
+/** One message the database did not take whole, with the SQLSTATE why. */
+interface RowProblem {
+  uid: number;
+  code: string;
+}
+
+type IsolatedOutcome =
+  | { kind: "stored"; rows: InsertedRow[] }
+  | { kind: "envelope"; rows: InsertedRow[]; code: string }
+  | { kind: "refused"; code: string; error: unknown };
+
 /**
  * Store one row the database rejected as part of a batch: retry it alone
- * (unless that already happened), then fall back to the envelope-only row,
- * and only as the very last resort skip it — logged with its UID, never with
- * its content. A transient error is rethrown so the caller aborts the sync.
+ * (unless that already happened), then fall back to the envelope-only row.
+ * Logged with its UID and SQLSTATE, never with its content. A transient
+ * error is rethrown so the caller aborts the sync.
  */
 async function insertIsolated(
   row: InsertRow,
   label: string,
   knownError?: unknown,
-): Promise<InsertedRow[]> {
+): Promise<IsolatedOutcome> {
   let error = knownError;
   if (error === undefined) {
     try {
-      return await insertRows([row]);
+      return { kind: "stored", rows: await insertRows([row]) };
     } catch (e) {
       if (!isPermanentRowError(e)) throw e;
       error = e;
@@ -498,44 +519,171 @@ async function insertIsolated(
     `[imap] ${label}: uid ${row.imapUid} rejected by the database (${describeError(error)}); storing it envelope-only`,
   );
   try {
-    return await insertRows([envelopeOnlyRow(row)]);
+    return {
+      kind: "envelope",
+      rows: await insertRows([envelopeOnlyRow(row)]),
+      code: pgErrorCode(error) ?? "unknown",
+    };
   } catch (e) {
     if (!isPermanentRowError(e)) throw e;
-    console.error(
-      `[imap] ${label}: uid ${row.imapUid} skipped, the database rejected even its envelope (${describeError(e)})`,
-    );
-    return [];
+    return { kind: "refused", code: pgErrorCode(e) ?? "unknown", error: e };
   }
 }
 
+/** Every row of a batch was refused, even envelope-only. */
+class BatchRefusedError extends Error {
+  constructor(count: number, firstUid: number, lastUid: number, cause: unknown) {
+    super(
+      `Database refused all ${count} message(s) of the batch even envelope-only ` +
+        `(uid ${firstUid === lastUid ? firstUid : `${firstUid}-${lastUid}`}), ` +
+        `so this is not about one message; cursor not advanced: ${describeError(cause, 300)}`,
+    );
+    this.name = "BatchRefusedError";
+  }
+}
+
+interface IngestResult {
+  /** Rows genuinely inserted (re-ingested messages are dropped by the unique index). */
+  inserted: InsertedRow[];
+  /** Stored without bodies/recipients because the database refused the full row. */
+  envelopeOnly: RowProblem[];
+  /** Not stored at all: refused even envelope-only. */
+  skipped: RowProblem[];
+}
+
+const INSERT_CHUNK = 50;
+
 /** Insert rows in small chunks; returns ONLY the rows genuinely inserted (the
  *  unique index drops re-ingested messages), so callers can fire side effects
- *  (webhooks) exactly once per new message.
+ *  (webhooks) exactly once per new message, plus what could not be stored.
  *
  *  A multi-row INSERT is all-or-nothing: one message the database refuses
  *  used to fail its whole chunk on every sync, the cursor never moved and the
  *  mailbox stopped receiving mail (Osobní Gmail, 29. 9. – 20. 10. 2026). Rows
  *  are therefore isolated when the database rejects their VALUES; any other
  *  failure (connection loss, shutdown, …) still aborts the sync, so nothing is
- *  ever skipped because of a database hiccup. */
-async function ingest(rows: InsertRow[], label: string): Promise<InsertedRow[]> {
-  const inserted: InsertedRow[] = [];
-  for (let i = 0; i < rows.length; i += 50) {
-    const chunk = rows.slice(i, i + 50);
+ *  ever skipped because of a database hiccup.
+ *
+ *  If the database refuses EVERY row of a chunk, even envelope-only, the cause
+ *  is the database or the schema (e.g. 23502 after a migration mismatch), not
+ *  the mail: BatchRefusedError aborts the sync without moving the cursor
+ *  instead of skipping the whole batch. A single refused message alone in its
+ *  batch therefore waits; once newer mail joins its batch, only it is skipped. */
+async function ingest(rows: InsertRow[], label: string): Promise<IngestResult> {
+  const result: IngestResult = { inserted: [], envelopeOnly: [], skipped: [] };
+  for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
+    const chunk = rows.slice(i, i + INSERT_CHUNK);
+    let chunkError: unknown;
     try {
-      inserted.push(...(await insertRows(chunk)));
+      result.inserted.push(...(await insertRows(chunk)));
+      continue;
     } catch (e) {
       if (!isPermanentRowError(e)) throw e;
-      if (chunk.length === 1) {
-        inserted.push(...(await insertIsolated(chunk[0]!, label, e)));
+      chunkError = e;
+    }
+    const refused: Array<RowProblem & { error: unknown }> = [];
+    for (const row of chunk) {
+      const outcome = await insertIsolated(
+        row,
+        label,
+        chunk.length === 1 ? chunkError : undefined,
+      );
+      if (outcome.kind === "refused") {
+        refused.push({ uid: row.imapUid, code: outcome.code, error: outcome.error });
         continue;
       }
-      for (const row of chunk) {
-        inserted.push(...(await insertIsolated(row, label)));
+      result.inserted.push(...outcome.rows);
+      if (outcome.kind === "envelope") {
+        result.envelopeOnly.push({ uid: row.imapUid, code: outcome.code });
       }
     }
+    if (refused.length === chunk.length) {
+      throw new BatchRefusedError(
+        chunk.length,
+        chunk[0]!.imapUid,
+        chunk[chunk.length - 1]!.imapUid,
+        refused[refused.length - 1]!.error,
+      );
+    }
+    for (const r of refused) {
+      console.error(
+        `[imap] ${label}: uid ${r.uid} skipped, the database refused even its envelope (${describeError(r.error)})`,
+      );
+      result.skipped.push({ uid: r.uid, code: r.code });
+    }
   }
-  return inserted;
+  return result;
+}
+
+/** "11, 12, 13 +4 more" — a short, bounded UID list for logs and notices. */
+function uidList(uids: number[], max = 5): string {
+  const shown = uids.slice(0, max).join(", ");
+  return uids.length > max ? `${shown} +${uids.length - max} more` : shown;
+}
+
+function problemList(problems: RowProblem[]): string {
+  const codes = [...new Set(problems.map((p) => p.code))].join("/");
+  return `uid ${uidList(problems.map((p) => p.uid))}; SQLSTATE ${codes}`;
+}
+
+// A UID the listing FETCH returned but the source FETCH right after it did
+// not. Usually expunged in between: then the next listing no longer shows it
+// and the cursor passes it. A server that just omitted it (Gmail under load
+// answers OK with fewer messages) shows it again and it is fetched then. A UID
+// that keeps being listed but never returned is passed after this many syncs,
+// so it can never wedge the mailbox. In-memory: a restart starts counting anew.
+const MISSING_UID_MAX_ATTEMPTS = 3;
+const missingUidStreaks = new Map<string, { uid: number; attempts: number }>();
+
+/** Exported for tests: forget the per-mailbox missing-UID streaks. */
+export function resetMissingUidStreaks(): void {
+  missingUidStreaks.clear();
+}
+
+/**
+ * Where the forward cursor may move after the source FETCH of `batchUids`:
+ * past every UID that came back (stored, envelope-only, skipped or
+ * unparseable — those are final), but not past the first one that did not.
+ */
+function forwardCursor(
+  config: SmtpConfig,
+  streakKey: string,
+  lastUid: number,
+  batchUids: number[],
+  returned: Set<number>,
+): { cursor: number; notice?: string } {
+  const last = batchUids[batchUids.length - 1]!;
+  const missing = batchUids.filter((uid) => !returned.has(uid));
+  if (missing.length === 0) {
+    missingUidStreaks.delete(streakKey);
+    return { cursor: last };
+  }
+  const first = missing[0]!;
+  const previous = missingUidStreaks.get(streakKey);
+  const attempts = previous?.uid === first ? previous.attempts + 1 : 1;
+  if (attempts < MISSING_UID_MAX_ATTEMPTS) {
+    missingUidStreaks.set(streakKey, { uid: first, attempts });
+    const cursor = Math.max(lastUid, first - 1);
+    // Logged, not noted in imap_last_sync_error: this usually resolves on
+    // the next sync, and a note there makes mail-agent alert the owner.
+    console.warn(
+      `[imap] ${config.name}: server listed ${missing.length} message(s) but did not return them ` +
+        `(uid ${uidList(missing)}); cursor held at ${cursor}, attempt ${attempts}/${MISSING_UID_MAX_ATTEMPTS}`,
+    );
+    return { cursor };
+  }
+  // Give up on `first` only; a later missing UID gets its own attempts.
+  missingUidStreaks.delete(streakKey);
+  const next = missing[1];
+  const cursor = next === undefined ? last : Math.max(lastUid, next - 1);
+  console.error(
+    `[imap] ${config.name}: uid ${first} was listed but never returned by the server ` +
+      `in ${attempts} syncs; passing it (cursor ${cursor})`,
+  );
+  return {
+    cursor,
+    notice: `uid ${first} never returned by the server in ${attempts} syncs, passed (not stored)`,
+  };
 }
 
 /**
@@ -616,6 +764,7 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
   const client = clientFor(config);
   let fetched = 0;
   let syncError: string | undefined;
+  const notices: string[] = [];
   try {
     await client.connect();
   } catch (e) {
@@ -662,6 +811,10 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
           let minUid = Infinity;
           const rows: InsertRow[] = [];
           const bounces = new Map<number, BounceResult>();
+          // UIDs the source FETCH returned (with a source). Anything else of
+          // the batch must not be passed silently — see forwardCursor.
+          const returned = new Set<number>();
+          const unparseable: number[] = [];
 
           if (batchUids.length > 0) {
             for await (const msg of client.fetch(
@@ -676,11 +829,8 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
               { uid: true },
             )) {
               const uid = msg.uid;
-              if (!inBatch.has(uid)) continue;
-              // Advance across the processing window (including skipped
-              // messages) so a single bad message can't wedge the cursor.
-              if (uid > maxUid) maxUid = uid;
-              if (!msg.source) continue;
+              if (!inBatch.has(uid) || !msg.source) continue;
+              returned.add(uid);
               const row = await parseSafely(
                 config,
                 uid,
@@ -690,29 +840,71 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
                 msg.size,
                 msg.envelope,
               );
-              if (!row) continue;
+              if (!row) {
+                // Final: re-fetching an unparseable message won't help.
+                unparseable.push(uid);
+                continue;
+              }
               rows.push(row);
               if (uid < minUid) minUid = uid;
             }
-            // The FETCH completed, so a listed UID it did not return was
-            // expunged in between and can never be fetched: pass it too.
-            maxUid = Math.max(maxUid, batchUids[batchUids.length - 1]!);
+            const advance = forwardCursor(
+              config,
+              `${config.id}:${uidValidity}`,
+              lastUid,
+              batchUids,
+              returned,
+            );
+            maxUid = advance.cursor;
+            if (advance.notice) notices.push(advance.notice);
           }
 
-          const inserted = rows.length ? await ingest(rows, config.name) : [];
+          const ingested: IngestResult = rows.length
+            ? await ingest(rows, config.name)
+            : { inserted: [], envelopeOnly: [], skipped: [] };
+          const inserted = ingested.inserted;
           fetched = inserted.length;
+          if (ingested.envelopeOnly.length > 0) {
+            notices.push(
+              `${ingested.envelopeOnly.length} message(s) stored without content (${problemList(ingested.envelopeOnly)})`,
+            );
+          }
+          if (ingested.skipped.length > 0) {
+            notices.push(
+              `${ingested.skipped.length} message(s) not stored, refused by the database (${problemList(ingested.skipped)})`,
+            );
+          }
+          if (unparseable.length > 0) {
+            notices.push(
+              `${unparseable.length} message(s) not stored, unparseable (uid ${uidList(unparseable)})`,
+            );
+          }
 
           // Process permanent bounces among the genuinely-new messages: suppress
           // the dead recipient + mark the original send bounced. Only new mail
           // (not backfill) so we never act on ancient DSNs.
+          const failedBounces: number[] = [];
           for (const m of inserted) {
             const b = bounces.get(m.imapUid);
-            if (b?.permanent) {
-              // Await the transactional bounce/outbox commit. Fire-and-forget
-              // here could lose a terminal event if the worker exited after
-              // storing the IMAP row but before persisting its outbox intent.
+            if (!b?.permanent) continue;
+            // Awaited: the bounce + its outbox intent commit in one
+            // transaction before the cursor moves. Isolated: one DSN the
+            // database refuses must not abort the sync — the rows are already
+            // stored, so a rerun would treat them as known and their
+            // `incoming.received` webhooks would never be sent.
+            try {
               await processBounce(config.organizationId, b);
+            } catch (e) {
+              failedBounces.push(m.imapUid);
+              console.error(
+                `[imap] ${config.name}: bounce in uid ${m.imapUid} could not be processed: ${describeError(e)}`,
+              );
             }
+          }
+          if (failedBounces.length > 0) {
+            notices.push(
+              `${failedBounces.length} bounce(s) not processed (uid ${uidList(failedBounces)})`,
+            );
           }
 
           // firstUid is the lowest UID we hold — the start point for backfill.
@@ -759,8 +951,14 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
     }
   }
 
-  await recordSyncHealth(config, syncError);
-  return { fetched, error: syncError };
+  // A problem with single messages is not a sync failure (no backoff), but it
+  // must not look like a healthy mailbox either.
+  const notice =
+    !syncError && notices.length > 0
+      ? `Synced with problems: ${notices.join("; ")}`
+      : undefined;
+  await recordSyncHealth(config, syncError ?? notice);
+  return notice ? { fetched, notice } : { fetched, error: syncError };
 }
 
 /**
@@ -838,7 +1036,9 @@ export async function backfillMailbox(
               );
               if (row) rows.push(row);
             }
-            if (rows.length) fetched = (await ingest(rows, config.name)).length;
+            if (rows.length) {
+              fetched = (await ingest(rows, config.name)).inserted.length;
+            }
             // We've now covered [low, firstUid-1]; the new floor is `low`.
             await updateImapState(config.id, {
               firstUid: low,

@@ -14,6 +14,12 @@ import {
 import { emailTerminalIdempotencyKey } from "./email-terminal";
 import type { BounceResult } from "./bounce";
 
+// email_logs.id is a uuid column. Comparing it with any other token (someone
+// else's VERP address, a mangled DSN) is a query error (22P02), not a miss,
+// and would abort the whole bounce instead of falling back to the recipient.
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export async function processBounce(
   organizationId: string,
   bounce: BounceResult,
@@ -27,7 +33,7 @@ export async function processBounce(
   let clientType: string | null = null;
 
   // 1) VERP token → the exact email_logs id (most reliable attribution).
-  if (bounce.verpToken) {
+  if (bounce.verpToken && UUID_RE.test(bounce.verpToken)) {
     const [row] = await db
       .select({
         id: emailLogs.id,

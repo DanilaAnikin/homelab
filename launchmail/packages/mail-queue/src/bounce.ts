@@ -12,6 +12,7 @@
 // Pure module (no DB/network) → unit-tested.
 // ============================================================================
 import type { ParsedMail } from "mailparser";
+import { boundPgText, toPgText } from "./pg-text";
 
 // ── VERP (Variable Envelope Return Path) ────────────────────────────────────
 
@@ -78,6 +79,34 @@ function match(haystack: string, re: RegExp): string | undefined {
   return m ? m[1] : undefined;
 }
 
+// DSN fields end up in email_logs.error, in suppressions and in the jsonb
+// webhook outbox, inside the transaction of processBounce: a NUL there fails
+// it (22021 / 22P05) just like the 20. 10. 2026 HTML did. Free text is made
+// PostgreSQL-safe and bounded; an identifier (recipient, VERP token) is used
+// only when it is clean, because stripping a NUL out of an address yields a
+// DIFFERENT address, and that one must not be suppressed.
+const BOUNCE_STATUS_MAX_CHARS = 32;
+const BOUNCE_DIAGNOSTIC_MAX_CHARS = 1000;
+const BOUNCE_RECIPIENT_MAX_CHARS = 320;
+const BOUNCE_TOKEN_MAX_CHARS = 128;
+
+function cleanText(value: string | undefined, max: number): string | undefined {
+  if (value == null) return undefined;
+  return boundPgText(value, max).value.trim() || undefined;
+}
+
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+function cleanIdentifier(
+  value: string | null | undefined,
+  max: number,
+): string | undefined {
+  if (!value || value.length > max) return undefined;
+  if (CONTROL_CHARS.test(value) || toPgText(value) !== value) return undefined;
+  return value;
+}
+
 /** Parse a message into a bounce verdict. Non-bounces → { isBounce:false }. */
 export function parseBounce(parsed: ParsedMail): BounceResult {
   const fromAddr = (firstAddress(parsed.from) ?? "").toLowerCase();
@@ -94,15 +123,26 @@ export function parseBounce(parsed: ParsedMail): BounceResult {
     fromAddr === "" || // null sender <> is the classic bounce envelope
     SUBJECT_RE.test(subject);
 
-  const status = match(haystack, /Status:\s*([245]\.\d+\.\d+)/i);
+  const status = cleanText(
+    match(haystack, /Status:\s*([245]\.\d+\.\d+)/i),
+    BOUNCE_STATUS_MAX_CHARS,
+  );
   const action = match(haystack, /Action:\s*(\w+)/i)?.toLowerCase();
-  const recipient =
+  const recipient = cleanIdentifier(
     match(
       haystack,
       /(?:Final|Original)-Recipient:\s*[^;\n]*;\s*<?([^\s<>]+@[^\s<>]+?)>?\s*$/im,
-    )?.toLowerCase();
-  const diagnostic = match(haystack, /Diagnostic-Code:\s*([^\n]+)/i)?.trim();
-  const verpToken = parseVerpToken(firstAddress(parsed.to)) ?? undefined;
+    )?.toLowerCase(),
+    BOUNCE_RECIPIENT_MAX_CHARS,
+  );
+  const diagnostic = cleanText(
+    match(haystack, /Diagnostic-Code:\s*([^\n]+)/i),
+    BOUNCE_DIAGNOSTIC_MAX_CHARS,
+  );
+  const verpToken = cleanIdentifier(
+    parseVerpToken(firstAddress(parsed.to)),
+    BOUNCE_TOKEN_MAX_CHARS,
+  );
 
   const isBounce = looksLikeBounce || !!status || !!verpToken;
   if (!isBounce) return { isBounce: false, permanent: false };

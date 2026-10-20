@@ -14,6 +14,7 @@ import {
   or,
 } from "drizzle-orm"
 import { enqueueWebhook, webhookQueue } from "./webhook-queue"
+import { describeError } from "./safe-error"
 
 export const WEBHOOK_OUTBOX_RELAY_STALE_MS = 5 * 60 * 1000
 
@@ -323,9 +324,7 @@ export function startWebhookOutboxRelay(
         if (count > 0) console.log(`[webhook-outbox] Relayed ${count} row(s)`)
       })
       .catch((error) => {
-        console.error(
-          `[webhook-outbox] Relay failed: ${error instanceof Error ? error.message : String(error)}`
-        )
+        console.error(`[webhook-outbox] Relay failed: ${describeError(error)}`)
       })
       .finally(() => {
         running = null

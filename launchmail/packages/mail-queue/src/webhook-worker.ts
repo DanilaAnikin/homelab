@@ -8,6 +8,7 @@ import { REDIS_URL } from "./redis"
 import { ssrfSafePost, SsrfError } from "./webhooks.service"
 import { WEBHOOK_QUEUE_NAME, type WebhookJobData } from "./webhook-queue"
 import { completeWebhookOutbox, failWebhookOutbox } from "./webhook-outbox"
+import { describeError } from "./safe-error"
 
 type DeliveryHook = Pick<
   Webhook,
@@ -165,7 +166,7 @@ export function startWebhookWorker() {
   )
 
   worker.on("error", (error) => {
-    console.error(`[webhook-worker] Worker error: ${error.message}`)
+    console.error(`[webhook-worker] Worker error: ${describeError(error)}`)
   })
   worker.on("completed", (job, result) => {
     if (result.delivered) {
@@ -179,7 +180,7 @@ export function startWebhookWorker() {
   worker.on("failed", (job, error) => {
     if (job) {
       console.error(
-        `[webhook-worker] Attempt failed: ${job.id}: ${error.message}`
+        `[webhook-worker] Attempt failed: ${job.id}: ${describeError(error)}`
       )
       const maxAttempts = job.opts.attempts ?? 1
       if (job.attemptsMade >= maxAttempts) {

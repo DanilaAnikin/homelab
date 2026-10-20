@@ -22,6 +22,11 @@ const TLS_REJECT_UNAUTHORIZED =
 const RETRY_BASE_MS = 30_000;
 const RETRY_MAX_MS = 10 * 60_000;
 
+// stop(): how long one IDLE connection may take to LOGOUT before its socket is
+// simply closed. A slow server (Gmail took 37 s to log in on 20. 10. 2026)
+// must not eat the worker's shutdown deadline, which the BullMQ send jobs need.
+const LOGOUT_LIMIT_MS = 2_000;
+
 // Identity of the IMAP connection — when any of these change, the persistent
 // connection is torn down and reopened with fresh credentials.
 function fingerprint(c: SmtpConfig): string {
@@ -44,10 +49,32 @@ function closeQuietly(client: ImapFlow): void {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Resolves when `promise` settles or after `ms`, whichever comes first. */
+async function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise.then(
+        () => undefined,
+        () => undefined,
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 interface Conn {
   client: ImapFlow;
+  /** The config this connection was opened with (sync re-reads the row). */
+  config: SmtpConfig;
   fingerprint: string;
   syncing: boolean;
+  /** An `exists` push arrived while this mailbox was already syncing. */
+  pending: boolean;
   debounce: ReturnType<typeof setTimeout> | null;
 }
 
@@ -140,10 +167,17 @@ export function startInboxIdle(opts?: {
   }
 
   async function runSync(config: SmtpConfig, conn: Conn) {
-    if (conn.syncing || inFlight.has(config.id) || stopped) return;
+    if (stopped) return;
+    if (conn.syncing || inFlight.has(config.id)) {
+      // The running sync may have listed the mailbox's UIDs before this push;
+      // remember it so one more sync follows instead of dropping the push.
+      conn.pending = true;
+      return;
+    }
     // A mailbox in backoff waits; the safety poll retries it once due.
     if (!backoff.isReady(syncKey(config.id))) return;
     conn.syncing = true;
+    conn.pending = false;
     inFlight.add(config.id);
     try {
       // Re-read the row: the config captured when this connection opened
@@ -157,7 +191,21 @@ export function startInboxIdle(opts?: {
     } finally {
       conn.syncing = false;
       inFlight.delete(config.id);
+      followUpPending(config.id);
     }
+  }
+
+  /**
+   * After a sync of `id` (IDLE path or safety poll): if a push arrived while
+   * it ran, schedule exactly one more sync — unless the mailbox is in backoff,
+   * then the safety poll retries it once due.
+   */
+  function followUpPending(id: string) {
+    const conn = conns.get(id);
+    if (!conn?.pending || stopped) return;
+    conn.pending = false;
+    if (!backoff.isReady(syncKey(id))) return;
+    scheduleSync(conn.config, conn);
   }
 
   function scheduleSync(config: SmtpConfig, conn: Conn) {
@@ -224,8 +272,10 @@ export function startInboxIdle(opts?: {
     );
     const opened: Conn = {
       client,
+      config,
       fingerprint: fingerprint(config),
       syncing: false,
+      pending: false,
       debounce: null,
     };
     conn = opened;
@@ -331,14 +381,21 @@ export function startInboxIdle(opts?: {
         if (!backoff.isReady(syncKey(c.id))) continue;
         inFlight.add(c.id);
         try {
-          const ok = await syncOnce(c);
+          // Same as runSync: `configs` was read when this poll started, and
+          // the poll walks every mailbox one after another. An IDLE sync may
+          // have advanced this mailbox's cursor meanwhile; syncing from the
+          // snapshot re-downloaded up to MAX_PER_SYNC messages and wrote the
+          // cursor back to where it was.
+          const fresh = await getSmtpConfigById(c.id);
+          if (!fresh?.imapHost) continue;
+          const ok = await syncOnce(fresh);
           // Advance history backfill one batch per cycle, only while the
           // mailbox is healthy. Re-read so we use the firstUid just updated
           // by the sync above.
-          if (ok && !c.imapBackfillComplete) {
-            const fresh = await getSmtpConfigById(c.id);
-            if (fresh && !fresh.imapBackfillComplete) {
-              const b = await backfillMailbox(fresh);
+          if (ok && !fresh.imapBackfillComplete) {
+            const after = await getSmtpConfigById(c.id);
+            if (after && !after.imapBackfillComplete) {
+              const b = await backfillMailbox(after);
               if (b.error) {
                 console.warn(`[inbox-idle] backfill ${c.name} failed: ${b.error}`);
               }
@@ -348,6 +405,7 @@ export function startInboxIdle(opts?: {
           console.error(`[inbox-idle] poll ${c.name} failed: ${describeError(e)}`);
         } finally {
           inFlight.delete(c.id);
+          followUpPending(c.id);
         }
       }
     } catch (e) {
@@ -374,15 +432,24 @@ export function startInboxIdle(opts?: {
       clearTimeout(bootTimer);
       clearInterval(reconcileTimer);
       clearInterval(pollTimer);
-      // Await all logouts so the process doesn't exit mid-handshake and leave
-      // half-open IMAP sessions on the server.
+      const openConns = Array.from(conns.values());
+      conns.clear();
+      // LOGOUT politely so the server doesn't keep half-open sessions, but
+      // only for LOGOUT_LIMIT_MS: all connections in parallel, then the socket
+      // is closed regardless (a no-op after a clean LOGOUT).
       await Promise.all(
-        Array.from(conns.values()).map((conn) => {
-          if (conn.debounce) clearTimeout(conn.debounce);
-          return conn.client.logout().catch(() => undefined);
+        openConns.map(async (conn) => {
+          if (conn.debounce) {
+            clearTimeout(conn.debounce);
+            conn.debounce = null;
+          }
+          await settleWithin(
+            Promise.resolve().then(() => conn.client.logout()),
+            LOGOUT_LIMIT_MS,
+          );
+          closeQuietly(conn.client);
         }),
       );
-      conns.clear();
     },
   };
 }

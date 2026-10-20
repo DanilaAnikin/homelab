@@ -5,7 +5,8 @@ import { describeError, stackFrames } from "./safe-error";
 // The pattern: an error that reaches `uncaughtException`/`unhandledRejection`
 // is logged with context and, unless it is provably isolated, treated as a bug
 // that ends the process through a graceful shutdown with a non-zero exit code.
-// The supervisor (concurrently in `start:all`) then restarts just that process.
+// `start:all` (concurrently --kill-others) then stops the other process too and
+// Docker restarts the container, so the crash shows up in RestartCount.
 // Swallowing everything would keep a process alive in an unknown state and hide
 // logic errors; dying on everything is what made one flaky IMAP account take
 // the whole API down twenty times a day.

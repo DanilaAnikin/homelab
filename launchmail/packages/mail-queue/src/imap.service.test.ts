@@ -31,6 +31,11 @@ const state = vi.hoisted(() => ({
   lateError: null as Error | null,
   // Simulated database verdict for one INSERT statement (all-or-nothing).
   rejectInsert: null as ((rows: Row[]) => unknown) | null,
+  // (smtp_config_id, imap_uid) pairs already stored — the unique index that
+  // makes re-ingesting a message a no-op (ON CONFLICT DO NOTHING).
+  storedKeys: new Set<string>(),
+  // UIDs the source FETCH leaves out although the UID listing showed them.
+  omitFromSource: new Set<number>(),
 }));
 
 const serviceMocks = vi.hoisted(() => ({
@@ -92,6 +97,7 @@ vi.mock("imapflow", async () => {
         const maxSeq = state.messages.length;
         for (const [index, message] of state.messages.entries()) {
           const key = byUid ? Number(message.uid) : index + 1;
+          if (query.source && state.omitFromSource.has(Number(message.uid))) continue;
           if (inRange(range, key, byUid ? maxUid : maxSeq)) yield message;
         }
       }
@@ -150,8 +156,14 @@ vi.mock("@workspace/db", () => ({
             state.insertAttempts += 1;
             const verdict = pgRejectsNul(rows) ?? state.rejectInsert?.(rows);
             if (verdict) throw drizzleError(verdict, rows);
-            state.insertedRows.push(...rows);
-            return rows.map((row, index) => ({
+            const fresh = rows.filter(
+              (row) => !state.storedKeys.has(`${String(row.smtpConfigId)}:${String(row.imapUid)}`),
+            );
+            for (const row of fresh) {
+              state.storedKeys.add(`${String(row.smtpConfigId)}:${String(row.imapUid)}`);
+            }
+            state.insertedRows.push(...fresh);
+            return fresh.map((row, index) => ({
               id: `incoming-${String(row.imapUid)}-${index + 1}`,
               imapUid: row.imapUid,
               fromAddress: row.fromAddress,
@@ -168,6 +180,17 @@ vi.mock("@workspace/db", () => ({
   },
 }));
 
+vi.mock("mailparser", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("mailparser")>();
+  return {
+    ...actual,
+    simpleParser: (source: Buffer, options: Record<string, unknown>) =>
+      source.includes("UNPARSEABLE-MARKER")
+        ? Promise.reject(new Error("Unexpected end of MIME structure"))
+        : actual.simpleParser(source, options),
+  };
+});
+
 vi.mock("./smtp-configs.service", () => ({
   updateImapState: serviceMocks.updateImapState,
 }));
@@ -182,6 +205,7 @@ import {
   backfillMailbox,
   fetchAttachment,
   IncomingEmailContentTooLargeError,
+  resetMissingUidStreaks,
   syncMailbox,
   testImapConnection,
 } from "./imap.service";
@@ -278,7 +302,11 @@ beforeEach(() => {
   state.connectError = null;
   state.lateError = null;
   state.rejectInsert = null;
+  state.storedKeys.clear();
+  state.omitFromSource.clear();
+  resetMissingUidStreaks();
   vi.clearAllMocks();
+  serviceMocks.processBounce.mockResolvedValue(undefined);
 });
 
 describe("bounded IMAP ingestion", () => {
@@ -501,9 +529,11 @@ describe("a problematic message never wedges the mailbox", () => {
         ? pgError("22P02", "invalid input syntax")
         : null;
 
+    const notice =
+      "Synced with problems: 1 message(s) stored without content (uid 12; SQLSTATE 22P02)";
     await expect(syncMailbox(syncedConfig(10))).resolves.toEqual({
       fetched: 3,
-      error: undefined,
+      notice,
     });
 
     const byUid = new Map(state.insertedRows.map((r) => [r.imapUid, r]));
@@ -521,7 +551,8 @@ describe("a problematic message never wedges the mailbox", () => {
     });
     expect(serviceMocks.dispatchEvent).toHaveBeenCalledTimes(3);
     expect(cursorWrites()).toEqual([13]);
-    expect(healthWrites()).toEqual([null]);
+    // Not a failure (no backoff), but visible in imap_last_sync_error.
+    expect(healthWrites()).toEqual([notice]);
   });
 
   it("skips a message the database refuses even envelope-only, and still advances past it", async () => {
@@ -531,11 +562,56 @@ describe("a problematic message never wedges the mailbox", () => {
         ? pgError("23514", "new row violates check constraint")
         : null;
 
+    const notice =
+      "Synced with problems: 1 message(s) not stored, refused by the database (uid 12; SQLSTATE 23514)";
     await expect(syncMailbox(syncedConfig(10))).resolves.toEqual({
       fetched: 2,
-      error: undefined,
+      notice,
     });
     expect(state.insertedRows.map((r) => r.imapUid).sort()).toEqual([11, 13]);
+    expect(cursorWrites()).toEqual([13]);
+    expect(healthWrites()).toEqual([notice]);
+  });
+
+  it("stops without moving the cursor when the database refuses EVERY row of the batch, even envelope-only", async () => {
+    pushMessages([11, 12, 13], () => "SECRET BODY");
+    // E.g. a NOT NULL column the code does not know about after a bad migration.
+    state.rejectInsert = () =>
+      pgError("23502", 'null value in column "x" of relation "incoming_emails" violates not-null constraint');
+
+    const result = await syncMailbox(syncedConfig(10));
+
+    expect(result.fetched).toBe(0);
+    expect(result.notice).toBeUndefined();
+    expect(result.error).toMatch(
+      /^Database refused all 3 message\(s\) of the batch even envelope-only \(uid 11-13\).*cursor not advanced: Database error 23502: null value in column/,
+    );
+    expect(result.error).not.toContain("SECRET");
+    expect(state.insertedRows).toHaveLength(0);
+    expect(cursorWrites()).toEqual([]);
+    expect(healthWrites()).toEqual([result.error]);
+    expect(serviceMocks.dispatchEvent).not.toHaveBeenCalled();
+  });
+
+  it("a lone message the database refuses waits for newer mail, then only it is skipped", async () => {
+    pushMessages([12]);
+    state.rejectInsert = (rows) =>
+      rows.some((r) => r.imapUid === 12)
+        ? pgError("23514", "new row violates check constraint")
+        : null;
+
+    // Alone in its batch, the refusal cannot be told from a database problem.
+    const first = await syncMailbox(syncedConfig(10));
+    expect(first.error).toMatch(/^Database refused all 1 message\(s\)/);
+    expect(cursorWrites()).toEqual([]);
+
+    pushMessages([13]);
+    const second = await syncMailbox(syncedConfig(10));
+    expect(second).toEqual({
+      fetched: 1,
+      notice:
+        "Synced with problems: 1 message(s) not stored, refused by the database (uid 12; SQLSTATE 23514)",
+    });
     expect(cursorWrites()).toEqual([13]);
   });
 
@@ -590,6 +666,116 @@ describe("a problematic message never wedges the mailbox", () => {
     expect(state.fetchCalls).toHaveLength(1);
     expect(state.insertedRows).toHaveLength(0);
     expect(cursorWrites()).toEqual([9]);
+  });
+});
+
+describe("the forward cursor never silently passes a message", () => {
+  it("holds the cursor before a listed UID the server did not return, and stores it once it comes back", async () => {
+    pushMessages([11, 12, 13]);
+    state.omitFromSource.add(12); // e.g. Gmail answering OK with fewer messages
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(syncMailbox(syncedConfig(10))).resolves.toEqual({
+      fetched: 2,
+      error: undefined,
+    });
+    expect(cursorWrites()).toEqual([11]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("did not return them (uid 12); cursor held at 11, attempt 1/3"),
+    );
+
+    state.omitFromSource.clear();
+    await expect(syncMailbox(syncedConfig(11))).resolves.toEqual({
+      fetched: 1,
+      error: undefined,
+    });
+    expect(cursorWrites()).toEqual([11, 13]);
+    expect(state.insertedRows.map((r) => r.imapUid)).toEqual([11, 13, 12]);
+    // 13 was fetched twice but announced once (unique index).
+    expect(serviceMocks.dispatchEvent).toHaveBeenCalledTimes(3);
+    warn.mockRestore();
+  });
+
+  it("passes a UID that is listed but never returned after 3 syncs, and says so", async () => {
+    pushMessages([11, 12, 13]);
+    state.omitFromSource.add(12);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await syncMailbox(syncedConfig(10)); // attempt 1 → held at 11
+    await syncMailbox(syncedConfig(11)); // attempt 2 → held at 11
+    const third = await syncMailbox(syncedConfig(11)); // attempt 3 → passed
+
+    expect(cursorWrites()).toEqual([11, 11, 13]);
+    const notice =
+      "Synced with problems: uid 12 never returned by the server in 3 syncs, passed (not stored)";
+    expect(third).toEqual({ fetched: 0, notice });
+    expect(healthWrites()).toEqual([null, null, notice]);
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("uid 12 was listed but never returned by the server in 3 syncs"),
+    );
+    expect(serviceMocks.dispatchEvent).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+    error.mockRestore();
+  });
+
+  it("passes an unparseable message (final) but notes it", async () => {
+    pushMessages([11, 12], (uid) => (uid === 12 ? "UNPARSEABLE-MARKER" : `Reply ${uid}.`));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(syncMailbox(syncedConfig(10))).resolves.toEqual({
+      fetched: 1,
+      notice: "Synced with problems: 1 message(s) not stored, unparseable (uid 12)",
+    });
+    expect(cursorWrites()).toEqual([12]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("uid 12 is not a parseable message; not stored"),
+    );
+    warn.mockRestore();
+  });
+});
+
+describe("bounces", () => {
+  function pushBounce(uid: number, recipient: string) {
+    const source = Buffer.from(
+      [
+        "From: Mail Delivery System <MAILER-DAEMON@example.test>",
+        "To: bounces+0f7b2d7e-5a43-5b8b-9f0c-3a2f6e0d9c11@example.test",
+        "Subject: Undelivered Mail Returned to Sender",
+        `Message-ID: <dsn-${uid}@example.test>`,
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        `Final-Recipient: rfc822; ${recipient}`,
+        "Action: failed",
+        "Status: 5.1.1",
+        "Diagnostic-Code: smtp; 550 5.1.1 user unknown",
+      ].join("\r\n"),
+    );
+    state.messages.push({ uid, source, size: source.length });
+  }
+
+  it("one bounce the database refuses neither aborts the sync nor loses the batch's webhooks", async () => {
+    pushMessages([11]);
+    pushBounce(12, "dead@example.test");
+    pushBounce(13, "gone@example.test");
+    serviceMocks.processBounce.mockImplementation(async (_org: string, b: { recipient?: string }) => {
+      if (b.recipient === "dead@example.test") {
+        throw drizzleError(pgError("22P02", "invalid input syntax for type uuid"), []);
+      }
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(syncMailbox(syncedConfig(10))).resolves.toEqual({
+      fetched: 3,
+      notice: "Synced with problems: 1 bounce(s) not processed (uid 12)",
+    });
+    expect(serviceMocks.processBounce).toHaveBeenCalledTimes(2);
+    expect(serviceMocks.dispatchEvent).toHaveBeenCalledTimes(3);
+    expect(cursorWrites()).toEqual([13]);
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("bounce in uid 12 could not be processed: Database error 22P02"),
+    );
+    error.mockRestore();
   });
 });
 
