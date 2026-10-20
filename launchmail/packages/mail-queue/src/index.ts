@@ -39,6 +39,11 @@ export type {
 export { startInboxIdle } from "./inbox-idle";
 export type { InboxIdleManager } from "./inbox-idle";
 
+// Process-level safety net + content-free error descriptions (api + worker)
+export { installProcessSafetyNet } from "./process-safety";
+export type { ProcessFailureKind } from "./process-safety";
+export { describeError } from "./safe-error";
+
 // SMTP transport
 export {
   sendMail,

@@ -2,6 +2,10 @@ import { db } from "@workspace/db";
 import { smtpConfigs } from "@workspace/db/schemas";
 import { eq, and, desc, isNotNull } from "drizzle-orm";
 import { encrypt, decrypt } from "./crypto";
+import { boundPgText } from "./pg-text";
+import { describeError } from "./safe-error";
+
+const IMAP_SYNC_ERROR_MAX_CHARS = 1000;
 
 export interface SmtpConfig {
   id: string;
@@ -353,7 +357,19 @@ export async function listReceiveEnabledConfigs(): Promise<SmtpConfig[]> {
     .select()
     .from(smtpConfigs)
     .where(isNotNull(smtpConfigs.imapHost));
-  return rows.map(toSmtpConfig);
+  const configs: SmtpConfig[] = [];
+  for (const row of rows) {
+    try {
+      configs.push(toSmtpConfig(row));
+    } catch (e) {
+      // One mailbox whose credentials cannot be decrypted (corrupt ciphertext)
+      // must not stop the IMAP worker for every other mailbox.
+      console.error(
+        `[smtp-configs] skipping mailbox ${row.name} (${row.id}): cannot decrypt its credentials: ${describeError(e)}`,
+      );
+    }
+  }
+  return configs;
 }
 
 /** Patch the per-mailbox IMAP sync state (cursors, backfill, health). */
@@ -376,7 +392,12 @@ export async function updateImapState(
     set.imapBackfillComplete = patch.backfillComplete;
   if (patch.lastSyncAt !== undefined) set.imapLastSyncAt = patch.lastSyncAt;
   if (patch.lastSyncError !== undefined)
-    set.imapLastSyncError = patch.lastSyncError;
+    // Defense in depth: whatever a caller passes, the health write itself must
+    // not fail (a NUL byte used to make this UPDATE fail too) or grow unbounded.
+    set.imapLastSyncError =
+      patch.lastSyncError === null
+        ? null
+        : boundPgText(patch.lastSyncError, IMAP_SYNC_ERROR_MAX_CHARS).value;
   if (Object.keys(set).length === 0) return;
   await db.update(smtpConfigs).set(set).where(eq(smtpConfigs.id, id));
 }

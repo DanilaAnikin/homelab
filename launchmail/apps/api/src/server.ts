@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import app, { formsPublicApp } from "@workspace/server";
+import { installProcessSafetyNet } from "@workspace/mail-queue";
 
 const root = new Hono();
 root.route("/", app); // /api/* (incl. Better Auth at /api/auth/*)
@@ -14,14 +15,29 @@ const server = serve({ fetch: root.fetch, port, hostname: "0.0.0.0" }, (info) =>
 });
 
 // Graceful shutdown: stop accepting connections and let in-flight requests
-// drain before exiting so the orchestrator sees a clean exit.
+// drain before exiting so the orchestrator sees a clean exit. Bounded, so a
+// lingering connection cannot keep a broken process alive.
+const SHUTDOWN_DEADLINE_MS = 10_000;
 let shuttingDown = false;
-function shutdown(signal: string): void {
+function shutdown(reason: string, exitCode: number): void {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`[api] ${signal} received — shutting down...`);
-  server.close(() => process.exit(0));
+  console.log(`[api] ${reason} — shutting down...`);
+  const deadline = setTimeout(() => process.exit(exitCode), SHUTDOWN_DEADLINE_MS);
+  server.close(() => {
+    clearTimeout(deadline);
+    process.exit(exitCode);
+  });
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM received", 0));
+process.on("SIGINT", () => shutdown("SIGINT received", 0));
+
+// Same policy as the worker (see process-safety.ts): log with context, survive
+// an isolated IMAP connection error (the API opens IMAP for manual sync,
+// attachment download and the connection test), otherwise exit 1 so that
+// `start:all` restarts only the API.
+installProcessSafetyNet({
+  name: "api",
+  onFatal: (kind) => shutdown(`fatal ${kind}`, 1),
+});

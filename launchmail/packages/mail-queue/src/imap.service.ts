@@ -1,8 +1,8 @@
-import {
+import type {
   ImapFlow,
-  type ImapFlowOptions,
-  type MessageAddressObject,
-  type MessageEnvelopeObject,
+  ImapFlowOptions,
+  MessageAddressObject,
+  MessageEnvelopeObject,
 } from "imapflow";
 import { simpleParser, type AddressObject, type ParsedMail } from "mailparser";
 import { db } from "@workspace/db";
@@ -12,6 +12,9 @@ import { updateImapState } from "./smtp-configs.service";
 import { dispatchEvent } from "./webhooks.service";
 import { parseBounce, type BounceResult } from "./bounce";
 import { processBounce } from "./bounce-handler";
+import { createImapClient } from "./imap-client";
+import { boundPgText, isPermanentRowError } from "./pg-text";
+import { describeError } from "./safe-error";
 import {
   INCOMING_ADDRESS_MAX_CHARS,
   INCOMING_ADDRESS_MAX_ITEMS,
@@ -46,10 +49,11 @@ interface Bounded<T> {
   truncated: boolean;
 }
 
+// Every string stored from a message passes through here: bounded AND safe for
+// PostgreSQL (no U+0000, no lone surrogates — see pg-text.ts). One HTML part
+// with NULs used to fail the whole multi-row insert on every sync.
 function boundString(value: string, max: number): Bounded<string> {
-  return value.length > max
-    ? { value: value.slice(0, max), truncated: true }
-    : { value, truncated: false };
+  return boundPgText(value, max);
 }
 
 type AutomationHeaderName =
@@ -147,7 +151,7 @@ function buildSnippet(text: string | null, subject: string | null): string {
     .slice(0, 4 * 1024)
     .replace(/\s+/g, " ")
     .trim();
-  return base.slice(0, 240);
+  return boundPgText(base, 240).value;
 }
 
 function safeSourceSize(value: number | undefined, fallback: number): number {
@@ -189,7 +193,39 @@ function clientFor(config: SmtpConfig): ImapFlow {
     maxLiteralSize: INCOMING_SOURCE_MAX_BYTES,
     maxLineLength: INCOMING_PROTOCOL_MAX_LINE_BYTES,
   };
-  return new ImapFlow(opts);
+  // createImapClient attaches the 'error' listener; without it a socket
+  // timeout on this short-lived connection killed the whole process.
+  return createImapClient(opts, config.name);
+}
+
+/**
+ * Drop the TCP connection without LOGOUT. Needed after a failed connect():
+ * ImapFlow rejects connect() on a failed LOGIN/startup command but leaves the
+ * socket open, which later times out on its own.
+ */
+function closeQuietly(client: ImapFlow): void {
+  try {
+    client.close();
+  } catch {
+    /* already closed */
+  }
+}
+
+/** Persist sync health without ever failing the sync that produced it. */
+async function recordSyncHealth(
+  config: SmtpConfig,
+  error: string | undefined,
+): Promise<void> {
+  try {
+    await updateImapState(config.id, {
+      lastSyncAt: new Date(),
+      lastSyncError: error ?? null,
+    });
+  } catch (e) {
+    console.error(
+      `[imap] ${config.name}: could not record sync health: ${describeError(e)}`,
+    );
+  }
 }
 
 export interface SyncResult {
@@ -370,31 +406,199 @@ interface InsertedRow {
   contentTruncated: boolean;
 }
 
+async function insertRows(rows: InsertRow[]): Promise<InsertedRow[]> {
+  return db
+    .insert(incomingEmails)
+    .values(rows)
+    .onConflictDoNothing({
+      target: [incomingEmails.smtpConfigId, incomingEmails.imapUid],
+    })
+    .returning({
+      id: incomingEmails.id,
+      imapUid: incomingEmails.imapUid,
+      fromAddress: incomingEmails.fromAddress,
+      fromName: incomingEmails.fromName,
+      subject: incomingEmails.subject,
+      receivedAt: incomingEmails.receivedAt,
+      sourceTruncated: incomingEmails.sourceTruncated,
+      contentTruncated: incomingEmails.contentTruncated,
+    });
+}
+
+// PostgreSQL `timestamp` cannot hold every JS Date (e.g. far BC years).
+const MIN_STORABLE_DATE_MS = Date.UTC(1900, 0, 1);
+const MAX_FUTURE_SKEW_MS = 366 * 24 * 60 * 60 * 1000;
+
+function storableDate(value: unknown): Date {
+  const ms = value instanceof Date ? value.getTime() : Number.NaN;
+  return Number.isFinite(ms) &&
+    ms >= MIN_STORABLE_DATE_MS &&
+    ms <= Date.now() + MAX_FUTURE_SKEW_MS
+    ? (value as Date)
+    : new Date();
+}
+
+/**
+ * Last-resort row for a message whose full projection the database refused.
+ * Identity, threading headers, automation headers and the sender survive, so
+ * the message still shows up in the inbox, reply matching still works and the
+ * `incoming.received` webhook still fires; bodies, recipients and attachment
+ * metadata are dropped and the row is flagged contentTruncated.
+ */
+function envelopeOnlyRow(row: InsertRow): InsertRow {
+  return {
+    organizationId: row.organizationId,
+    smtpConfigId: row.smtpConfigId,
+    imapUid: row.imapUid,
+    messageId: row.messageId ?? null,
+    inReplyTo: row.inReplyTo ?? null,
+    references: row.references ?? null,
+    autoSubmitted: row.autoSubmitted ?? null,
+    precedence: row.precedence ?? null,
+    xAutoResponseSuppress: row.xAutoResponseSuppress ?? null,
+    automationHeadersComplete: row.automationHeadersComplete ?? null,
+    fromAddress: row.fromAddress,
+    fromName: row.fromName ?? null,
+    toAddresses: [],
+    ccAddresses: [],
+    subject: row.subject ?? null,
+    snippet: null,
+    text: null,
+    html: null,
+    sourceSizeBytes: row.sourceSizeBytes ?? null,
+    sourceTruncated: row.sourceTruncated ?? false,
+    contentTruncated: true,
+    hasAttachments: false,
+    attachments: null,
+    receivedAt: storableDate(row.receivedAt),
+  };
+}
+
+/**
+ * Store one row the database rejected as part of a batch: retry it alone
+ * (unless that already happened), then fall back to the envelope-only row,
+ * and only as the very last resort skip it — logged with its UID, never with
+ * its content. A transient error is rethrown so the caller aborts the sync.
+ */
+async function insertIsolated(
+  row: InsertRow,
+  label: string,
+  knownError?: unknown,
+): Promise<InsertedRow[]> {
+  let error = knownError;
+  if (error === undefined) {
+    try {
+      return await insertRows([row]);
+    } catch (e) {
+      if (!isPermanentRowError(e)) throw e;
+      error = e;
+    }
+  }
+  console.warn(
+    `[imap] ${label}: uid ${row.imapUid} rejected by the database (${describeError(error)}); storing it envelope-only`,
+  );
+  try {
+    return await insertRows([envelopeOnlyRow(row)]);
+  } catch (e) {
+    if (!isPermanentRowError(e)) throw e;
+    console.error(
+      `[imap] ${label}: uid ${row.imapUid} skipped, the database rejected even its envelope (${describeError(e)})`,
+    );
+    return [];
+  }
+}
+
 /** Insert rows in small chunks; returns ONLY the rows genuinely inserted (the
  *  unique index drops re-ingested messages), so callers can fire side effects
- *  (webhooks) exactly once per new message. */
-async function ingest(rows: InsertRow[]): Promise<InsertedRow[]> {
+ *  (webhooks) exactly once per new message.
+ *
+ *  A multi-row INSERT is all-or-nothing: one message the database refuses
+ *  used to fail its whole chunk on every sync, the cursor never moved and the
+ *  mailbox stopped receiving mail (Osobní Gmail, 29. 9. – 20. 10. 2026). Rows
+ *  are therefore isolated when the database rejects their VALUES; any other
+ *  failure (connection loss, shutdown, …) still aborts the sync, so nothing is
+ *  ever skipped because of a database hiccup. */
+async function ingest(rows: InsertRow[], label: string): Promise<InsertedRow[]> {
   const inserted: InsertedRow[] = [];
   for (let i = 0; i < rows.length; i += 50) {
-    const chunk = await db
-      .insert(incomingEmails)
-      .values(rows.slice(i, i + 50))
-      .onConflictDoNothing({
-        target: [incomingEmails.smtpConfigId, incomingEmails.imapUid],
-      })
-      .returning({
-        id: incomingEmails.id,
-        imapUid: incomingEmails.imapUid,
-        fromAddress: incomingEmails.fromAddress,
-        fromName: incomingEmails.fromName,
-        subject: incomingEmails.subject,
-        receivedAt: incomingEmails.receivedAt,
-        sourceTruncated: incomingEmails.sourceTruncated,
-        contentTruncated: incomingEmails.contentTruncated,
-      });
-    inserted.push(...chunk);
+    const chunk = rows.slice(i, i + 50);
+    try {
+      inserted.push(...(await insertRows(chunk)));
+    } catch (e) {
+      if (!isPermanentRowError(e)) throw e;
+      if (chunk.length === 1) {
+        inserted.push(...(await insertIsolated(chunk[0]!, label, e)));
+        continue;
+      }
+      for (const row of chunk) {
+        inserted.push(...(await insertIsolated(row, label)));
+      }
+    }
   }
   return inserted;
+}
+
+/**
+ * UIDs the next forward sync should ingest: ascending, at most MAX_PER_SYNC.
+ *
+ * Only UIDs are requested here; sources are fetched afterwards for exactly this
+ * batch. A single FETCH of `lastUid+1:*` with BODY[] streamed EVERY newer
+ * message even though the loop stopped after MAX_PER_SYNC — leaving imapflow's
+ * async iterator does not cancel the IMAP command, the rest is downloaded and
+ * discarded. With a stuck cursor that was 633 messages / 51 MiB on every sync
+ * of the personal Gmail (20. 10. 2026), enough to get the account throttled.
+ */
+async function nextForwardBatch(
+  client: ImapFlow,
+  cursorValid: boolean,
+  lastUid: number,
+  exists: number,
+): Promise<number[]> {
+  const range = cursorValid
+    ? `${lastUid + 1}:*`
+    : `${Math.max(1, exists - INITIAL_SYNC_LIMIT + 1)}:${exists}`;
+  const uids: number[] = [];
+  for await (const msg of client.fetch(
+    range,
+    { uid: true },
+    cursorValid ? { uid: true } : undefined,
+  )) {
+    if (!Number.isSafeInteger(msg.uid) || msg.uid < 1) continue;
+    // `n:*` always includes the highest UID, even when it is below n.
+    if (cursorValid && msg.uid <= lastUid) continue;
+    uids.push(msg.uid);
+  }
+  uids.sort((a, b) => a - b);
+  return uids.slice(0, MAX_PER_SYNC);
+}
+
+/** parseMessageToRow that can never abort (and so wedge) the sync: an
+ *  unexpected exception is treated like an unparseable message — skipped. */
+async function parseSafely(
+  config: SmtpConfig,
+  uid: number,
+  source: Buffer,
+  internalDate: string | Date | undefined,
+  bounces: Map<number, BounceResult> | undefined,
+  announcedSize: number | undefined,
+  envelope: MessageEnvelopeObject | undefined,
+): Promise<InsertRow | null> {
+  try {
+    return await parseMessageToRow(
+      config,
+      uid,
+      source,
+      internalDate,
+      bounces,
+      announcedSize,
+      envelope,
+    );
+  } catch (e) {
+    console.error(
+      `[imap] ${config.name}: uid ${uid} could not be parsed, skipped: ${describeError(e)}`,
+    );
+    return null;
+  }
 }
 
 /**
@@ -415,11 +619,9 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
   try {
     await client.connect();
   } catch (e) {
-    syncError = (e as Error).message;
-    await updateImapState(config.id, {
-      lastSyncAt: new Date(),
-      lastSyncError: syncError,
-    });
+    closeQuietly(client);
+    syncError = describeError(e);
+    await recordSyncHealth(config, syncError);
     return { fetched: 0, error: syncError };
   }
 
@@ -444,55 +646,60 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
         if (exists === 0) {
           await updateImapState(config.id, { lastUid, uidValidity });
         } else {
-          // Incremental: UID FETCH "lastUid+1:*" (filter the always-included
-          // tail). First sync: most recent INITIAL_SYNC_LIMIT messages by seq.
-          const useUid = cursorValid;
-          const range = cursorValid
-            ? `${lastUid + 1}:*`
-            : `${Math.max(1, exists - INITIAL_SYNC_LIMIT + 1)}:${exists}`;
+          // Incremental: UIDs above the cursor. First sync: the most recent
+          // INITIAL_SYNC_LIMIT messages by sequence number. Either way only the
+          // oldest MAX_PER_SYNC of them are fetched now; the remainder is the
+          // next tick's window, never skipped.
+          const batchUids = await nextForwardBatch(
+            client,
+            cursorValid,
+            lastUid,
+            exists,
+          );
+          const inBatch = new Set(batchUids);
 
           let maxUid = lastUid;
           let minUid = Infinity;
-          let examined = 0;
           const rows: InsertRow[] = [];
           const bounces = new Map<number, BounceResult>();
 
-          for await (const msg of client.fetch(
-            range,
-            {
-              uid: true,
-              size: true,
-              envelope: true,
-              source: { start: 0, maxLength: INCOMING_SOURCE_MAX_BYTES },
-              internalDate: true,
-            },
-            useUid ? { uid: true } : undefined,
-          )) {
-            const uid = msg.uid;
-            if (cursorValid && uid <= lastUid) continue;
-            // Stop before advancing past the per-run cap, so the remainder is
-            // re-fetched next tick rather than skipped forever.
-            if (examined >= MAX_PER_SYNC) break;
-            examined += 1;
-            // Advance across the processing window (including skipped messages)
-            // so a single bad message can't wedge the cursor.
-            if (uid > maxUid) maxUid = uid;
-            if (!msg.source) continue;
-            const row = await parseMessageToRow(
-              config,
-              uid,
-              msg.source,
-              msg.internalDate,
-              bounces,
-              msg.size,
-              msg.envelope,
-            );
-            if (!row) continue;
-            rows.push(row);
-            if (uid < minUid) minUid = uid;
+          if (batchUids.length > 0) {
+            for await (const msg of client.fetch(
+              `${batchUids[0]}:${batchUids[batchUids.length - 1]}`,
+              {
+                uid: true,
+                size: true,
+                envelope: true,
+                source: { start: 0, maxLength: INCOMING_SOURCE_MAX_BYTES },
+                internalDate: true,
+              },
+              { uid: true },
+            )) {
+              const uid = msg.uid;
+              if (!inBatch.has(uid)) continue;
+              // Advance across the processing window (including skipped
+              // messages) so a single bad message can't wedge the cursor.
+              if (uid > maxUid) maxUid = uid;
+              if (!msg.source) continue;
+              const row = await parseSafely(
+                config,
+                uid,
+                msg.source,
+                msg.internalDate,
+                bounces,
+                msg.size,
+                msg.envelope,
+              );
+              if (!row) continue;
+              rows.push(row);
+              if (uid < minUid) minUid = uid;
+            }
+            // The FETCH completed, so a listed UID it did not return was
+            // expunged in between and can never be fetched: pass it too.
+            maxUid = Math.max(maxUid, batchUids[batchUids.length - 1]!);
           }
 
-          const inserted = rows.length ? await ingest(rows) : [];
+          const inserted = rows.length ? await ingest(rows, config.name) : [];
           fetched = inserted.length;
 
           // Process permanent bounces among the genuinely-new messages: suppress
@@ -543,7 +750,7 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
       lock.release();
     }
   } catch (e) {
-    syncError = (e as Error).message;
+    syncError = describeError(e);
   } finally {
     try {
       await client.logout();
@@ -552,10 +759,7 @@ export async function syncMailbox(config: SmtpConfig): Promise<SyncResult> {
     }
   }
 
-  await updateImapState(config.id, {
-    lastSyncAt: new Date(),
-    lastSyncError: syncError ?? null,
-  });
+  await recordSyncHealth(config, syncError);
   return { fetched, error: syncError };
 }
 
@@ -579,7 +783,8 @@ export async function backfillMailbox(
   try {
     await client.connect();
   } catch (e) {
-    return { fetched: 0, error: (e as Error).message };
+    closeQuietly(client);
+    return { fetched: 0, error: describeError(e) };
   }
 
   try {
@@ -622,7 +827,7 @@ export async function backfillMailbox(
               if (uid >= firstUid) continue;
               if (!msg.source) continue;
               if (rows.length >= MAX_PER_SYNC) break;
-              const row = await parseMessageToRow(
+              const row = await parseSafely(
                 config,
                 uid,
                 msg.source,
@@ -633,7 +838,7 @@ export async function backfillMailbox(
               );
               if (row) rows.push(row);
             }
-            if (rows.length) fetched = (await ingest(rows)).length;
+            if (rows.length) fetched = (await ingest(rows, config.name)).length;
             // We've now covered [low, firstUid-1]; the new floor is `low`.
             await updateImapState(config.id, {
               firstUid: low,
@@ -646,7 +851,7 @@ export async function backfillMailbox(
       lock.release();
     }
   } catch (e) {
-    error = (e as Error).message;
+    error = describeError(e);
   } finally {
     try {
       await client.logout();
@@ -682,7 +887,12 @@ export async function fetchAttachment(
 ): Promise<FetchedAttachment | null> {
   if (!config.imapHost || !config.imapPassword) return null;
   const client = clientFor(config);
-  await client.connect();
+  try {
+    await client.connect();
+  } catch (e) {
+    closeQuietly(client);
+    throw e;
+  }
   try {
     const lock = await client.getMailboxLock("INBOX");
     try {
@@ -744,26 +954,31 @@ export async function testImapConnection(
   >,
 ): Promise<{ success: true } | { success: false; error: string }> {
   if (!config.imapHost) return { success: false, error: "IMAP host not set" };
-  const client = new ImapFlow({
-    host: config.imapHost,
-    port: config.imapPort ?? 993,
-    secure: config.imapSecure ?? true,
-    auth: {
-      user: config.imapUsername || config.username || "",
-      pass: config.imapPassword ?? "",
+  const client = createImapClient(
+    {
+      host: config.imapHost,
+      port: config.imapPort ?? 993,
+      secure: config.imapSecure ?? true,
+      auth: {
+        user: config.imapUsername || config.username || "",
+        pass: config.imapPassword ?? "",
+      },
+      logger: false,
+      tls: { rejectUnauthorized: TLS_REJECT_UNAUTHORIZED },
+      greetingTimeout: 15000,
+      connectionTimeout: 15000,
+      socketTimeout: 60000,
+      maxLiteralSize: INCOMING_SOURCE_MAX_BYTES,
+      maxLineLength: INCOMING_PROTOCOL_MAX_LINE_BYTES,
     },
-    logger: false,
-    tls: { rejectUnauthorized: TLS_REJECT_UNAUTHORIZED },
-    greetingTimeout: 15000,
-    connectionTimeout: 15000,
-    maxLiteralSize: INCOMING_SOURCE_MAX_BYTES,
-    maxLineLength: INCOMING_PROTOCOL_MAX_LINE_BYTES,
-  });
+    `IMAP test ${config.imapHost}`,
+  );
   try {
     await client.connect();
     await client.logout();
     return { success: true };
   } catch (e) {
-    return { success: false, error: (e as Error).message };
+    closeQuietly(client);
+    return { success: false, error: describeError(e) };
   }
 }

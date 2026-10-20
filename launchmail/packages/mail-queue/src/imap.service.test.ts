@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SmtpConfig } from "./smtp-configs.service";
 
+type Row = Record<string, unknown>;
+
 const state = vi.hoisted(() => ({
   clientOptions: [] as Array<Record<string, unknown>>,
+  clients: [] as Array<{
+    listenerCount: (event: string) => number;
+    emit: (event: string, ...args: unknown[]) => boolean;
+    closed: boolean;
+  }>,
   fetchCalls: [] as Array<{
     range: string;
     query: Record<string, unknown>;
@@ -16,7 +23,14 @@ const state = vi.hoisted(() => ({
   messages: [] as Array<Record<string, unknown>>,
   fetchOneMessage: null as Record<string, unknown> | null,
   insertedRows: [] as Array<Record<string, unknown>>,
+  insertAttempts: 0,
   mailbox: { uidValidity: 42, exists: 1 },
+  connectError: null as Error | null,
+  // Emitted on the client right after connect() rejected — what imapflow's
+  // orphaned startSession does ("Connection not available").
+  lateError: null as Error | null,
+  // Simulated database verdict for one INSERT statement (all-or-nothing).
+  rejectInsert: null as ((rows: Row[]) => unknown) | null,
 }));
 
 const serviceMocks = vi.hoisted(() => ({
@@ -25,63 +39,131 @@ const serviceMocks = vi.hoisted(() => ({
   processBounce: vi.fn(),
 }));
 
-vi.mock("imapflow", () => ({
-  ImapFlow: class {
-    mailbox = state.mailbox;
+/** imapflow-like sequence-set matching: "a", "a:b", "a:*" by UID or seq. */
+function inRange(range: string, value: number, max: number): boolean {
+  return range.split(",").some((part) => {
+    const [lo, hi] = part.split(":");
+    const low = lo === "*" ? max : Number(lo);
+    if (hi === undefined) return value === low;
+    const high = hi === "*" ? max : Number(hi);
+    return value >= Math.min(low, high) && value <= Math.max(low, high);
+  });
+}
 
-    constructor(options: Record<string, unknown>) {
-      state.clientOptions.push(options);
-    }
+vi.mock("imapflow", async () => {
+  const { EventEmitter } = await import("node:events");
+  return {
+    ImapFlow: class extends EventEmitter {
+      mailbox = state.mailbox;
+      closed = false;
 
-    async connect() {}
+      constructor(options: Record<string, unknown>) {
+        super();
+        state.clientOptions.push(options);
+        state.clients.push(this);
+      }
 
-    async logout() {}
+      async connect() {
+        if (state.connectError) {
+          const late = state.lateError;
+          if (late) setImmediate(() => this.emit("error", late));
+          throw state.connectError;
+        }
+      }
 
-    async getMailboxLock() {
-      return { release: vi.fn() };
-    }
+      close() {
+        this.closed = true;
+      }
 
-    async *fetch(
-      range: string,
-      query: Record<string, unknown>,
-      options?: Record<string, unknown>,
-    ) {
-      state.fetchCalls.push({ range, query, options });
-      for (const message of state.messages) yield message;
-    }
+      async logout() {}
 
-    async fetchOne(
-      range: string,
-      query: Record<string, unknown>,
-      options?: Record<string, unknown>,
-    ) {
-      state.fetchOneCalls.push({ range, query, options });
-      return state.fetchOneMessage;
-    }
-  },
-}));
+      async getMailboxLock() {
+        return { release: vi.fn() };
+      }
+
+      async *fetch(
+        range: string,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ) {
+        state.fetchCalls.push({ range, query, options });
+        const byUid = Boolean(options?.uid);
+        const maxUid = Math.max(0, ...state.messages.map((m) => Number(m.uid)));
+        const maxSeq = state.messages.length;
+        for (const [index, message] of state.messages.entries()) {
+          const key = byUid ? Number(message.uid) : index + 1;
+          if (inRange(range, key, byUid ? maxUid : maxSeq)) yield message;
+        }
+      }
+
+      async fetchOne(
+        range: string,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ) {
+        state.fetchOneCalls.push({ range, query, options });
+        return state.fetchOneMessage;
+      }
+    },
+  };
+});
+
+/** What PostgreSQL does with U+0000 anywhere in a text/jsonb value. */
+function pgRejectsNul(rows: Row[]): unknown {
+  const hasNul = (v: unknown): boolean =>
+    typeof v === "string"
+      ? v.includes("\u0000")
+      : Array.isArray(v)
+        ? v.some(hasNul)
+        : v !== null && typeof v === "object" && !(v instanceof Date)
+          ? Object.values(v).some(hasNul)
+          : false;
+  return rows.some((row) => Object.values(row).some(hasNul))
+    ? pgError("22021", 'invalid byte sequence for encoding "UTF8": 0x00')
+    : null;
+}
+
+function pgError(code: string, message: string) {
+  return Object.assign(new Error(message), { code, severity: "ERROR" });
+}
+
+/** Shape of drizzle's DrizzleQueryError: params carry every bound value. */
+function drizzleError(cause: unknown, rows: Row[]) {
+  return Object.assign(
+    new Error(
+      `Failed query: insert into "incoming_emails" ("id") values (default)\nparams: ${JSON.stringify(rows)}`,
+    ),
+    {
+      query: 'insert into "incoming_emails" ("id") values (default)',
+      params: rows,
+      cause,
+    },
+  );
+}
 
 vi.mock("@workspace/db", () => ({
   db: {
     insert: () => ({
-      values: (rows: Array<Record<string, unknown>>) => {
-        state.insertedRows.push(...rows);
-        return {
-          onConflictDoNothing: () => ({
-            returning: async () =>
-              rows.map((row, index) => ({
-                id: `incoming-${index + 1}`,
-                imapUid: row.imapUid,
-                fromAddress: row.fromAddress,
-                fromName: row.fromName,
-                subject: row.subject,
-                receivedAt: row.receivedAt,
-                sourceTruncated: row.sourceTruncated,
-                contentTruncated: row.contentTruncated,
-              })),
-          }),
-        };
-      },
+      values: (rows: Row[]) => ({
+        onConflictDoNothing: () => ({
+          returning: async () => {
+            state.insertAttempts += 1;
+            const verdict = pgRejectsNul(rows) ?? state.rejectInsert?.(rows);
+            if (verdict) throw drizzleError(verdict, rows);
+            state.insertedRows.push(...rows);
+            return rows.map((row, index) => ({
+              id: `incoming-${String(row.imapUid)}-${index + 1}`,
+              imapUid: row.imapUid,
+              fromAddress: row.fromAddress,
+              fromName: row.fromName,
+              subject: row.subject,
+              receivedAt: row.receivedAt,
+              sourceTruncated: row.sourceTruncated,
+              contentTruncated: row.contentTruncated,
+            }));
+          },
+        }),
+      }),
     }),
   },
 }));
@@ -101,6 +183,7 @@ import {
   fetchAttachment,
   IncomingEmailContentTooLargeError,
   syncMailbox,
+  testImapConnection,
 } from "./imap.service";
 import {
   INCOMING_AUTOMATION_HEADER_MAX_CHARS,
@@ -125,6 +208,16 @@ const config = {
   imapBackfillComplete: false,
 } as unknown as SmtpConfig;
 
+/** A mailbox whose forward cursor is valid (UIDVALIDITY 42) at `lastUid`. */
+function syncedConfig(lastUid: number): SmtpConfig {
+  return {
+    ...config,
+    imapLastUid: lastUid,
+    imapUidValidity: 42,
+    imapFirstUid: 1,
+  } as SmtpConfig;
+}
+
 function messageSource(
   body: string,
   contentType = "text/plain",
@@ -144,14 +237,47 @@ function messageSource(
   );
 }
 
+function pushMessages(uids: number[], body = (uid: number) => `Reply ${uid}.`) {
+  for (const uid of uids) {
+    const source = messageSource(body(uid), "text/plain", [
+      `In-Reply-To: <orig-${uid}@example.test>`,
+    ]);
+    state.messages.push({
+      uid,
+      source,
+      size: source.length,
+      internalDate: new Date("2026-10-20T08:00:00.000Z"),
+    });
+  }
+}
+
+/** Every updateImapState patch that moved the forward cursor. */
+function cursorWrites(): number[] {
+  return serviceMocks.updateImapState.mock.calls
+    .map(([, patch]) => (patch as { lastUid?: number }).lastUid)
+    .filter((uid): uid is number => typeof uid === "number");
+}
+
+function healthWrites(): Array<string | null | undefined> {
+  return serviceMocks.updateImapState.mock.calls
+    .map(([, patch]) => patch as { lastSyncAt?: Date; lastSyncError?: string | null })
+    .filter((patch) => patch.lastSyncAt instanceof Date)
+    .map((patch) => patch.lastSyncError);
+}
+
 beforeEach(() => {
   state.clientOptions.length = 0;
+  state.clients.length = 0;
   state.fetchCalls.length = 0;
   state.fetchOneCalls.length = 0;
   state.messages.length = 0;
   state.fetchOneMessage = null;
   state.insertedRows.length = 0;
+  state.insertAttempts = 0;
   state.mailbox = { uidValidity: 42, exists: 1 };
+  state.connectError = null;
+  state.lateError = null;
+  state.rejectInsert = null;
   vi.clearAllMocks();
 });
 
@@ -174,7 +300,9 @@ describe("bounded IMAP ingestion", () => {
       maxLiteralSize: INCOMING_SOURCE_MAX_BYTES,
       maxLineLength: INCOMING_SOURCE_MAX_BYTES,
     });
-    expect(state.fetchCalls[0]?.query).toMatchObject({
+    // Phase 1 lists UIDs only; phase 2 fetches the bounded sources.
+    expect(state.fetchCalls[0]?.query).toEqual({ uid: true });
+    expect(state.fetchCalls[1]?.query).toMatchObject({
       uid: true,
       size: true,
       envelope: true,
@@ -326,6 +454,213 @@ describe("bounded IMAP ingestion", () => {
       contentTruncated: true,
     });
     expect(serviceMocks.dispatchEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("a problematic message never wedges the mailbox", () => {
+  it("strips the NULs of a mis-declared UTF-16 HTML part (the 20. 10. 2026 Alza message) and stores it", async () => {
+    // UTF-16LE bytes labelled utf-8: decodes to "<\0p\0>\0H\0i\0…" — exactly
+    // what PostgreSQL refused with 22021 on every sync for three weeks.
+    const utf16 = Buffer.from("<p>Hi there</p>", "utf16le").toString("base64");
+    const source = Buffer.from(
+      [
+        "From: Shop <shop@example.test>",
+        "To: Receiver <receiver@example.test>",
+        "Subject: Newsletter",
+        "Message-ID: <utf16@example.test>",
+        "Content-Type: text/html; charset=utf-8",
+        "Content-Transfer-Encoding: base64",
+        "",
+        utf16,
+      ].join("\r\n"),
+    );
+    state.messages.push({
+      uid: 24802,
+      source,
+      size: source.length,
+      internalDate: new Date("2026-09-29T05:01:00.000Z"),
+    });
+
+    await expect(syncMailbox(syncedConfig(24801))).resolves.toEqual({
+      fetched: 1,
+      error: undefined,
+    });
+
+    const html = state.insertedRows[0]?.html as string;
+    expect(html).not.toContain("\u0000");
+    expect(html).toContain("<p>Hi there</p>");
+    expect(cursorWrites()).toEqual([24802]);
+    expect(healthWrites()).toEqual([null]);
+  });
+
+  it("isolates a row the database rejects: neighbours are stored whole, it is stored envelope-only, the cursor moves on", async () => {
+    pushMessages([11, 12, 13]);
+    // Simulated value-level rejection (class 22) of uid 12's full row only.
+    state.rejectInsert = (rows) =>
+      rows.some((r) => r.imapUid === 12 && r.text !== null)
+        ? pgError("22P02", "invalid input syntax")
+        : null;
+
+    await expect(syncMailbox(syncedConfig(10))).resolves.toEqual({
+      fetched: 3,
+      error: undefined,
+    });
+
+    const byUid = new Map(state.insertedRows.map((r) => [r.imapUid, r]));
+    expect(byUid.get(11)).toMatchObject({ text: "Reply 11.", contentTruncated: false });
+    expect(byUid.get(13)).toMatchObject({ text: "Reply 13.", contentTruncated: false });
+    expect(byUid.get(12)).toMatchObject({
+      text: null,
+      html: null,
+      toAddresses: [],
+      attachments: null,
+      contentTruncated: true,
+      // Threading survives, so reply matching downstream still works.
+      inReplyTo: "<orig-12@example.test>",
+      fromAddress: "sender@example.test",
+    });
+    expect(serviceMocks.dispatchEvent).toHaveBeenCalledTimes(3);
+    expect(cursorWrites()).toEqual([13]);
+    expect(healthWrites()).toEqual([null]);
+  });
+
+  it("skips a message the database refuses even envelope-only, and still advances past it", async () => {
+    pushMessages([11, 12, 13]);
+    state.rejectInsert = (rows) =>
+      rows.some((r) => r.imapUid === 12)
+        ? pgError("23514", "new row violates check constraint")
+        : null;
+
+    await expect(syncMailbox(syncedConfig(10))).resolves.toEqual({
+      fetched: 2,
+      error: undefined,
+    });
+    expect(state.insertedRows.map((r) => r.imapUid).sort()).toEqual([11, 13]);
+    expect(cursorWrites()).toEqual([13]);
+  });
+
+  it("aborts on a transient database error without moving the cursor or leaking content", async () => {
+    pushMessages([11, 12], () => "SECRET BODY");
+    state.rejectInsert = () => pgError("08006", "connection terminated unexpectedly");
+
+    const result = await syncMailbox(syncedConfig(10));
+
+    expect(result.fetched).toBe(0);
+    expect(result.error).toBe(
+      "Database error 08006: connection terminated unexpectedly (insert into incoming_emails)",
+    );
+    // One statement, no row-by-row retries for a non-data error.
+    expect(state.insertAttempts).toBe(1);
+    expect(cursorWrites()).toEqual([]);
+    const [stored] = healthWrites();
+    expect(stored).toBe(result.error);
+    expect(stored).not.toContain("SECRET");
+    expect(stored).not.toContain("params");
+    expect(serviceMocks.dispatchEvent).not.toHaveBeenCalled();
+  });
+
+  it("downloads only the bounded window, not every message above the cursor", async () => {
+    pushMessages(Array.from({ length: 120 }, (_, i) => 101 + i));
+
+    await expect(syncMailbox(syncedConfig(100))).resolves.toMatchObject({
+      fetched: 50,
+    });
+
+    expect(state.fetchCalls).toHaveLength(2);
+    expect(state.fetchCalls[0]).toMatchObject({
+      range: "101:*",
+      query: { uid: true },
+      options: { uid: true },
+    });
+    expect(state.fetchCalls[1]).toMatchObject({
+      range: "101:150",
+      options: { uid: true },
+    });
+    expect(state.insertedRows).toHaveLength(50);
+    expect(cursorWrites()).toEqual([150]);
+  });
+
+  it("ignores the always-included highest UID when nothing is newer than the cursor", async () => {
+    pushMessages([5]);
+
+    await expect(syncMailbox(syncedConfig(9))).resolves.toEqual({
+      fetched: 0,
+      error: undefined,
+    });
+    expect(state.fetchCalls).toHaveLength(1);
+    expect(state.insertedRows).toHaveLength(0);
+    expect(cursorWrites()).toEqual([9]);
+  });
+});
+
+describe("IMAP connection failures stay contained", () => {
+  it("handles an 'error' event emitted after connect() already rejected, closes the socket and records a concise error", async () => {
+    state.connectError = Object.assign(new Error("Socket timeout"), {
+      code: "ETIMEOUT",
+      _connId: "c1",
+    });
+    state.lateError = Object.assign(new Error("Connection not available"), {
+      code: "NoConnection",
+      _connId: "c1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(syncMailbox(syncedConfig(10))).resolves.toEqual({
+      fetched: 0,
+      error: "Socket timeout [ETIMEOUT]",
+    });
+    // Let the late 'error' event fire: without a listener it would throw and
+    // crash the process (vitest reports it as an unhandled error).
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const client = state.clients[0]!;
+    expect(client.listenerCount("error")).toBeGreaterThan(0);
+    expect(client.closed).toBe(true);
+    expect(healthWrites()).toEqual(["Socket timeout [ETIMEOUT]"]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("Connection not available"),
+    );
+    warn.mockRestore();
+  });
+
+  it("surfaces the server's own words for a failed login (wrong app password)", async () => {
+    state.connectError = Object.assign(new Error("Command failed"), {
+      responseStatus: "NO",
+      responseText: "[AUTHENTICATIONFAILED] Invalid credentials (Failure)",
+      serverResponseCode: "AUTHENTICATIONFAILED",
+      authenticationFailed: true,
+    });
+
+    await expect(
+      testImapConnection({
+        imapHost: "imap.example.test",
+        imapPort: 993,
+        imapSecure: true,
+        imapUsername: "sender@example.test",
+        imapPassword: "wrong",
+        username: "sender@example.test",
+      }),
+    ).resolves.toEqual({
+      success: false,
+      error:
+        "Command failed (AUTHENTICATIONFAILED) - server: [AUTHENTICATIONFAILED] Invalid credentials (Failure)",
+    });
+    expect(state.clients[0]!.listenerCount("error")).toBeGreaterThan(0);
+    expect(state.clients[0]!.closed).toBe(true);
+  });
+
+  it("gives every client it creates an 'error' listener (sync, backfill, attachment, test)", async () => {
+    pushMessages([11]);
+    await syncMailbox(syncedConfig(10));
+    await backfillMailbox({ ...syncedConfig(10), imapFirstUid: 5 } as SmtpConfig);
+    state.fetchOneMessage = null;
+    await fetchAttachment(config, 11, 0);
+    await testImapConnection(config);
+
+    expect(state.clients.length).toBeGreaterThanOrEqual(4);
+    for (const client of state.clients) {
+      expect(client.listenerCount("error")).toBeGreaterThan(0);
+    }
   });
 });
 
