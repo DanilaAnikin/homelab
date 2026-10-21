@@ -102,6 +102,25 @@ gh_api(){ # method path [json-body]
 
 resolve_project "$PROJECT"
 DEPLOY_MODE="${DEPLOY_MODE:-compose}"; PROD_DIR="${PROD_DIR:-}"; COMPOSE_FILE="${COMPOSE_FILE:-}"; COMPOSE_PROJECT="${COMPOSE_PROJECT:-}"
+# --- 0) Vypínač farmy ---------------------------------------------------------
+# Zastavená farma znamená, že se nenasazuje. Watcher tuhle frontu vybírá sám
+# každých 30 s, takže požadavek zařazený PŘED zastavením by se jinak odpálil
+# klidně týden po tom, co farmu někdo vypnul. Tlačítko v dashboardu kontroluje
+# totéž, ale to nedosáhne na požadavky, které už ve frontě leží.
+# Zapisuje se "failed", ne "pending": jinak by to watcher zkoušel každých 30 s donekonečna.
+PAUSED="$(DBQ "select coalesce(bool_or(value::text not in ('false','\"false\"','null')), false) from farm_settings where key in ('global_pause','owner_pause');")"
+# Fail-closed: dotaz s coalesce() vrací vždy právě jeden řádek (t/f). Prázdno tedy
+# neznamená "nikdo nepauzoval", ale "nedosáhl jsem na DB" — a to je stav, ve kterém
+# se o vypínači nedá nic tvrdit. Deploy bez DB stejně nedojede (report do ní píše).
+if [[ -z "${PAUSED:-}" ]]; then
+  die "nelze ověřit vypínač farmy (DB neodpovídá) — deploy zamítnut"
+fi
+if [[ "$PAUSED" == "t" ]]; then
+  log "farma je zastavená (global_pause/owner_pause) — deploy se nespouští"
+  report "failed" "Farma je zastavená — deploy zamítnut. Pusť farmu a klikni znovu."
+  exit 0
+fi
+
 GH_TOKEN="$(gh_token)"
 report "running" "Deploy zahájen."
 log "start (dry_run=$DRY_RUN, mode=$DEPLOY_MODE) repo=$REPO_SLUG prod=${PROD_DIR:-n/a}"

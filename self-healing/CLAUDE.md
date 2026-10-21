@@ -33,6 +33,15 @@ Incident může přijít i jako `Prometheus alert '<name>' FIRING`. Podle názvu
 - **DiskDochazi / DiskDojedeDoTydne** → `df -h`; `sudo docker system prune -f` (BEZ --volumes!), smaž staré `/var/log/*.gz`, staré Dokploy build logy v `/etc/dokploy`. NIKDY nemaž data/volumes. Ověř `df -h`.
 - **KontejnerSeRestartuje** (crashloop) → najdi kontejner (`docker ps -a`, `docker inspect -f '{{.RestartCount}}'`), `docker logs <c> --tail 100`. Když jasná tranzitní příčina → 1× redeploy/restart. Když padá dál po 1 restartu → ESKALACE (nezacyklit restart).
 - **PostgresNedostupny** → `docker ps | grep postgres`; `docker restart <postgres-container>`; ověř `pg_isready`. Když nenaběhne → ESKALACE (možná poškozená data — NESAHAT na volume).
+- NIKDY nepouštěj zastavenou agent-farm a NIKDY za ni nenasazuj. Vypínač je
+  vůle majitele, ne porucha k opravě — farma umí utratit skutečné peníze.
+  Zkontroluj ho takhle a respektuj výsledek:
+  `docker exec -i agentfarm-supabase-db-1 psql -U postgres -tAc "select key, value from farm_settings where key in ('global_pause','owner_pause');"`
+  Když je kterýkoli `true`: nepřepisuj je, nespouštěj `farm-deploy.sh`, neklikej
+  Push to Production, neodpauzovávej projekty, nečisti pgmq frontu. Farma smí
+  zůstat tichá — to je v tu chvíli SPRÁVNÝ stav, ne incident. Kontejnery farmy
+  restartovat smíš (loop si pauzu přečte sám), měnit její stav ne.
+  Jestli incident vypadá, že vyžaduje puštění farmy → `ESKALACE:` a skonči.
 - **PostgresDochazejiSpojeni** → `docker exec <pg> psql -U postgres -c "SELECT count(*),state FROM pg_stat_activity GROUP BY state"`. Identifikuj `idle in transaction`. NEZABÍJEJ spojení naslepo — nejdřív diagnóza, při nejistotě ESKALACE.
 - **MaloPameti / KontejnerZeraPamet** → `docker stats --no-stream`, restartuj konkrétního viníka. Nerestartuj postgres/kong naslepo.
 - **CertifikatBrzyVyprsi** → cert řeší Cloudflare/Traefik ACME automaticky. Zkontroluj `docker logs dokploy-traefik | grep -i acme`. Sám cert NEobnovuj ručně; při <3 dnech a žádné auto-renew aktivitě → ESKALACE.
