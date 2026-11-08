@@ -12,7 +12,7 @@
 set -euo pipefail
 APP="${1:?app name, napr. gorillatype}"
 APIDOM="${2:?api domain, napr. gtapi.anikin.cz}"
-BASE="/srv/homelab/compose/supabase-$APP"
+BASE="${SUPABASE_STACK_BASE:-/srv/homelab/compose/supabase-$APP}"   # override jen pro test
 UPSTREAM_SRC="/srv/homelab/freio-rehearsal/supabase-docker"   # už fetchnutý upstream
 PROJECT="$APP-supabase"
 KONG_NAME="$APP-supabase-kong"
@@ -21,11 +21,48 @@ NET_INTERNAL="${PROJECT}_default"
 echo "== provision Supabase stack: $APP ($APIDOM) =="
 mkdir -p "$BASE"
 
-# ── 1) upstream base (kopie fetchnutého) ────────────────────────────────────
+# ── 1) upstream base — JEN čisté init soubory (allowlist) ──────────────────
+# POZOR (2026-11-08): $UPSTREAM_SRC je pracovní adresář ŽIVÉ PRODUKCE Freia
+# (compose projekt freio-supabase). $UPSTREAM_SRC/volumes/db/data je datový
+# adresář produkční DB a $UPSTREAM_SRC/volumes/storage produkční soubory.
+# Dřívější `cp -rn volumes` je kopíroval do každého nového stacku (PII + rozbitá
+# kopie běžícího Postgresu). Kopírují se jen vyjmenované soubory níž; cokoli
+# pod db/data nebo storage skript zastaví.
+INIT_FILES=(
+  api/kong.yml api/kong-entrypoint.sh
+  db/_supabase.sql db/jwt.sql db/logs.sql db/pooler.sql db/realtime.sql db/roles.sql db/webhooks.sql
+  functions/main/index.ts functions/hello/index.ts
+  logs/vector.yml pooler/pooler.exs
+)
+SRC_DATA_DIRS=("$(realpath -m "$UPSTREAM_SRC/volumes/db/data")" "$(realpath -m "$UPSTREAM_SRC/volumes/storage")")
+copy_init_file() {
+  local rel="$1" src real d
+  case "$rel" in /*|*..*|db/data|db/data/*|storage|storage/*)
+    echo "STOP: '$rel' je datová cesta nebo mimo allowlist" >&2; exit 2;; esac
+  src="$UPSTREAM_SRC/volumes/$rel"
+  [[ -f "$src" && ! -L "$src" ]] || { echo "STOP: '$src' není běžný soubor" >&2; exit 2; }
+  real=$(realpath "$src")
+  for d in "${SRC_DATA_DIRS[@]}"; do
+    [[ "$real" == "$d" || "$real" == "$d"/* ]] && { echo "STOP: '$src' leží v datovém adresáři $d" >&2; exit 2; }
+  done
+  mkdir -p "$BASE/volumes/$(dirname "$rel")"
+  cp --update=none "$src" "$BASE/volumes/$rel"
+}
 if [[ ! -f "$BASE/docker-compose.yml" ]]; then
   cp "$UPSTREAM_SRC/docker-compose.yml" "$BASE/docker-compose.base.yml"
-  [[ -d "$UPSTREAM_SRC/volumes" ]] && cp -rn "$UPSTREAM_SRC/volumes" "$BASE/volumes" 2>/dev/null || true
+  for rel in "${INIT_FILES[@]}"; do copy_init_file "$rel"; done
+  # prázdné adresáře pro bind mounty (Postgres se inicializuje čistý)
+  mkdir -p "$BASE/volumes/db/data" "$BASE/volumes/storage" "$BASE/volumes/snippets"
 fi
+# Pojistka i pro opakovaný běh: nový/neinicializovaný stack nesmí mít v db/data
+# ani storage nic, co nepatří jemu (kontrola, že nejde o kopii produkce).
+if [[ -e "$BASE/volumes/db/data/PG_VERSION" && ! -f "$BASE/.env" ]]; then
+  echo "STOP: $BASE/volumes/db/data obsahuje databázi, ale stack nemá .env — podezření na zkopírovaná data" >&2; exit 2
+fi
+for d in "${SRC_DATA_DIRS[@]}"; do
+  [[ "$(realpath -m "$BASE/volumes/db/data")" == "$d" || "$(realpath -m "$BASE/volumes/storage")" == "$d" ]] && {
+    echo "STOP: cílový adresář je produkční datový adresář $d" >&2; exit 2; }
+done
 
 # ── 2) patch base: namespacing + hardening (Python, robustní) ───────────────
 python3 - "$BASE" "$APP" "$KONG_NAME" <<'PY'
